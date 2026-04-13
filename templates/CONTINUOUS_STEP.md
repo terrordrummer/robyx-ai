@@ -25,9 +25,9 @@ and plan the next step.
 
 {{STEP_HISTORY}}
 
-## Git Branch
+## Versioning
 
-You are working on branch `{{BRANCH}}`. All changes must be committed to this branch.
+{{VERSIONING_INSTRUCTIONS}}
 
 ## State File
 
@@ -38,10 +38,7 @@ Your state file is at `{{STATE_FILE}}`. You MUST update it when done.
 1. **Execute the step** described above completely and with maximum quality.
    Take as long as needed — quality over speed.
 
-2. **Commit your work** to the `{{BRANCH}}` branch with a descriptive commit message:
-   ```
-   continuous({{TASK_NAME}}): step {{STEP_NUMBER}} — <brief description>
-   ```
+2. **Version your work** (if git is available — see Versioning section above).
 
 3. **Update the state file** (`{{STATE_FILE}}`). Read it, then write back with:
    - If step succeeded:

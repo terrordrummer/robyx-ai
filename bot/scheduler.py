@@ -832,6 +832,25 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
         history_text = build_step_context(state)
 
         lock_file = DATA_DIR / name / "lock"
+
+        # Build versioning instructions based on git availability
+        versioning = state.get("versioning", "none")
+        branch = state.get("branch", "main")
+        if versioning in ("git-branch", "git-init"):
+            versioning_instructions = (
+                "You are working on branch `%s`. Commit your changes after each step:\n"
+                "```\n"
+                "git add -A && git commit -m \"continuous(%s): step %d — <brief description>\"\n"
+                "```\n"
+                "Record the commit hash in the state file's `history[].artifact` field."
+                % (branch, name, step_number)
+            )
+        else:
+            versioning_instructions = (
+                "Git is not available in this work directory. "
+                "Do not attempt git commands. Track progress only via the state file."
+            )
+
         prompt = (
             template
             .replace("{{OBJECTIVE}}", program.get("objective", ""))
@@ -841,7 +860,7 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             .replace("{{STEP_NUMBER}}", str(step_number))
             .replace("{{STEP_DESCRIPTION}}", step_description)
             .replace("{{STEP_HISTORY}}", history_text)
-            .replace("{{BRANCH}}", state.get("branch", "main"))
+            .replace("{{VERSIONING_INSTRUCTIONS}}", versioning_instructions)
             .replace("{{STATE_FILE}}", sf)
             .replace("{{TASK_NAME}}", name)
             .replace("{{LOCK_FILE}}", str(lock_file))

@@ -186,6 +186,108 @@ async def close_workspace(name: str, manager: AgentManager, platform=None) -> bo
     return True
 
 
+def _setup_git_branch(work_dir: str, branch: str) -> dict:
+    """Set up a git branch for continuous task work in the target project.
+
+    Returns a dict with:
+      - ``branch``: the actual branch name (may differ if user's repo uses it)
+      - ``versioning``: ``"git-branch"`` | ``"git-init"`` | ``"none"``
+      - ``message``: human-readable description of what was done
+
+    Three scenarios:
+    1. work_dir is already a git repo → create branch there
+    2. work_dir is not a git repo → git init + create branch
+    3. git is not available → proceed without versioning
+    """
+    import subprocess
+    from pathlib import Path
+
+    work_path = Path(work_dir)
+
+    # Check if git is available
+    try:
+        subprocess.run(
+            ["git", "--version"],
+            capture_output=True, check=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return {
+            "branch": branch,
+            "versioning": "none",
+            "message": "git not available — proceeding without versioning",
+        }
+
+    # Check if work_dir is already a git repo
+    is_repo = (work_path / ".git").exists()
+    if not is_repo:
+        try:
+            # Check if it's inside a git repo (subdirectory)
+            result = subprocess.run(
+                ["git", "-C", work_dir, "rev-parse", "--git-dir"],
+                capture_output=True, timeout=5,
+            )
+            is_repo = result.returncode == 0
+        except subprocess.SubprocessError:
+            pass
+
+    if is_repo:
+        # Create branch in existing repo
+        try:
+            subprocess.run(
+                ["git", "-C", work_dir, "checkout", "-b", branch],
+                capture_output=True, check=True, timeout=10,
+            )
+            return {
+                "branch": branch,
+                "versioning": "git-branch",
+                "message": "created branch `%s` in existing repo" % branch,
+            }
+        except subprocess.CalledProcessError as exc:
+            # Branch might already exist
+            if b"already exists" in exc.stderr:
+                try:
+                    subprocess.run(
+                        ["git", "-C", work_dir, "checkout", branch],
+                        capture_output=True, check=True, timeout=10,
+                    )
+                    return {
+                        "branch": branch,
+                        "versioning": "git-branch",
+                        "message": "switched to existing branch `%s`" % branch,
+                    }
+                except subprocess.SubprocessError:
+                    pass
+            log.warning("Failed to create branch '%s' in %s: %s", branch, work_dir, exc.stderr)
+            return {
+                "branch": branch,
+                "versioning": "none",
+                "message": "branch creation failed — proceeding without versioning",
+            }
+    else:
+        # Initialize a new repo
+        try:
+            subprocess.run(
+                ["git", "-C", work_dir, "init"],
+                capture_output=True, check=True, timeout=10,
+            )
+            subprocess.run(
+                ["git", "-C", work_dir, "checkout", "-b", branch],
+                capture_output=True, check=True, timeout=10,
+            )
+            return {
+                "branch": branch,
+                "versioning": "git-init",
+                "message": "initialized git repo and created branch `%s`" % branch,
+            }
+        except subprocess.SubprocessError as exc:
+            log.warning("Failed to init git in %s: %s", work_dir, exc)
+            return {
+                "branch": branch,
+                "versioning": "none",
+                "message": "git init failed — proceeding without versioning",
+            }
+
+
 async def create_continuous_workspace(
     name: str,
     program: dict,
@@ -196,6 +298,10 @@ async def create_continuous_workspace(
     platform=None,
 ) -> dict | None:
     """Create a continuous task workspace: topic + branch + state + queue entry.
+
+    The git branch is created in the target project's work_dir (not in Robyx).
+    If git is not available or the repo can't be set up, the task proceeds
+    without versioning.
 
     Returns dict with workspace info or None on failure.
     """
@@ -213,7 +319,16 @@ async def create_continuous_workspace(
     if not thread_id:
         return None
 
-    # 2. Write agent instructions
+    # 2. Set up git branch in the target project's work_dir
+    git_info = _setup_git_branch(work_dir, branch)
+    branch = git_info["branch"]
+    versioning = git_info["versioning"]
+    log.info(
+        "Continuous '%s' git setup: %s (%s)",
+        safe_name, git_info["message"], versioning,
+    )
+
+    # 3. Write agent instructions
     agent_file = AGENTS_DIR / ("%s.md" % safe_name)
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     setup_template_path = __import__("pathlib").Path(__file__).parent.parent / "templates" / "CONTINUOUS_SETUP.md"
@@ -224,7 +339,7 @@ async def create_continuous_workspace(
     full_instructions = "# %s (Continuous Task)\n\n%s\n" % (display_name, setup_instructions)
     agent_file.write_text(full_instructions)
 
-    # 3. Create state file
+    # 4. Create state file
     state = create_continuous_task(
         name=safe_name,
         parent_workspace=parent_workspace,
@@ -233,11 +348,15 @@ async def create_continuous_workspace(
         branch=branch,
         work_dir=work_dir,
     )
+    # Store versioning info in state for the step agent
+    state["versioning"] = versioning
+    from continuous import save_state, state_file_path as _sfp
+    save_state(_sfp(safe_name), state)
 
-    # 4. Create data directory
+    # 5. Create data directory
     (DATA_DIR / safe_name).mkdir(parents=True, exist_ok=True)
 
-    # 5. Add to unified queue
+    # 6. Add to unified queue
     _add_task({
         "name": safe_name,
         "type": "continuous",
@@ -248,7 +367,7 @@ async def create_continuous_workspace(
         "description": "Continuous: %s" % display_name,
     })
 
-    # 6. Register agent
+    # 7. Register agent
     agent = manager.add_agent(
         name=safe_name,
         work_dir=work_dir,
@@ -258,14 +377,23 @@ async def create_continuous_workspace(
         thread_id=thread_id,
     )
 
-    # 7. Welcome message
+    # 8. Welcome message
+    versioning_note = ""
+    if versioning == "git-branch":
+        versioning_note = "Working on branch `%s`." % branch
+    elif versioning == "git-init":
+        versioning_note = "Initialized git repo, working on branch `%s`." % branch
+    else:
+        versioning_note = "No git versioning (git not available)."
+
     await platform.send_to_channel(
         thread_id,
         "*🔄 %s* continuous workspace is ready.\n"
-        "Agent *%s* will work autonomously on branch `%s`.\n\n"
+        "Agent *%s* will work autonomously.\n"
+        "%s\n\n"
         "**Objective:** %s\n\n"
         "Send a message here to interrupt and interact."
-        % (display_name, safe_name, branch, program.get("objective", "N/A")),
+        % (display_name, safe_name, versioning_note, program.get("objective", "N/A")),
     )
 
     return {
@@ -273,6 +401,7 @@ async def create_continuous_workspace(
         "display_name": display_name,
         "thread_id": thread_id,
         "branch": branch,
+        "versioning": versioning,
         "state_file": str(state_file_path(safe_name)),
         "type": "continuous",
     }
