@@ -1,0 +1,30 @@
+## Robyx — Model preferences
+##
+## Defines semantic model aliases (fast / balanced / powerful) and the
+## concrete model that each backend should use for each alias. Robyx
+## resolves the alias at invocation time, so workspaces and scheduled tasks
+## can specify intent ("balanced") instead of a backend-specific model id.
+##
+## Roles map a logical agent purpose to a default alias. They are used when
+## an agent has no explicit ``model`` set.
+
+defaults:
+  orchestrator: balanced
+  workspace: balanced
+  specialist: powerful
+  scheduled: fast
+  one-shot: fast
+
+aliases:
+  fast:
+    claude: haiku
+    codex: gpt-5-mini
+    opencode: openai/gpt-5-mini
+  balanced:
+    claude: sonnet
+    codex: gpt-5
+    opencode: openai/gpt-5
+  powerful:
+    claude: opus
+    codex: gpt-5.4
+    opencode: openai/gpt-5.4

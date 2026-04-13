@@ -1,0 +1,919 @@
+"""Tests for bot.topics — channel/topic management via Platform abstraction."""
+
+import json
+
+import pytest
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import topics
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mock_platform():
+    """A mock Platform with async methods for channel operations."""
+    p = AsyncMock()
+    p.create_channel = AsyncMock(return_value=999)
+    p.close_channel = AsyncMock(return_value=True)
+    p.send_to_channel = AsyncMock(return_value=True)
+    return p
+
+
+@pytest.fixture(autouse=True)
+def _patch_topics_paths(tmp_path, monkeypatch):
+    """Patch all path constants inside the topics module to use tmp_path/data/."""
+    data = tmp_path / "data"
+    monkeypatch.setattr(topics, "AGENTS_DIR", data / "agents")
+    monkeypatch.setattr(topics, "SPECIALISTS_DIR", data / "specialists")
+    monkeypatch.setattr(topics, "TASKS_FILE", data / "tasks.md")
+    monkeypatch.setattr(topics, "SPECIALISTS_FILE", data / "specialists.md")
+    monkeypatch.setattr(topics, "DATA_DIR", data)
+    monkeypatch.setattr(topics, "_timed_cancel_tasks_for_agent_file", lambda *args, **kwargs: 0)
+    data.mkdir(exist_ok=True)
+    (data / "agents").mkdir(exist_ok=True)
+    (data / "specialists").mkdir(exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_task_name
+# ---------------------------------------------------------------------------
+
+class TestSanitizeTaskName:
+    def test_basic_spaces(self):
+        assert topics._sanitize_task_name("My Project") == "my-project"
+
+    def test_special_characters(self):
+        result = topics._sanitize_task_name("Hello World!")
+        # '!' -> '-', but strip('-') removes trailing hyphen
+        assert "hello" in result
+        assert "world" in result
+
+    def test_leading_trailing_whitespace(self):
+        assert topics._sanitize_task_name("  Test  ") == "test"
+
+    def test_already_clean(self):
+        assert topics._sanitize_task_name("clean-name") == "clean-name"
+
+    def test_mixed_case_and_symbols(self):
+        result = topics._sanitize_task_name("ML_Finance 2.0!")
+        assert result.startswith("ml-finance")
+        assert result == result.lower()
+
+    def test_empty_after_strip(self):
+        result = topics._sanitize_task_name("!!!")
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# create_workspace (full flow)
+# ---------------------------------------------------------------------------
+
+class TestCreateWorkspace:
+    @pytest.mark.asyncio
+    async def test_success_full_flow(self, tmp_path, agent_manager, mock_platform):
+        """Channel created -> agent file written -> tasks.md updated -> agent registered -> welcome sent."""
+        mock_platform.create_channel = AsyncMock(return_value=500)
+
+        result = await topics.create_workspace(
+            name="My Workspace",
+            task_type="analysis",
+            frequency="daily",
+            model="claude-sonnet-4-20250514",
+            scheduled_at="08:00",
+            instructions="Do the thing.",
+            manager=agent_manager,
+            work_dir=str(tmp_path / "workspace"),
+            platform=mock_platform,
+        )
+
+        assert result is not None
+        assert result["name"] == "my-workspace"
+        assert result["display_name"] == "My Workspace"
+        assert result["thread_id"] == 500
+        assert result["type"] == "analysis"
+
+        # Agent file written
+        agent_file = tmp_path / "data" / "agents" / "my-workspace.md"
+        assert agent_file.exists()
+        content = agent_file.read_text()
+        assert "# My Workspace" in content
+        assert "Do the thing." in content
+
+        # tasks.md row appended
+        tasks_file = tmp_path / "data" / "tasks.md"
+        assert tasks_file.exists()
+        tasks_text = tasks_file.read_text()
+        assert "| my-workspace |" in tasks_text
+        assert "| analysis |" in tasks_text
+        assert "| daily |" in tasks_text
+        assert "| yes |" in tasks_text
+        assert "| 500 |" in tasks_text
+
+        # Data dir created
+        assert (tmp_path / "data" / "my-workspace").is_dir()
+
+        # Agent registered in manager
+        agent = agent_manager.get("my-workspace")
+        assert agent is not None
+        assert agent.thread_id == 500
+        assert agent.agent_type == "workspace"
+
+        # Welcome message sent via platform
+        mock_platform.send_to_channel.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_topic_creation_fails(self, tmp_path, agent_manager, mock_platform):
+        mock_platform.create_channel = AsyncMock(return_value=None)
+
+        result = await topics.create_workspace(
+            name="Fail",
+            task_type="test",
+            frequency="none",
+            model="claude-sonnet-4-20250514",
+            scheduled_at="none",
+            instructions="Nope",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_frequency_none_becomes_dash(self, tmp_path, agent_manager, mock_platform):
+        mock_platform.create_channel = AsyncMock(return_value=600)
+
+        await topics.create_workspace(
+            name="NoFreq",
+            task_type="test",
+            frequency="none",
+            model="m",
+            scheduled_at="none",
+            instructions="x",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+
+        tasks_text = (tmp_path / "data" / "tasks.md").read_text()
+        # frequency="none" -> "-", scheduled_at="none" -> "-"
+        assert "| - |" in tasks_text
+
+    @pytest.mark.asyncio
+    async def test_agent_file_content(self, tmp_path, agent_manager, mock_platform):
+        """Verify the agent instructions file has the expected format."""
+        mock_platform.create_channel = AsyncMock(return_value=501)
+
+        await topics.create_workspace(
+            name="Agent Check",
+            task_type="test",
+            frequency="daily",
+            model="m",
+            scheduled_at="08:00",
+            instructions="  Trimmed instructions  ",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+
+        agent_file = tmp_path / "data" / "agents" / "agent-check.md"
+        content = agent_file.read_text()
+        assert content.startswith("# Agent Check\n")
+        assert "Trimmed instructions" in content
+        # Instructions are stripped
+        assert "  Trimmed instructions  " not in content
+
+    @pytest.mark.asyncio
+    @patch.object(topics, "_timed_add_task")
+    async def test_one_shot_requires_scheduled_at_before_side_effects(
+        self, mock_add_task, tmp_path, agent_manager, mock_platform
+    ):
+        with pytest.raises(
+            ValueError, match="scheduled_at is required for one-shot workspaces"
+        ):
+            await topics.create_workspace(
+                name="Missing Time",
+                task_type="one-shot",
+                frequency="none",
+                model="m",
+                scheduled_at="none",
+                instructions="x",
+                manager=agent_manager,
+                work_dir=str(tmp_path),
+                platform=mock_platform,
+            )
+
+        mock_platform.create_channel.assert_not_awaited()
+        mock_add_task.assert_not_called()
+        assert not (tmp_path / "data" / "agents" / "missing-time.md").exists()
+        assert agent_manager.get("missing-time") is None
+
+    @pytest.mark.asyncio
+    @patch.object(topics, "_timed_add_task")
+    async def test_one_shot_rejects_malformed_scheduled_at_before_side_effects(
+        self, mock_add_task, tmp_path, agent_manager, mock_platform
+    ):
+        with pytest.raises(
+            ValueError,
+            match="scheduled_at for one-shot workspaces must be a valid ISO datetime",
+        ):
+            await topics.create_workspace(
+                name="Bad Time",
+                task_type="one-shot",
+                frequency="none",
+                model="m",
+                scheduled_at="tomorrow",
+                instructions="x",
+                manager=agent_manager,
+                work_dir=str(tmp_path),
+                platform=mock_platform,
+            )
+
+        mock_platform.create_channel.assert_not_awaited()
+        mock_add_task.assert_not_called()
+        assert not (tmp_path / "data" / "agents" / "bad-time.md").exists()
+
+    @pytest.mark.asyncio
+    @patch.object(topics, "_timed_add_task")
+    async def test_one_shot_normalizes_scheduled_at_before_queue_write(
+        self, mock_add_task, tmp_path, agent_manager, mock_platform
+    ):
+        mock_platform.create_channel = AsyncMock(return_value=502)
+
+        await topics.create_workspace(
+            name="Timed Once",
+            task_type="one-shot",
+            frequency="none",
+            model="m",
+            scheduled_at="2099-06-01T12:00:00",
+            instructions="x",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+
+        queued_task = mock_add_task.call_args.args[0]
+        assert queued_task["scheduled_at"] == "2099-06-01T12:00:00+00:00"
+
+
+# ---------------------------------------------------------------------------
+# Reserved / duplicate name guard
+# ---------------------------------------------------------------------------
+
+
+class TestReservedAndDuplicateNames:
+    """Regression guard for M3: creating a workspace or specialist whose
+    sanitized name collides with a reserved name or an already-registered
+    agent must be rejected *before* any side effect (no channel, no file,
+    no tasks.md row). The failure surfaces as a ``ValueError`` so the
+    handler can show the user a specific reason instead of a generic
+    'failed to create' message."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("display_name", ["robyx", "Robyx", "ROBYX", "orchestrator"])
+    async def test_workspace_rejects_reserved_name(
+        self, display_name, tmp_path, agent_manager, mock_platform
+    ):
+        with pytest.raises(ValueError, match="reserved"):
+            await topics.create_workspace(
+                name=display_name,
+                task_type="interactive",
+                frequency="none",
+                model="m",
+                scheduled_at="none",
+                instructions="nope",
+                manager=agent_manager,
+                work_dir=str(tmp_path),
+                platform=mock_platform,
+            )
+        # No side effects — channel not even requested.
+        mock_platform.create_channel.assert_not_awaited()
+        assert not (tmp_path / "data" / "tasks.md").exists()
+        assert not (tmp_path / "data" / "agents" / "robyx.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_workspace_rejects_empty_sanitized_name(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        # "!!!" sanitizes to "" — must be refused.
+        with pytest.raises(ValueError, match="reserved"):
+            await topics.create_workspace(
+                name="!!!",
+                task_type="interactive",
+                frequency="none",
+                model="m",
+                scheduled_at="none",
+                instructions="x",
+                manager=agent_manager,
+                work_dir=str(tmp_path),
+                platform=mock_platform,
+            )
+        mock_platform.create_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_workspace_rejects_duplicate_name(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        mock_platform.create_channel = AsyncMock(return_value=500)
+        await topics.create_workspace(
+            name="My Thing", task_type="interactive", frequency="none",
+            model="m", scheduled_at="none", instructions="first",
+            manager=agent_manager, work_dir=str(tmp_path), platform=mock_platform,
+        )
+
+        with pytest.raises(ValueError, match="already in use"):
+            await topics.create_workspace(
+                name="my-thing",  # same sanitized form
+                task_type="interactive", frequency="none",
+                model="m", scheduled_at="none", instructions="second",
+                manager=agent_manager, work_dir=str(tmp_path), platform=mock_platform,
+            )
+        # Only the first create_channel call happened.
+        assert mock_platform.create_channel.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_specialist_rejects_reserved_name(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        with pytest.raises(ValueError, match="reserved"):
+            await topics.create_specialist(
+                name="Robyx",
+                model="m",
+                instructions="nope",
+                manager=agent_manager,
+                work_dir=str(tmp_path),
+                platform=mock_platform,
+            )
+        mock_platform.create_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_specialist_rejects_duplicate_of_workspace(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        """A workspace and a specialist cannot share a name — they live in
+        the same AgentManager namespace."""
+        mock_platform.create_channel = AsyncMock(return_value=500)
+        await topics.create_workspace(
+            name="Review", task_type="interactive", frequency="none",
+            model="m", scheduled_at="none", instructions="x",
+            manager=agent_manager, work_dir=str(tmp_path), platform=mock_platform,
+        )
+        with pytest.raises(ValueError, match="already in use"):
+            await topics.create_specialist(
+                name="Review", model="m", instructions="y",
+                manager=agent_manager, work_dir=str(tmp_path), platform=mock_platform,
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("display_name", ["Bad | Name", "Bad\nName"])
+    async def test_workspace_rejects_table_breaking_display_name(
+        self, display_name, tmp_path, agent_manager, mock_platform
+    ):
+        with pytest.raises(ValueError, match="unsupported table characters"):
+            await topics.create_workspace(
+                name=display_name,
+                task_type="interactive",
+                frequency="none",
+                model="m",
+                scheduled_at="none",
+                instructions="x",
+                manager=agent_manager,
+                work_dir=str(tmp_path),
+                platform=mock_platform,
+            )
+
+        mock_platform.create_channel.assert_not_awaited()
+        assert not (tmp_path / "data" / "tasks.md").exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("display_name", ["Bad | Specialist", "Bad\nSpecialist"])
+    async def test_specialist_rejects_table_breaking_display_name(
+        self, display_name, tmp_path, agent_manager, mock_platform
+    ):
+        with pytest.raises(ValueError, match="unsupported table characters"):
+            await topics.create_specialist(
+                name=display_name,
+                model="m",
+                instructions="x",
+                manager=agent_manager,
+                work_dir=str(tmp_path),
+                platform=mock_platform,
+            )
+
+        mock_platform.create_channel.assert_not_awaited()
+        assert not (tmp_path / "data" / "specialists.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# close_workspace
+# ---------------------------------------------------------------------------
+
+class TestCloseWorkspace:
+    @pytest.mark.asyncio
+    @patch.object(topics, "_timed_cancel_tasks_for_agent_file", return_value=2)
+    async def test_success(self, mock_cancel, tmp_path, agent_manager, mock_platform):
+        # Set up: create a workspace first
+        mock_platform.create_channel = AsyncMock(return_value=700)
+
+        await topics.create_workspace(
+            name="ToClose",
+            task_type="test",
+            frequency="daily",
+            model="m",
+            scheduled_at="09:00",
+            instructions="close me",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+
+        # Now close it
+        result = await topics.close_workspace("toclose", agent_manager, platform=mock_platform)
+
+        assert result is True
+
+        # tasks.md should show "no" instead of "yes"
+        tasks_text = (tmp_path / "data" / "tasks.md").read_text()
+        assert "| no |" in tasks_text
+
+        mock_cancel.assert_called_once_with(
+            "agents/toclose.md",
+            reason="workspace closed",
+        )
+
+        # Agent removed from manager
+        assert agent_manager.get("toclose") is None
+
+    @pytest.mark.asyncio
+    async def test_agent_not_found(self, agent_manager, mock_platform):
+        result = await topics.close_workspace("nonexistent", agent_manager, platform=mock_platform)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_agent_no_thread_id(self, tmp_path, agent_manager, mock_platform):
+        """Agent exists but has no thread_id -- should still succeed, skipping topic ops."""
+        agent_manager.add_agent(
+            name="no-thread",
+            work_dir=str(tmp_path),
+            description="test",
+            agent_type="workspace",
+            thread_id=None,
+        )
+        # No platform calls expected since thread_id is None
+        result = await topics.close_workspace("no-thread", agent_manager, platform=mock_platform)
+        assert result is True
+        assert agent_manager.get("no-thread") is None
+
+    @pytest.mark.asyncio
+    @patch.object(topics, "_timed_cancel_tasks_for_agent_file", return_value=1)
+    async def test_cancels_pending_timed_tasks_for_workspace(
+        self, mock_cancel, tmp_path, agent_manager, mock_platform
+    ):
+        agent_manager.add_agent(
+            name="queued-workspace",
+            work_dir=str(tmp_path),
+            description="queued workspace",
+            agent_type="workspace",
+            thread_id=900,
+        )
+
+        result = await topics.close_workspace(
+            "queued-workspace", agent_manager, platform=mock_platform,
+        )
+
+        assert result is True
+        mock_cancel.assert_called_once_with(
+            "agents/queued-workspace.md",
+            reason="workspace closed",
+        )
+
+    @pytest.mark.asyncio
+    async def test_close_workspace_cancels_real_timed_queue_entries(
+        self, tmp_path, agent_manager, mock_platform, monkeypatch
+    ):
+        import timed_scheduler as ts_mod
+
+        queue_file = tmp_path / "data" / "timed_queue.json"
+        tasks_file = tmp_path / "data" / "tasks.md"
+        monkeypatch.setattr(ts_mod, "TIMED_QUEUE_FILE", queue_file)
+        monkeypatch.setattr(topics, "_timed_cancel_tasks_for_agent_file", ts_mod.cancel_tasks_for_agent_file)
+
+        agent_manager.add_agent(
+            name="integrated",
+            work_dir=str(tmp_path),
+            description="integrated workspace",
+            agent_type="workspace",
+            thread_id=901,
+        )
+        tasks_file.write_text(
+            "| Task | Agent | Type | Frequency | Enabled | Model | Thread ID | Description |\n"
+            "|------|-------|------|-----------|---------|-------|-----------|-------------|\n"
+            "| integrated | agents/integrated.md | scheduled | hourly | yes | fast | 901 | Integrated |\n"
+        )
+        queue_file.write_text(json.dumps([
+            {
+                "id": "one-shot",
+                "name": "integrated-once",
+                "agent_file": "agents/integrated.md",
+                "type": "one-shot",
+                "scheduled_at": "2099-01-01T00:00:00+00:00",
+                "status": "pending",
+            },
+            {
+                "id": "periodic",
+                "name": "integrated-periodic",
+                "agent_file": "agents/integrated.md",
+                "type": "periodic",
+                "next_run": "2099-01-01T00:00:00+00:00",
+                "status": "pending",
+            },
+            {
+                "id": "other",
+                "name": "other-workspace",
+                "agent_file": "agents/other.md",
+                "type": "one-shot",
+                "scheduled_at": "2099-01-01T00:00:00+00:00",
+                "status": "pending",
+            },
+        ]))
+
+        result = await topics.close_workspace("integrated", agent_manager, platform=mock_platform)
+
+        assert result is True
+        assert agent_manager.get("integrated") is None
+        assert "| integrated | agents/integrated.md | scheduled | hourly | no |" in tasks_file.read_text()
+
+        queued = {task["id"]: task for task in json.loads(queue_file.read_text())}
+        assert queued["one-shot"]["status"] == "canceled"
+        assert queued["one-shot"]["canceled_reason"] == "workspace closed"
+        assert queued["periodic"]["status"] == "canceled"
+        assert queued["other"]["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# create_specialist
+# ---------------------------------------------------------------------------
+
+class TestCreateSpecialist:
+    @pytest.mark.asyncio
+    async def test_success(self, tmp_path, agent_manager, mock_platform):
+        mock_platform.create_channel = AsyncMock(return_value=800)
+
+        result = await topics.create_specialist(
+            name="Code Reviewer",
+            model="claude-sonnet-4-20250514",
+            instructions="Review code carefully.",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+
+        assert result is not None
+        assert result["name"] == "code-reviewer"
+        assert result["display_name"] == "Code Reviewer"
+        assert result["thread_id"] == 800
+
+        # Specialist file written
+        spec_file = tmp_path / "data" / "specialists" / "code-reviewer.md"
+        assert spec_file.exists()
+        content = spec_file.read_text()
+        assert "Cross-functional Specialist" in content
+        assert "Review code carefully." in content
+
+        # specialists.md updated
+        spec_md = tmp_path / "data" / "specialists.md"
+        assert spec_md.exists()
+        spec_text = spec_md.read_text()
+        assert "| code-reviewer |" in spec_text
+        assert "| 800 |" in spec_text
+
+        # Agent registered as specialist
+        agent = agent_manager.get("code-reviewer")
+        assert agent is not None
+        assert agent.agent_type == "specialist"
+        assert agent.thread_id == 800
+
+    @pytest.mark.asyncio
+    async def test_topic_fails(self, tmp_path, agent_manager, mock_platform):
+        mock_platform.create_channel = AsyncMock(return_value=None)
+
+        result = await topics.create_specialist(
+            name="Bad",
+            model="m",
+            instructions="x",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _append_to_tasks
+# ---------------------------------------------------------------------------
+
+class TestAppendToTasks:
+    def test_file_does_not_exist(self, tmp_path):
+        tasks_file = tmp_path / "data" / "tasks.md"
+        # Ensure it does not exist
+        if tasks_file.exists():
+            tasks_file.unlink()
+
+        row = "| test | agents/test.md | analysis | daily | yes | m | 1 | Test |\n"
+        topics._append_to_tasks(row)
+
+        assert tasks_file.exists()
+        text = tasks_file.read_text()
+        # Should have header + row
+        assert "| Task |" in text
+        assert "| test |" in text
+        lines = text.strip().split("\n")
+        assert len(lines) == 3  # header + separator + row
+
+    def test_file_exists_appends(self, tmp_path):
+        tasks_file = tmp_path / "data" / "tasks.md"
+        header = (
+            "| Task | Agent | Type | Frequency | Enabled | Model | Thread ID | Description |\n"
+            "|------|-------|------|-----------|---------|-------|-----------|-------------|\n"
+            "| existing | agents/existing.md | x | x | yes | m | 1 | Existing |\n"
+        )
+        tasks_file.write_text(header)
+
+        row = "| new | agents/new.md | y | y | yes | m | 2 | New |\n"
+        topics._append_to_tasks(row)
+
+        text = tasks_file.read_text()
+        assert "| existing |" in text
+        assert "| new |" in text
+
+
+# ---------------------------------------------------------------------------
+# _append_to_specialists
+# ---------------------------------------------------------------------------
+
+class TestAppendToSpecialists:
+    def test_file_does_not_exist(self, tmp_path):
+        spec_file = tmp_path / "data" / "specialists.md"
+        if spec_file.exists():
+            spec_file.unlink()
+
+        row = "| spec | specialists/spec.md | m | 1 | Spec |\n"
+        topics._append_to_specialists(row)
+
+        assert spec_file.exists()
+        text = spec_file.read_text()
+        assert "| Agent |" in text
+        assert "| spec |" in text
+
+    def test_file_exists_appends(self, tmp_path):
+        spec_file = tmp_path / "data" / "specialists.md"
+        header = (
+            "| Agent | Instructions | Model | Thread ID | Description |\n"
+            "|-------|-------------|-------|-----------|-------------|\n"
+            "| old | specialists/old.md | m | 1 | Old |\n"
+        )
+        spec_file.write_text(header)
+
+        row = "| new | specialists/new.md | m | 2 | New |\n"
+        topics._append_to_specialists(row)
+
+        text = spec_file.read_text()
+        assert "| old |" in text
+        assert "| new |" in text
+
+
+# ---------------------------------------------------------------------------
+# _disable_task
+# ---------------------------------------------------------------------------
+
+class TestDisableTask:
+    def test_task_found_and_disabled(self, tmp_path):
+        tasks_file = tmp_path / "data" / "tasks.md"
+        content = (
+            "| Task | Agent | Type | Frequency | Enabled | Model | Thread ID | Description |\n"
+            "|------|-------|------|-----------|---------|-------|-----------|-------------|\n"
+            "| my-task | agents/my-task.md | x | daily | yes | m | 1 | My Task |\n"
+        )
+        tasks_file.write_text(content)
+
+        topics._disable_task("my-task")
+
+        text = tasks_file.read_text()
+        assert "| no |" in text
+        assert "| yes |" not in text
+
+    def test_file_missing_no_error(self, tmp_path):
+        tasks_file = tmp_path / "data" / "tasks.md"
+        if tasks_file.exists():
+            tasks_file.unlink()
+        # Should not raise
+        topics._disable_task("anything")
+
+    def test_task_not_found_file_unchanged(self, tmp_path):
+        tasks_file = tmp_path / "data" / "tasks.md"
+        content = (
+            "| Task | Agent | Type | Frequency | Enabled | Model | Thread ID | Description |\n"
+            "|------|-------|------|-----------|---------|-------|-----------|-------------|\n"
+            "| other | agents/other.md | x | daily | yes | m | 1 | Other |\n"
+        )
+        tasks_file.write_text(content)
+
+        topics._disable_task("nonexistent")
+
+        text = tasks_file.read_text()
+        # "yes" should still be there for "other"
+        assert "| yes |" in text
+
+
+# ---------------------------------------------------------------------------
+# create_workspace / create_specialist propagate the ``model`` preference
+# ---------------------------------------------------------------------------
+
+
+class TestCreateWorkspacePersistsModel:
+    """Workspaces and specialists must record their preferred model on the
+    in-memory Agent so :func:`model_preferences.resolve_model_preference`
+    can resolve it later, even when no model is supplied at invocation."""
+
+    @pytest.mark.asyncio
+    async def test_workspace_stores_model_on_agent(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        mock_platform.create_channel = AsyncMock(return_value=801)
+
+        await topics.create_workspace(
+            name="With Model",
+            task_type="interactive",
+            frequency="none",
+            model="powerful",
+            scheduled_at="none",
+            instructions="x",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+
+        agent = agent_manager.get("with-model")
+        assert agent is not None
+        assert agent.model == "powerful"
+
+    @pytest.mark.asyncio
+    async def test_specialist_stores_model_on_agent(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        mock_platform.create_channel = AsyncMock(return_value=802)
+
+        await topics.create_specialist(
+            name="Reviewer",
+            model="balanced",
+            instructions="be terse",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+
+        agent = agent_manager.get("reviewer")
+        assert agent is not None
+        assert agent.model == "balanced"
+        assert agent.agent_type == "specialist"
+
+
+# ---------------------------------------------------------------------------
+# _update_table_thread_id helpers
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateTableThreadId:
+    def test_rewrites_thread_id_for_named_row(self, tmp_path):
+        path = tmp_path / "data" / "tasks.md"
+        path.write_text(
+            "| Task | Agent | Type | Frequency | Enabled | Model | Thread ID | Description |\n"
+            "|------|-------|------|-----------|---------|-------|-----------|-------------|\n"
+            "| alpha | agents/alpha.md | scheduled | hourly | yes | sonnet | - | A |\n"
+            "| beta  | agents/beta.md  | scheduled | daily  | yes | sonnet | 9 | B |\n"
+        )
+        topics._update_task_thread_id("alpha", 123)
+
+        text = path.read_text()
+        # alpha row updated; beta row untouched.
+        assert "| alpha | agents/alpha.md | scheduled | hourly | yes | sonnet | 123 | A |" in text
+        assert "| beta " in text and "| 9 |" in text
+
+    def test_clearing_thread_id_writes_dash(self, tmp_path):
+        path = tmp_path / "data" / "specialists.md"
+        path.write_text(
+            "| Agent | Instructions | Model | Thread ID | Description |\n"
+            "|-------|-------------|-------|-----------|-------------|\n"
+            "| rev | specialists/rev.md | sonnet | 7 | r |\n"
+        )
+        topics._update_specialist_thread_id("rev", None)
+
+        text = path.read_text()
+        assert "| rev | specialists/rev.md | sonnet | - | r |" in text
+
+    def test_missing_file_is_a_noop(self, tmp_path):
+        topics._update_task_thread_id("anything", 1)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# heal_detached_workspaces
+# ---------------------------------------------------------------------------
+
+
+class TestHealDetachedWorkspaces:
+    """When a Telegram restart leaves a workspace with ``Thread ID = -``,
+    booting must transparently re-create the topic and persist the new id."""
+
+    @pytest.mark.asyncio
+    async def test_heals_detached_workspace_and_updates_tasks_md(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        # Pre-create a workspace, then deliberately strip its thread_id to
+        # simulate an old state file from before the topic was lost.
+        mock_platform.create_channel = AsyncMock(return_value=300)
+        await topics.create_workspace(
+            name="Detached", task_type="interactive", frequency="none",
+            model="balanced", scheduled_at="none", instructions="x",
+            manager=agent_manager, work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+        agent = agent_manager.get("detached")
+        agent.thread_id = None
+        agent_manager._rebuild_topic_map()
+        agent_manager.save_state()
+
+        # The tasks.md row should also reflect the detached state. Rewrite
+        # it to "-" so the test starts in the broken state we want to fix.
+        topics._update_task_thread_id("detached", None)
+        assert "| - |" in (tmp_path / "data" / "tasks.md").read_text()
+
+        # Pretend the platform hands us a fresh topic id.
+        mock_platform.create_channel = AsyncMock(return_value=400)
+        mock_platform.send_to_channel = AsyncMock(return_value=True)
+
+        repaired = await topics.heal_detached_workspaces(
+            agent_manager, platform=mock_platform,
+        )
+
+        assert len(repaired) == 1
+        assert repaired[0]["name"] == "detached"
+        assert repaired[0]["thread_id"] == 400
+
+        # Agent re-attached to the new topic, and the tasks.md row reflects it.
+        assert agent_manager.get("detached").thread_id == 400
+        assert "| 400 |" in (tmp_path / "data" / "tasks.md").read_text()
+        # The user receives a welcome message in the freshly attached topic.
+        mock_platform.send_to_channel.assert_awaited_once()
+        assert mock_platform.send_to_channel.await_args.args[0] == 400
+
+    @pytest.mark.asyncio
+    async def test_attached_workspaces_are_left_alone(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        mock_platform.create_channel = AsyncMock(return_value=500)
+        await topics.create_workspace(
+            name="Healthy", task_type="interactive", frequency="none",
+            model="balanced", scheduled_at="none", instructions="x",
+            manager=agent_manager, work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+        # Reset call count after the create flow above.
+        mock_platform.create_channel = AsyncMock(return_value=999)
+
+        repaired = await topics.heal_detached_workspaces(
+            agent_manager, platform=mock_platform,
+        )
+        assert repaired == []
+        mock_platform.create_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_platform_failure_is_recorded_and_not_fatal(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        mock_platform.create_channel = AsyncMock(return_value=600)
+        await topics.create_workspace(
+            name="StillBroken", task_type="interactive", frequency="none",
+            model="fast", scheduled_at="none", instructions="x",
+            manager=agent_manager, work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+        agent_manager.get("stillbroken").thread_id = None
+        agent_manager.save_state()
+
+        # The next attempt to create a topic fails.
+        mock_platform.create_channel = AsyncMock(return_value=None)
+
+        repaired = await topics.heal_detached_workspaces(
+            agent_manager, platform=mock_platform,
+        )
+        assert repaired == []
+        # The agent is still detached but the call did not raise.
+        assert agent_manager.get("stillbroken").thread_id is None
+
+    @pytest.mark.asyncio
+    async def test_no_platform_returns_empty_list(self, agent_manager):
+        result = await topics.heal_detached_workspaces(agent_manager, platform=None)
+        assert result == []
