@@ -49,7 +49,9 @@ class TestClaudeBackend:
         assert "--verbose" in cmd
         assert "--model" in cmd
         assert cmd[cmd.index("--model") + 1] == "sonnet"
-        assert "--permission-mode" not in cmd
+        # bypassPermissions is the default for autonomous operation
+        assert "--permission-mode" in cmd
+        assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions"
         assert "hello" not in cmd
         assert claude_backend.command_stdin_payload("hello") == b"hello\n"
 
@@ -132,7 +134,9 @@ class TestClaudeBackend:
         assert cmd[cmd.index("-d") + 1] == "/home/user/project"
         assert "--model" in cmd
         assert cmd[cmd.index("--model") + 1] == "opus"
-        assert "--permission-mode" not in cmd
+        # Spawn commands always force bypassPermissions (no terminal)
+        assert "--permission-mode" in cmd
+        assert cmd[cmd.index("--permission-mode") + 1] == "bypassPermissions"
         # stream-json should NOT be present
         assert "stream-json" not in cmd
         assert "do stuff" not in cmd
