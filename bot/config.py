@@ -53,8 +53,7 @@ DISCORD_CONTROL_CHANNEL_ID = int(os.environ.get("DISCORD_CONTROL_CHANNEL_ID", "0
 # ── Optional ──
 WORKSPACE = Path(_env("ROBYX_WORKSPACE", "KAELOPS_WORKSPACE", os.path.expanduser("~/Workspace")))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-SCHEDULER_INTERVAL = int(os.environ.get("SCHEDULER_INTERVAL", "600"))  # 10 minutes
-TIMED_SCHEDULER_INTERVAL = int(os.environ.get("TIMED_SCHEDULER_INTERVAL", "60"))  # 1 minute
+SCHEDULER_INTERVAL = int(os.environ.get("SCHEDULER_INTERVAL", "60"))  # unified scheduler tick
 UPDATE_CHECK_INTERVAL = int(os.environ.get("UPDATE_CHECK_INTERVAL", "3600"))  # 1 hour
 
 
@@ -195,7 +194,9 @@ ORCHESTRATOR_MD = PROJECT_ROOT / "ORCHESTRATOR.md"
 SCHEDULER_MD = PROJECT_ROOT / "templates" / "SCHEDULER_AGENT.md"
 AGENTS_DIR = DATA_DIR / "agents"
 SPECIALISTS_DIR = DATA_DIR / "specialists"
-TIMED_QUEUE_FILE = DATA_DIR / "timed_queue.json"
+TIMED_QUEUE_FILE = DATA_DIR / "timed_queue.json"  # legacy — kept for migration
+QUEUE_FILE = DATA_DIR / "queue.json"
+CONTINUOUS_DIR = DATA_DIR / "continuous"
 VERSION_FILE = PROJECT_ROOT / "VERSION"
 RELEASES_DIR = PROJECT_ROOT / "releases"
 UPDATES_STATE_FILE = DATA_DIR / "updates.json"
@@ -227,7 +228,7 @@ When the user provides API keys, tokens, or configuration values (prefer explici
 2. Confirm the change to the user
 3. Emit [RESTART] on its own line to trigger a service restart so the new config takes effect
 The .env file uses KEY=VALUE format (no quotes). Known keys: OPENAI_API_KEY, AI_BACKEND, SCHEDULER_INTERVAL, UPDATE_CHECK_INTERVAL, ROBYX_PLATFORM.
-Also support common keys `AI_CLI_PATH`, `CLAUDE_PERMISSION_MODE`, `ROBYX_WORKSPACE`, `TIMED_SCHEDULER_INTERVAL`; Telegram keys `ROBYX_BOT_TOKEN`, `ROBYX_CHAT_ID`, `ROBYX_OWNER_ID`; Slack keys `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID`, `SLACK_OWNER_ID`; Discord keys `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CONTROL_CHANNEL_ID`, `DISCORD_OWNER_ID`.
+Also support common keys `AI_CLI_PATH`, `CLAUDE_PERMISSION_MODE`, `ROBYX_WORKSPACE`; Telegram keys `ROBYX_BOT_TOKEN`, `ROBYX_CHAT_ID`, `ROBYX_OWNER_ID`; Slack keys `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID`, `SLACK_OWNER_ID`; Discord keys `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CONTROL_CHANNEL_ID`, `DISCORD_OWNER_ID`.
 
 ## Platform Migration
 Robyx supports multiple messaging platforms: Telegram, Discord, and Slack.
@@ -288,8 +289,7 @@ When the user asks you to do something that needs its own space (monitoring, rem
 1. Respond with [CREATE_WORKSPACE name="<name>" type="<interactive|scheduled|one-shot>" frequency="<hourly|every-6h|daily|none>" model="<fast|balanced|powerful or explicit model id>" scheduled_at="<ISO datetime or none>"]
 2. Followed by [AGENT_INSTRUCTIONS]<the full markdown instructions for the workspace agent>[/AGENT_INSTRUCTIONS]
 3. The system will create the topic/channel, write the agent file, register
-   scheduled/interactive workspaces in `data/tasks.md`, queue one-shot
-   workspaces in `data/timed_queue.json`, and spawn the agent automatically.
+   all workspaces in `data/queue.json` and spawn the agent automatically.
    The semantic aliases (`fast`, `balanced`, `powerful`) resolve to the right model
    for whichever AI backend is active. You may also pass an explicit backend model id.
    New workspaces inherit the configured `ROBYX_WORKSPACE` as their stored
@@ -391,11 +391,11 @@ Reminder modes — when to use which:
   [REMIND at="2026-04-10T09:00:00+02:00" agent="cleanup" text="Run the daily cleanup and post the summary to your topic."]
   [REMIND in="1h" agent="monitor" text="Snapshot the dashboard and report anomalies."]
 
-NEVER write to `data/reminders.json` directly. For plain reminders use
+NEVER write to `data/queue.json` directly. For plain reminders use
 the `[REMIND ...]` pattern. For future autonomous work, emit the
 appropriate Robyx command (`[CREATE_WORKSPACE ...]` or an action
 reminder with `agent="..."`) instead of appending raw JSON to
-`data/timed_queue.json` yourself. Multiple `[REMIND ...]` lines in one
+`data/queue.json` yourself. Multiple `[REMIND ...]` lines in one
 response are allowed. After scheduling,
 briefly confirm to the user what you set up
 ("Ho impostato un reminder per …" / "Reminder set for …").
@@ -482,10 +482,10 @@ Reminder modes — when to use which:
   [REMIND at="2026-04-10T09:00:00+02:00" agent="cleanup" text="Run the daily cleanup and post the summary to your topic."]
   [REMIND in="1h" agent="monitor" text="Snapshot the dashboard and report anomalies."]
 
-NEVER write to `data/reminders.json` directly. For plain reminders use
+NEVER write to `data/queue.json` directly. For plain reminders use
 the `[REMIND ...]` pattern. If you need a future autonomous run that does
 real work, use the validated helper shown below instead of appending raw
-JSON to `data/timed_queue.json` yourself. Multiple `[REMIND ...]` lines in
+JSON to `data/queue.json` yourself. Multiple `[REMIND ...]` lines in
 one response are allowed. After scheduling,
 briefly confirm to the user what you set up
 ("Ho impostato un reminder per …" / "Reminder set for …").
@@ -498,13 +498,13 @@ queue. For "ping me at T with this text", use the `[REMIND ...]` pattern
 above instead — it is cheaper, simpler, and the right tool 99% of the time.
 
 You can schedule a one-shot or periodic task to run at a precise future
-time with `timed_scheduler.add_task(...)`. It validates `name` and
-`agent_file` and persists atomically into `data/timed_queue.json`.
+time with `scheduler.add_task(...)`. It validates `name` and
+`agent_file` and persists atomically into `data/queue.json`.
 
 ```python
 import uuid
 from datetime import datetime, timezone
-from timed_scheduler import add_task
+from scheduler import add_task
 
 add_task({
     "id": str(uuid.uuid4()),
@@ -585,10 +585,10 @@ Reminder modes — when to use which:
   [REMIND at="2026-04-10T09:00:00+02:00" agent="cleanup" text="Run the daily cleanup and post the summary to your topic."]
   [REMIND in="1h" agent="monitor" text="Snapshot the dashboard and report anomalies."]
 
-NEVER write to `data/reminders.json` directly. For plain reminders use
+NEVER write to `data/queue.json` directly. For plain reminders use
 the `[REMIND ...]` pattern. If you need a future autonomous run that does
-real work, use `timed_scheduler.add_task(...)` instead of appending raw
-JSON to `data/timed_queue.json` yourself. Multiple `[REMIND ...]` lines in
+real work, use `scheduler.add_task(...)` instead of appending raw
+JSON to `data/queue.json` yourself. Multiple `[REMIND ...]` lines in
 one response are allowed. After scheduling,
 briefly confirm to the user what you set up
 ("Ho impostato un reminder per …" / "Reminder set for …").

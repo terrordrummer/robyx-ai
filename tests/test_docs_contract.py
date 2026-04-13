@@ -21,7 +21,6 @@ def test_env_example_lists_cross_platform_config_keys():
         "ROBYX_WORKSPACE=",
         "OPENAI_API_KEY=",
         "SCHEDULER_INTERVAL=",
-        "TIMED_SCHEDULER_INTERVAL=",
         "UPDATE_CHECK_INTERVAL=",
         "ROBYX_BOT_TOKEN=",
         "ROBYX_CHAT_ID=",
@@ -43,11 +42,10 @@ def test_env_example_lists_cross_platform_config_keys():
 def test_readme_documents_current_cross_platform_contract():
     contents = _read("README.md")
 
-    assert "TIMED_SCHEDULER_INTERVAL" in contents
+    assert "SCHEDULER_INTERVAL" in contents
     assert "CLAUDE_PERMISSION_MODE" in contents
     assert "SLACK_APP_TOKEN" in contents
     assert "DISCORD_CONTROL_CHANNEL_ID" in contents
-    assert "data/timed_queue.json" in contents
     assert "relay the parsed result back into the target topic/channel" in contents
     assert "one Telegram group" not in contents
     assert "Agent logs result to log.txt" not in contents
@@ -60,7 +58,7 @@ def test_orchestrator_documents_current_cross_platform_contract():
     assert "AI_CLI_PATH" in contents
     assert "CLAUDE_PERMISSION_MODE" in contents
     assert "ROBYX_WORKSPACE" in contents
-    assert "TIMED_SCHEDULER_INTERVAL" in contents
+    assert "SCHEDULER_INTERVAL" in contents
     assert "SLACK_APP_TOKEN" in contents
     assert "DISCORD_CONTROL_CHANNEL_ID" in contents
     assert "post their result back into the target workspace topic/channel" in contents
@@ -73,10 +71,9 @@ def test_robyx_prompt_mentions_full_platform_key_set():
     assert "AI_CLI_PATH" in prompt
     assert "CLAUDE_PERMISSION_MODE" in prompt
     assert "ROBYX_WORKSPACE" in prompt
-    assert "TIMED_SCHEDULER_INTERVAL" in prompt
     assert "SLACK_APP_TOKEN" in prompt
     assert "DISCORD_CONTROL_CHANNEL_ID" in prompt
-    assert "data/timed_queue.json" in prompt
+    assert "data/queue.json" in prompt
     assert "manage a staff of AI agents through Telegram." not in prompt
     assert "tasks.md entry automatically." not in prompt
     assert "ONE manual step" not in prompt
