@@ -46,7 +46,7 @@ def test_readme_documents_current_cross_platform_contract():
     assert "CLAUDE_PERMISSION_MODE" in contents
     assert "SLACK_APP_TOKEN" in contents
     assert "DISCORD_CONTROL_CHANNEL_ID" in contents
-    assert "relay the parsed result back into the target topic/channel" in contents
+    assert "relays the parsed result back into the target topic/channel" in contents
     assert "one Telegram group" not in contents
     assert "Agent logs result to log.txt" not in contents
     assert "one manual step" not in contents

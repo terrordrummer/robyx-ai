@@ -244,7 +244,7 @@ Robyx:  Schedules a [REMIND] entry. The Python reminder engine fires
        at the exact minute, survives bot restarts, no LLM needed.
 ```
 
-Reminders are a **universal skill**: any agent in Robyx — Robyx, workspaces, specialists, and focused-mode agents — can schedule one with the `[REMIND ...]` pattern. The bot parses the pattern, queues it into `data/reminders.json`, and the engine delivers the message at the exact time. See **Reminders** in `ORCHESTRATOR.md` for the attribute reference.
+Reminders are a **universal skill**: any agent in Robyx — Robyx, workspaces, specialists, and focused-mode agents — can schedule one with the `[REMIND ...]` pattern. The bot parses the pattern, queues it into the unified `data/queue.json`, and the scheduler delivers the message at the exact time. See **Reminders** in `ORCHESTRATOR.md` for the attribute reference.
 
 Every agent lives in its own topic/channel. You can talk to any agent directly by opening it, or use `/focus <name>` to redirect all messages to that agent.
 
@@ -345,8 +345,8 @@ A workspace is the fundamental unit of Robyx. When Robyx creates one, this is wh
                                        (forum topic on Telegram,
                                         channel on Discord/Slack)
 2. Agent instructions generated    →  data/agents/btc-monitor.md
-3. Scheduler entry written         →  interactive/scheduled: data/tasks.md
-                                       one-shot: data/timed_queue.json
+3. Scheduler entry written         →  data/queue.json (one-shot/periodic/continuous)
+                                       (interactive workspaces are agent-only)
 4. Data directory created          →  data/btc-monitor/
 5. Agent activated                 →  ready to work
 ```
@@ -378,19 +378,28 @@ Three ways to interact with a workspace agent:
 
 ## The Scheduler
 
-Robyx uses two automation loops:
+Robyx uses a **unified scheduler** (`SCHEDULER_INTERVAL`, default `60s`) that reads `data/queue.json` every cycle and handles all task types:
 
-- The periodic scheduler (`SCHEDULER_INTERVAL`, default `600`) reads `data/tasks.md` and dispatches enabled `scheduled` workspaces. `interactive` rows stay user-triggered.
-- The timed scheduler (`TIMED_SCHEDULER_INTERVAL`, default `60`) reads `data/timed_queue.json` for one-shot workspaces, timed periodic runs, and `[REMIND agent="..."]` actions, and reads `data/reminders.json` for plain text reminders.
+| Type | Purpose |
+|------|---------|
+| `reminder` | Plain text delivery at a precise time (no LLM) |
+| `one-shot` | Agent subprocess at a specific date/time |
+| `periodic` | Recurring agent subprocess on an interval |
+| `continuous` | Iterative autonomous work — step-by-step until objective reached |
 
-Both automation paths follow the same runtime contract:
+The scheduler follows a consistent runtime contract:
 
-- They spawn independent AI CLI processes and exit immediately.
-- They use PID lock files under `data/<task>/lock` to prevent duplicate runs and clean up stale locks.
-- They execute in the target agent's stored `work_dir`.
-- They keep raw output in per-task logs and relay the parsed result back into the target topic/channel, so logs remain operational artifacts rather than the only delivery path.
+- Spawns independent AI CLI processes and exits immediately.
+- Uses PID lock files under `data/<task>/lock` to prevent duplicate runs and clean stale locks.
+- Executes in the target agent's stored `work_dir`.
+- Keeps raw output in per-task logs and relays the parsed result back into the target topic/channel.
+- Uses an atomic claim system to prevent double-dispatch on concurrent access.
 
-One-shot workspaces live in `data/timed_queue.json`. After they fire, the timed queue marks them `dispatched`; closing a workspace also cancels any still-pending timed rows that target it.
+After one-shot tasks fire, the queue marks them `dispatched`; closing a workspace cancels any still-pending queue entries that target it.
+
+### Continuous Tasks
+
+Continuous tasks enable autonomous, iterative work. Each gets a dedicated workspace topic, a git branch (in the target project's repo), and a state file. The scheduler dispatches one step at a time; each step commits, updates the state, and plans the next step. The user can interrupt at any time by messaging the continuous task's topic.
 
 ---
 
@@ -499,7 +508,6 @@ Robyx always parses the compatibility keys `KAELOPS_BOT_TOKEN`, `KAELOPS_CHAT_ID
 | `KAELOPS_WORKSPACE` | — | Default `work_dir` inherited by newly created workspaces and specialists (default: `~/Workspace`) |
 | `OPENAI_API_KEY` | — | For voice message transcription (Whisper) |
 | `SCHEDULER_INTERVAL` | — | Scheduler check interval in seconds (default: `600`) |
-| `TIMED_SCHEDULER_INTERVAL` | — | Timed queue / reminder check interval in seconds (default: `60`) |
 | `UPDATE_CHECK_INTERVAL` | — | Auto-update check interval in seconds (default: `3600`) |
 
 ### Telegram
@@ -740,7 +748,8 @@ robyx-ai/
 │   ├── ai_invoke.py           # CLI invocation, streaming, response patterns
 │   ├── handlers.py            # Command & message handlers (platform-agnostic)
 │   ├── scheduler.py           # Periodic task scheduler loop
-│   ├── timed_scheduler.py     # One-shot & timed task queue (60-sec loop)
+│   ├── continuous.py           # Continuous task state management
+
 │   ├── scheduled_delivery.py  # Output relay from scheduled runs to topics
 │   ├── task_runtime.py        # Agent context resolver for scheduled tasks
 │   ├── reminders.py           # Cross-platform text reminder engine
