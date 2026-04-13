@@ -153,7 +153,7 @@ def clear_registry_for_tests() -> None:
     description="Rename the platform's main channel/topic to 'Command Bridge'",
 )
 async def _rename_to_command_bridge(platform, manager) -> bool:
-    """Historical migration: rename Kael's home to "Command Bridge".
+    """Historical migration: rename orchestrator's home to "Command Bridge".
 
     Kept in the registry for installs that have never run it (e.g. fresh
     clones that pull straight to a post-0.14 version). New installs will
@@ -171,7 +171,7 @@ async def _rename_to_command_bridge(platform, manager) -> bool:
 
 @migration(
     id="0.14.0-rename-command-bridge-to-headquarters",
-    description="Rename Kael's home from 'Command Bridge' to 'Headquarters'",
+    description="Rename orchestrator's home from 'Command Bridge' to 'Headquarters'",
 )
 async def _rename_to_headquarters(platform, manager) -> bool:
     """Rename the control room from 'Command Bridge' to 'Headquarters'.

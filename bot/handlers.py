@@ -374,7 +374,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             )
 
     async def _handle_workspace_commands(response, chat_id, platform, thread_id):
-        """Parse and execute workspace/specialist creation/closure commands from Kael."""
+        """Parse and execute workspace/specialist creation/closure commands from Robyx."""
         # Handle CREATE_WORKSPACE (supports multiple in one response)
         ws_matches = list(CREATE_WORKSPACE_PATTERN.finditer(response))
         instr_matches = list(AGENT_INSTRUCTIONS_PATTERN.finditer(response))
@@ -417,7 +417,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
                     )
                 except ValueError as e:
                     # Reserved name / duplicate name — surface the reason
-                    # verbatim so Kael can explain it to the user instead
+                    # verbatim so Robyx can explain it to the user instead
                     # of the generic failure message.
                     log.warning("create_workspace(%s) rejected: %s", ws_name, e)
                     result = None
@@ -790,11 +790,11 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
         1. Message arrives from a forum topic / thread that maps to a known
            workspace/specialist agent → route to that agent, stay in-thread.
         2. Message arrives from the platform's *main* destination → fall back
-           to @mention / focus / Kael; reply in-place (no thread rewrite).
+           to @mention / focus / Robyx; reply in-place (no thread rewrite).
         3. Message arrives from an un-mapped topic/thread → do NOT invoke any
            AI. Reply in the same thread telling the user the topic is orphaned.
            This prevents silent migration of the conversation to #general,
-           which was the old "Kael stops typing and typing appears in general"
+           which was the old "Robyx stops typing and typing appears in general"
            failure mode.
         """
         thread_id = msg.thread_id

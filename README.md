@@ -262,9 +262,9 @@ Robyx has three types of agents, each with a distinct purpose:
                                      │
                                      ▼
                         ┌──────────────────────────┐
-                        │         KAEL              │
+                        │        ROBYX              │
                         │  Principal Orchestrator   │
-                        │  Lives in Headquarters   │
+                        │  Lives in Headquarters    │
                         │  Creates & manages all    │
                         │  agents and workspaces    │
                         └──┬─────────┬──────────┬──┘
@@ -311,18 +311,9 @@ Each workspace is its own **topic/channel** with a **dedicated AI agent**. The a
 - Follows custom instructions written by Robyx (or by you)
 - Can request help from specialists
 
-New workspaces inherit the configured `KAELOPS_WORKSPACE` as their initial `work_dir`.
-Robyx does not currently auto-discover a different filesystem path for each workspace.
+New workspaces inherit the configured `ROBYX_WORKSPACE` (or legacy `KAELOPS_WORKSPACE`) as their initial `work_dir`.
 
-Workspace agents come in three types:
-
-| Type | Behavior | Example |
-|------|----------|---------|
-| `interactive` | Responds when you message its topic/channel | A project assistant |
-| `scheduled` | Runs on a timer (hourly, daily, etc.) | A system monitor |
-| `one-shot` | Runs once at a specific time via the timed queue | A scheduled R&D iteration |
-
-> Note: simple "ping me at T" reminders no longer need a `one-shot` workspace. Any agent can schedule them directly with the universal `[REMIND ...]` skill — use `one-shot` only when you actually need an agent re-invoked at a specific time to *do work*.
+A workspace is not limited to a single mode — the same agent can respond interactively when you message it, run scheduled tasks on a timer, and have continuous autonomous work in progress. The scheduler section below explains the full range of what agents can do.
 
 ### Specialists — The Experts
 
@@ -378,28 +369,35 @@ Three ways to interact with a workspace agent:
 
 ## The Scheduler
 
-Robyx uses a **unified scheduler** (`SCHEDULER_INTERVAL`, default `60s`) that reads `data/queue.json` every cycle and handles all task types:
+Robyx has a **unified scheduler** that runs every 60 seconds (configurable via `SCHEDULER_INTERVAL`). It manages everything that happens automatically — from simple reminders to long-running autonomous tasks. All entries live in a single `data/queue.json` file.
 
-| Type | Purpose |
-|------|---------|
-| `reminder` | Plain text delivery at a precise time (no LLM) |
-| `one-shot` | Agent subprocess at a specific date/time |
-| `periodic` | Recurring agent subprocess on an interval |
-| `continuous` | Iterative autonomous work — step-by-step until objective reached |
+### What the scheduler can do
 
-The scheduler follows a consistent runtime contract:
+**Reminders** — plain text delivered at an exact time, no AI involved. Any agent can schedule one with the `[REMIND ...]` pattern. "Remind me Thursday at 9am — dentist appointment" just works. Survives restarts, no LLM invocation needed.
 
-- Spawns independent AI CLI processes and exits immediately.
-- Uses PID lock files under `data/<task>/lock` to prevent duplicate runs and clean stale locks.
-- Executes in the target agent's stored `work_dir`.
-- Keeps raw output in per-task logs and relays the parsed result back into the target topic/channel.
-- Uses an atomic claim system to prevent double-dispatch on concurrent access.
+**One-shot tasks** — an agent subprocess that runs once at a specific date/time. Use this when you need an agent to *do work* at a scheduled moment: "Run a security scan tonight at 2am", "Generate the weekly report next Monday at 8am".
 
-After one-shot tasks fire, the queue marks them `dispatched`; closing a workspace cancels any still-pending queue entries that target it.
+**Periodic tasks** — recurring agent invocations on an interval (hourly, daily, etc.). A system monitor that checks server health every 6 hours, a price tracker that runs every 30 minutes — the scheduler keeps firing them until the workspace is closed or paused.
 
-### Continuous Tasks
+**Continuous tasks** — autonomous, iterative work that the scheduler keeps alive step-by-step until the objective is reached or the user intervenes. Each continuous task gets:
+- A **dedicated workspace topic** (prefixed with 🔄)
+- A **git branch** in the target project's repo
+- A **state file** tracking progress, completed steps, and the plan for the next step
 
-Continuous tasks enable autonomous, iterative work. Each gets a dedicated workspace topic, a git branch (in the target project's repo), and a state file. The scheduler dispatches one step at a time; each step commits, updates the state, and plans the next step. Any user message to a busy agent interrupts the running subprocess immediately, so the user's request is processed without waiting for the current task to finish.
+The scheduler dispatches one step at a time. Each step: executes, commits its changes, updates the state, and plans the next step. The scheduler picks up the next step on the following cycle. This is how you can say "refactor the auth module into smaller files" and walk away — the agent works through it methodically, one step at a time.
+
+### Agent interruption
+
+Any user message to a busy agent **interrupts the running subprocess immediately** (SIGTERM → 5s grace → SIGKILL). Your message is processed right away instead of queuing behind the current task. This works for all agent types — interactive, scheduled, or continuous. You can always stop, redirect, or interact with an agent mid-task.
+
+### Runtime contract
+
+- Each task spawns an independent AI CLI process.
+- PID lock files under `data/<task>/lock` prevent duplicate runs and clean stale locks.
+- Tasks execute in the target agent's stored `work_dir`.
+- Output is logged per-task and relayed back into the target topic/channel.
+- An atomic claim system prevents double-dispatch on concurrent access.
+- One-shot tasks are marked `dispatched` after firing; closing a workspace cancels all its pending queue entries.
 
 ---
 
@@ -450,7 +448,7 @@ Create one for each."
 ```
 
 Robyx creates three workspace topics/channels and three agents with appropriate instructions. By default,
-each new workspace inherits the configured `KAELOPS_WORKSPACE` as its starting
+each new workspace inherits the configured `ROBYX_WORKSPACE` as its starting
 `work_dir`; Robyx does not auto-map each workspace to a separate project directory.
 
 ### Add Specialists
@@ -495,28 +493,28 @@ Pre-built agent platforms give you 500 skills you didn't ask for and charge you 
 
 All settings live in `.env` (see [`.env.example`](.env.example)).
 
-Robyx always parses the compatibility keys `KAELOPS_BOT_TOKEN`, `KAELOPS_CHAT_ID`, and `KAELOPS_OWNER_ID` at startup. On Telegram they are real values. On Slack and Discord the installer writes harmless placeholder values so the shared config loader still boots; if you maintain `.env` by hand, keep the placeholder examples from [`.env.example`](.env.example).
+All env vars use the `ROBYX_` prefix. Legacy `KAELOPS_` prefixes are still accepted for backward compatibility. On Telegram the bot token, chat ID, and owner ID are real values. On Slack and Discord the installer writes harmless placeholder values so the shared config loader still boots; if you maintain `.env` by hand, keep the placeholder examples from [`.env.example`](.env.example).
 
 ### Common
 
 | Variable | Required | Description |
 |----------|:--------:|-------------|
-| `KAELOPS_PLATFORM` | Yes | `telegram` / `discord` / `slack` |
+| `ROBYX_PLATFORM` | Yes | `telegram` / `discord` / `slack` (legacy `KAELOPS_PLATFORM` also accepted) |
 | `AI_BACKEND` | Yes | `claude` / `codex` / `opencode` |
 | `AI_CLI_PATH` | — | Custom CLI path (auto-detected if on `PATH`) |
-| `CLAUDE_PERMISSION_MODE` | — | Advanced Claude-only override. Leave unset to keep Claude Code's default permission prompts; set explicitly only if you want a non-default mode such as `bypassPermissions` |
-| `KAELOPS_WORKSPACE` | — | Default `work_dir` inherited by newly created workspaces and specialists (default: `~/Workspace`) |
+| `CLAUDE_PERMISSION_MODE` | — | Claude Code permission mode (default: `bypassPermissions` for autonomous operation). Override to a different mode if needed. |
+| `ROBYX_WORKSPACE` | — | Default `work_dir` inherited by newly created workspaces and specialists (default: `~/Workspace`). Legacy `KAELOPS_WORKSPACE` is also accepted. |
 | `OPENAI_API_KEY` | — | For voice message transcription (Whisper) |
-| `SCHEDULER_INTERVAL` | — | Scheduler check interval in seconds (default: `600`) |
+| `SCHEDULER_INTERVAL` | — | Scheduler check interval in seconds (default: `60`) |
 | `UPDATE_CHECK_INTERVAL` | — | Auto-update check interval in seconds (default: `3600`) |
 
 ### Telegram
 
 | Variable | Required | Description |
 |----------|:--------:|-------------|
-| `KAELOPS_BOT_TOKEN` | Yes | Bot token from @BotFather |
-| `KAELOPS_CHAT_ID` | Yes | Supergroup chat ID (negative number) |
-| `KAELOPS_OWNER_ID` | Yes | Your Telegram user ID |
+| `ROBYX_BOT_TOKEN` | Yes | Bot token from @BotFather (legacy `KAELOPS_BOT_TOKEN` also accepted) |
+| `ROBYX_CHAT_ID` | Yes | Supergroup chat ID (negative number) (legacy `KAELOPS_CHAT_ID` also accepted) |
+| `ROBYX_OWNER_ID` | Yes | Your Telegram user ID (legacy `KAELOPS_OWNER_ID` also accepted) |
 
 ### Discord
 
@@ -574,7 +572,7 @@ Adding a new backend is one class in [`ai_backend.py`](bot/ai_backend.py) — im
 
 When using Claude Code, responses are **streamed in real-time**. Agents can emit `[STATUS ...]` markers that appear instantly in chat, so you see progress instead of just "typing...".
 
-Robyx no longer forces Claude Code into `bypassPermissions` by default. If you want a non-default Claude permission mode, set `CLAUDE_PERMISSION_MODE=...` explicitly in `.env`. Leaving it blank preserves Claude Code's own interactive safety behaviour.
+Robyx defaults to `bypassPermissions` so agents can operate autonomously without terminal interaction. Override via `CLAUDE_PERMISSION_MODE` in `.env` if you want a different mode.
 
 OpenCode runs with `--format json` and resumes its native session via `--session ses_…` so multi-turn conversations stay coherent across messages and bot restarts. Robyx captures the session id from the CLI output on the first turn and replays it automatically on every subsequent turn.
 
@@ -747,12 +745,10 @@ robyx-ai/
 │   ├── ai_backend.py          # AI backend abstraction
 │   ├── ai_invoke.py           # CLI invocation, streaming, response patterns
 │   ├── handlers.py            # Command & message handlers (platform-agnostic)
-│   ├── scheduler.py           # Periodic task scheduler loop
-│   ├── continuous.py           # Continuous task state management
-
+│   ├── scheduler.py           # Unified scheduler (reminders, one-shot, periodic, continuous)
+│   ├── continuous.py          # Continuous task state management
 │   ├── scheduled_delivery.py  # Output relay from scheduled runs to topics
 │   ├── task_runtime.py        # Agent context resolver for scheduled tasks
-│   ├── reminders.py           # Cross-platform text reminder engine
 │   ├── memory.py              # Agent memory system
 │   ├── model_preferences.py   # Backend-aware model alias resolution
 │   ├── topics.py              # Workspace/channel creation
@@ -775,10 +771,12 @@ robyx-ai/
 └── data/                      # Runtime data (gitignored, created on first boot)
     ├── bot.pid                # Single-instance lock
     ├── state.json             # Agent state persistence
+    ├── queue.json             # Unified scheduler queue (all task types)
     ├── tasks.md               # Workspace registry (auto-managed)
     ├── specialists.md         # Specialist registry (auto-managed)
     ├── agents/                # Workspace agent briefs (.md)
     ├── specialists/           # Specialist briefs (.md)
+    ├── continuous/            # Continuous task state files
     ├── migrations.json        # Applied migrations tracker
     └── memory/                # Robyx & specialist memory
 ```
