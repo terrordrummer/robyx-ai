@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.20.4
+
+### Added
+- **`bot/handlers.py`** — Bare "help" message in Headquarters is now intercepted and handled as `/help`, so users don't need the `/` prefix.
+
+### Changed
+- **`bot/i18n.py`** — Improved `/help` text with clearer command descriptions and usage hints.
+
 ## 0.20.3
 
 ### Fixed

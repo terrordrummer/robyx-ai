@@ -74,17 +74,17 @@ STRINGS = {
     # Help
     "help_text": (
         "*Robyx* — AI Agent Staff\n\n"
-        "Commands:\n"
-        "/workspaces — List active workspaces\n"
-        "/specialists — List cross-functional agents\n"
-        "/status — System overview\n"
-        "/focus <name|off> — Focus on an agent\n"
-        "/reset <name> — Reset agent session\n"
-        "/ping — Check bot is alive\n"
-        "/checkupdate — Check for new versions\n"
-        "/doupdate — Apply pending update\n\n"
-        "Talk to Robyx on the Headquarters to create workspaces, "
-        "assign tasks, or manage your agent staff."
+        "*Commands:*\n"
+        "/workspaces — Show active workspaces and their status\n"
+        "/specialists — Show cross-functional specialist agents\n"
+        "/status — System overview (agents, focus, scheduler)\n"
+        "/focus `<name|off>` — Route all messages to a specific agent (or disable)\n"
+        "/reset `<name>` — Reset an agent's session (fresh conversation)\n"
+        "/ping — Quick health check\n"
+        "/checkupdate — Check if a new Robyx version is available\n"
+        "/doupdate — Download and apply a pending update\n\n"
+        "Send any message in Headquarters to talk to the orchestrator. "
+        "Messages in workspace topics go directly to that agent."
     ),
 
     # Updates
