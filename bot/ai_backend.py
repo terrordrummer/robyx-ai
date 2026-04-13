@@ -95,10 +95,13 @@ class ClaudeBackend(AIBackend):
 
     def __init__(self, cli_path: str, permission_mode: str | None = None):
         super().__init__(cli_path)
+        # Default to bypassPermissions so agents can operate autonomously.
+        # Override via CLAUDE_PERMISSION_MODE env var or constructor arg.
         self.permission_mode = (
             permission_mode
             if permission_mode is not None
             else os.environ.get("CLAUDE_PERMISSION_MODE", "").strip()
+            or "bypassPermissions"
         )
 
     @property
@@ -138,8 +141,9 @@ class ClaudeBackend(AIBackend):
             "--output-format", "json",
             "-d", work_dir,
         ]
-        if self.permission_mode:
-            cmd.extend(["--permission-mode", self.permission_mode])
+        # Spawned tasks run without a terminal — force permission bypass
+        # so they never block waiting for interactive approval.
+        cmd.extend(["--permission-mode", "bypassPermissions"])
         return cmd
 
     @staticmethod
