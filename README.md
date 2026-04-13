@@ -1,8 +1,6 @@
 <div align="center">
 
-<img src="robyx-ai.png" alt="Robyx" width="400">
-
-# Robyx
+<img src="robyx-banner.png" alt="Robyx" width="100%">
 
 **Your AI staff, managed from chat.**
 
