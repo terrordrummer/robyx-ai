@@ -134,8 +134,9 @@ then emit:
 
 ### User Interaction
 
-- The user can send a message in the continuous task's topic to **interrupt**
-  the running step agent and interact directly
+- Any user message to a busy agent **interrupts** the running subprocess
+  immediately (SIGTERM → 5s grace → SIGKILL), so the user's request is
+  processed without waiting for the current step to finish
 - The user can ask the agent to pause, resume, or change direction
 - If the agent needs input, it sets `status: "awaiting-input"` and the
   scheduler pauses until the user responds
