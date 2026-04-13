@@ -610,8 +610,7 @@ def setup():
 
     # Step 6: Scheduler interval
     print("\n--- Step 6: Scheduler ---\n")
-    config["SCHEDULER_INTERVAL"] = ask("Scheduler check interval in seconds", default="600")
-    config["TIMED_SCHEDULER_INTERVAL"] = "60"
+    config["SCHEDULER_INTERVAL"] = ask("Unified scheduler tick interval in seconds", default="60")
     config["UPDATE_CHECK_INTERVAL"] = "3600"
     config["CLAUDE_PERMISSION_MODE"] = ""
 
@@ -790,7 +789,6 @@ def setup_noninteractive(args):
     # Optional
     config["OPENAI_API_KEY"] = args.openai_key
     config["SCHEDULER_INTERVAL"] = args.scheduler_interval
-    config["TIMED_SCHEDULER_INTERVAL"] = "60"
     config["UPDATE_CHECK_INTERVAL"] = "3600"
     config["CLAUDE_PERMISSION_MODE"] = ""
 

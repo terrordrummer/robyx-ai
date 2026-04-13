@@ -3,9 +3,9 @@
 ## Entrypoints
 - Main runtime entrypoint is `bot/bot.py`.
 - `bot/handlers.py` owns command/message routing.
-- `bot/topics.py` is the write path for workspace/specialist creation and mutates `data/tasks.md`, `data/specialists.md`, and instruction files under `data/agents/` and `data/specialists/`. These paths live under `data/` (gitignored) since v0.16; the repo ships a clean shell with no personal runtime data.
-- `bot/scheduler.py` treats `data/tasks.md` as executable config and spawns detached AI CLI processes. Rows still use the semantic `agents/<name>.md` column value — `spawn_task` resolves it against `DATA_DIR`, not `PROJECT_ROOT`.
-- `bot/timed_scheduler.py` owns the one-shot and timed task queue (`data/timed_queue.json`). Agents schedule work via `timed_scheduler.add_task(...)`.
+- `bot/topics.py` is the write path for workspace/specialist/continuous-task creation and mutates `data/queue.json`, `data/specialists.md`, and instruction files under `data/agents/` and `data/specialists/`. These paths live under `data/` (gitignored) since v0.16; the repo ships a clean shell with no personal runtime data.
+- `bot/scheduler.py` is the unified scheduler (every 60s). It reads `data/queue.json` and handles all task types: reminders, one-shot, periodic, and continuous. Agents schedule work via `scheduler.add_task(...)`.
+- `bot/continuous.py` manages state for continuous (iterative autonomous) tasks. State lives in `data/continuous/<name>/state.json`.
 - `bot/task_runtime.py` resolves agent identity and `work_dir` for scheduled/timed runs so they execute with the correct context and memory.
 - `bot/scheduled_delivery.py` relays parsed AI output from scheduled runs back into the target workspace/specialist topic.
 - `bot/config_updates.py` intercepts `KEY=value` messages in `handlers.py` and applies them directly to `.env` without routing secrets through the AI backend.
@@ -24,9 +24,10 @@
 - `OpenCodeBackend` only forwards `--model` when the model string contains `/`; plain names like `sonnet` are ignored for OpenCode runs.
 
 ## File Format Contracts
-- `data/tasks.md` and `data/specialists.md` are machine-parsed Markdown tables, not documentation. Preserve pipe-table structure and column order when editing manually.
-- `scheduler.parse_tasks()` expects 8 columns in `data/tasks.md`.
-- Legacy one-shot rows may store the ISO timestamp in the `Frequency` column until `bot/timed_scheduler.py:migrate_oneshot_from_tasks_md()` moves them into `data/timed_queue.json`; `scheduler.is_task_due()` never dispatches one-shot rows.
+- `data/queue.json` is the unified task queue (reminders, one-shot, periodic, continuous). All entries share an atomic claim system.
+- `data/specialists.md` is a machine-parsed Markdown table. Preserve pipe-table structure and column order when editing manually.
+- `data/continuous/<name>/state.json` tracks iterative task progress (steps, history, next planned step).
+- Legacy formats (`data/tasks.md`, `data/timed_queue.json`, `data/reminders.json`) are migrated automatically at boot into `queue.json`.
 
 ## Changelog
 - Maintain `CHANGELOG.md` for teammate-facing project updates.
