@@ -47,6 +47,17 @@ AGENT_INSTRUCTIONS_PATTERN = re.compile(
 )
 CLOSE_WORKSPACE_PATTERN = re.compile(r'\[CLOSE_WORKSPACE\s+name="([^"]+)"\s*\]')
 
+# Continuous task creation
+CREATE_CONTINUOUS_PATTERN = re.compile(
+    r'\[CREATE_CONTINUOUS\s+'
+    r'name="([^"]+)"\s+'
+    r'work_dir="([^"]+)"\s*\]',
+    re.DOTALL,
+)
+CONTINUOUS_PROGRAM_PATTERN = re.compile(
+    r'\[CONTINUOUS_PROGRAM\](.*?)\[/CONTINUOUS_PROGRAM\]', re.DOTALL
+)
+
 # Specialist creation
 CREATE_SPECIALIST_PATTERN = re.compile(
     r'\[CREATE_SPECIALIST\s+name="([^"]+)"\s+model="([^"]+)"\s*\]'
@@ -233,12 +244,40 @@ async def invoke_ai(
     *model* may be a semantic alias (``fast``/``balanced``/``powerful``), an
     explicit backend model id, or ``None`` (in which case the agent's own
     preference and the role default from ``models.yaml`` are consulted).
+
+    If the agent is currently busy with a running subprocess and the
+    incoming message targets a continuous-task topic, the running process
+    is interrupted (SIGTERM → SIGKILL) so the user's message is processed
+    immediately instead of queuing behind the lock.
     """
+    # Interrupt running subprocess if the agent is busy and this is a
+    # continuous task topic (user wants to interact with the running task).
+    if agent.busy and agent.running_proc is not None:
+        if _is_continuous_task_topic(agent):
+            log.info(
+                "Interrupting agent [%s] (PID %d) for user message",
+                agent.name, agent.running_proc.pid,
+            )
+            await agent.interrupt()
+
     async with agent.lock:
         return await _invoke_ai_locked(
             agent, message, chat_id, platform, manager, backend,
             is_orchestrator_call, model, _retry, thread_id,
         )
+
+
+def _is_continuous_task_topic(agent) -> bool:
+    """Return True if the agent is associated with a continuous task queue entry."""
+    try:
+        from scheduler import load_queue
+        entries = load_queue()
+        return any(
+            e.get("type") == "continuous" and e.get("name") == agent.name
+            for e in entries
+        )
+    except Exception:
+        return False
 
 
 async def _invoke_ai_locked(
@@ -333,8 +372,9 @@ async def _invoke_ai_locked(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=agent.work_dir,
-            limit=1024 * 1024,  # 1MB line buffer
+            limit=1024 * 1024,
         )
+        agent.running_proc = proc
 
         backend_session_id: str | None = None
         if backend.supports_streaming():
@@ -443,6 +483,7 @@ async def _invoke_ai_locked(
         return STRINGS["ai_error"] % str(e)
     finally:
         agent.busy = False
+        agent.running_proc = None
         stop_keepalive.set()
         keepalive_task.cancel()
         try:

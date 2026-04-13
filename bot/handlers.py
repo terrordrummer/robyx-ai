@@ -14,6 +14,8 @@ from ai_invoke import (
     CREATE_WORKSPACE_PATTERN,
     AGENT_INSTRUCTIONS_PATTERN,
     CLOSE_WORKSPACE_PATTERN,
+    CREATE_CONTINUOUS_PATTERN,
+    CONTINUOUS_PROGRAM_PATTERN,
     CREATE_SPECIALIST_PATTERN,
     REMIND_PATTERN,
     RESTART_PATTERN,
@@ -482,6 +484,54 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
                     )
                 else:
                     response += "\n\nFailed to create specialist *%s*." % spec_name
+
+        # Handle CREATE_CONTINUOUS
+        cont_match = CREATE_CONTINUOUS_PATTERN.search(response)
+        prog_match = CONTINUOUS_PROGRAM_PATTERN.search(response)
+        if cont_match and prog_match:
+            response = CREATE_CONTINUOUS_PATTERN.sub("", response)
+            response = CONTINUOUS_PROGRAM_PATTERN.sub("", response)
+            response = response.strip()
+
+            cont_name = cont_match.group(1)
+            cont_work_dir = cont_match.group(2)
+            try:
+                import json as _json
+                program = _json.loads(prog_match.group(1).strip())
+            except (ValueError, TypeError) as e:
+                log.error("Invalid CONTINUOUS_PROGRAM JSON: %s", e)
+                response += "\n\nFailed to create continuous task: invalid program JSON."
+                return response
+
+            from topics import create_continuous_workspace
+
+            rejection_reason = None
+            try:
+                result = await create_continuous_workspace(
+                    name=cont_name,
+                    program=program,
+                    work_dir=cont_work_dir,
+                    parent_workspace=manager.get_by_thread(thread_id).name if manager.get_by_thread(thread_id) else "robyx",
+                    model="powerful",
+                    manager=manager,
+                    platform=platform,
+                )
+            except ValueError as e:
+                log.warning("create_continuous_workspace(%s) rejected: %s", cont_name, e)
+                result = None
+                rejection_reason = str(e)
+            except Exception as e:
+                log.error("create_continuous_workspace(%s) raised: %s", cont_name, e, exc_info=True)
+                result = None
+
+            if result:
+                response += "\n\n🔄 Continuous task *%s* created (topic #%s, branch `%s`)." % (
+                    result["display_name"], result["thread_id"], result["branch"],
+                )
+            elif rejection_reason:
+                response += "\n\nContinuous task *%s* not created: %s." % (cont_name, rejection_reason)
+            else:
+                response += "\n\nFailed to create continuous task *%s*." % cont_name
 
         return response
 

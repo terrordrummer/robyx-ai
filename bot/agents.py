@@ -51,6 +51,32 @@ class Agent:
     thread_id: Any = None
     busy: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
+    running_proc: Any = field(default=None, repr=False, compare=False)
+
+    async def interrupt(self) -> bool:
+        """Interrupt the running subprocess. SIGTERM with 5s grace, then SIGKILL.
+
+        Returns True if a process was actually interrupted.
+        """
+        proc = self.running_proc
+        if proc is None:
+            return False
+        try:
+            proc.terminate()  # SIGTERM
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                proc.kill()  # SIGKILL
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+            return True
+        except ProcessLookupError:
+            return False
+        finally:
+            self.running_proc = None
+            self.busy = False
 
     def to_dict(self) -> dict:
         return {
@@ -69,7 +95,7 @@ class Agent:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Agent":
-        known = {f for f in cls.__dataclass_fields__} - {"lock", "busy"}
+        known = {f for f in cls.__dataclass_fields__} - {"lock", "busy", "running_proc"}
         filtered = {k: v for k, v in d.items() if k in known}
         return cls(**filtered)
 

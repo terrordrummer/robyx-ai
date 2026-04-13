@@ -65,6 +65,7 @@ def _patch_env(tmp_path, monkeypatch):
 
     # Also patch module-level copies in modules that do "from config import X"
     import agents as agents_mod
+    import continuous as continuous_mod
     import scheduler as scheduler_mod
     import topics as topics_mod
     import voice as voice_mod
@@ -73,6 +74,8 @@ def _patch_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(agents_mod, "STATE_FILE", data_dir / "state.json")
     monkeypatch.setattr(agents_mod, "WORKSPACE", tmp_path / "workspace")
+
+    monkeypatch.setattr(continuous_mod, "CONTINUOUS_DIR", data_dir / "continuous")
 
     monkeypatch.setattr(scheduler_mod, "CLAIM_TIMEOUT_SECONDS", 300)
     monkeypatch.setattr(scheduler_mod, "MAX_REMINDER_ATTEMPTS", 10)

@@ -186,6 +186,98 @@ async def close_workspace(name: str, manager: AgentManager, platform=None) -> bo
     return True
 
 
+async def create_continuous_workspace(
+    name: str,
+    program: dict,
+    work_dir: str,
+    parent_workspace: str,
+    model: str,
+    manager: AgentManager,
+    platform=None,
+) -> dict | None:
+    """Create a continuous task workspace: topic + branch + state + queue entry.
+
+    Returns dict with workspace info or None on failure.
+    """
+    from continuous import create_continuous_task, state_file_path
+
+    display_name = _validate_table_safe_display_name(name, "continuous workspace")
+    safe_name = _sanitize_task_name(display_name)
+    _validate_new_agent_name(safe_name, manager, "continuous workspace")
+
+    branch = "continuous/%s" % safe_name
+
+    # 1. Create channel/topic
+    topic_name = "🔄 %s" % display_name
+    thread_id = await platform.create_channel(topic_name)
+    if not thread_id:
+        return None
+
+    # 2. Write agent instructions
+    agent_file = AGENTS_DIR / ("%s.md" % safe_name)
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    setup_template_path = __import__("pathlib").Path(__file__).parent.parent / "templates" / "CONTINUOUS_SETUP.md"
+    if setup_template_path.exists():
+        setup_instructions = setup_template_path.read_text()
+    else:
+        setup_instructions = "You are a continuous task agent."
+    full_instructions = "# %s (Continuous Task)\n\n%s\n" % (display_name, setup_instructions)
+    agent_file.write_text(full_instructions)
+
+    # 3. Create state file
+    state = create_continuous_task(
+        name=safe_name,
+        parent_workspace=parent_workspace,
+        program=program,
+        thread_id=thread_id,
+        branch=branch,
+        work_dir=work_dir,
+    )
+
+    # 4. Create data directory
+    (DATA_DIR / safe_name).mkdir(parents=True, exist_ok=True)
+
+    # 5. Add to unified queue
+    _add_task({
+        "name": safe_name,
+        "type": "continuous",
+        "agent_file": "agents/%s.md" % safe_name,
+        "model": model,
+        "thread_id": str(thread_id),
+        "state_file": str(state_file_path(safe_name)),
+        "description": "Continuous: %s" % display_name,
+    })
+
+    # 6. Register agent
+    agent = manager.add_agent(
+        name=safe_name,
+        work_dir=work_dir,
+        description="[Continuous] %s" % display_name,
+        agent_type="workspace",
+        model=model,
+        thread_id=thread_id,
+    )
+
+    # 7. Welcome message
+    await platform.send_to_channel(
+        thread_id,
+        "*🔄 %s* continuous workspace is ready.\n"
+        "Agent *%s* will work autonomously on branch `%s`.\n\n"
+        "**Objective:** %s\n\n"
+        "Send a message here to interrupt and interact."
+        % (display_name, safe_name, branch, program.get("objective", "N/A")),
+    )
+
+    return {
+        "name": safe_name,
+        "display_name": display_name,
+        "thread_id": thread_id,
+        "branch": branch,
+        "state_file": str(state_file_path(safe_name)),
+        "type": "continuous",
+    }
+
+
 async def create_specialist(
     name: str,
     model: str,

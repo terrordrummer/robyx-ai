@@ -745,6 +745,168 @@ async def _dispatch_agent_tasks(
     return dispatched, errors
 
 
+# ── Dispatch: continuous tasks ────────────────────────────────────────────────
+
+
+async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple[list[tuple[str, int]], list[str]]:
+    """Check continuous entries in the queue and dispatch next steps if ready.
+
+    Continuous tasks are NOT claimed via the normal claim system because
+    they stay in ``pending`` status perpetually (the scheduler re-dispatches
+    them every cycle). Instead we check each entry's state file directly.
+    """
+    from continuous import (
+        build_step_context,
+        check_rate_limit_recovery,
+        is_ready_for_next_step,
+        load_state,
+        mark_step_failed,
+        mark_step_started,
+        resume_task,
+        save_state,
+        state_file_path,
+    )
+
+    entries = load_queue()
+    dispatched: list[tuple[str, int]] = []
+    errors: list[str] = []
+
+    for entry in entries:
+        if entry.get("type") != "continuous":
+            continue
+        if entry.get("status") != "pending":
+            continue
+
+        name = entry.get("name", "")
+        sf = entry.get("state_file")
+        if not sf:
+            sf = str(state_file_path(name))
+
+        state = load_state(Path(sf))
+        if state is None:
+            log.warning("Continuous task '%s': state file missing at %s", name, sf)
+            continue
+
+        # Handle rate-limited tasks
+        if state["status"] == "rate-limited":
+            if check_rate_limit_recovery(state):
+                resume_task(state)
+                save_state(Path(sf), state)
+                log.info("Continuous task '%s': rate limit recovered, resuming", name)
+            else:
+                continue
+
+        # Skip if not ready
+        if state["status"] in ("completed", "paused", "awaiting-input"):
+            continue
+
+        # Check if a subprocess is actually running (orphan detection)
+        if state["status"] == "running":
+            is_locked, pid = check_lock(name)
+            if is_locked:
+                continue  # Subprocess still running
+            # Subprocess died without updating state
+            log.warning("Continuous task '%s': state=running but no lock. Marking step failed.", name)
+            mark_step_failed(state, "subprocess exited unexpectedly")
+            save_state(Path(sf), state)
+            continue
+
+        if not is_ready_for_next_step(state):
+            continue
+
+        # Dispatch next step
+        next_step = state.get("next_step", {})
+        step_number = next_step.get("number", 1)
+        step_description = next_step.get("description", "Continue work.")
+
+        # Build prompt from template
+        template_path = Path(__file__).parent.parent / "templates" / "CONTINUOUS_STEP.md"
+        if template_path.exists():
+            template = template_path.read_text()
+        else:
+            template = "Execute step {{STEP_NUMBER}}: {{STEP_DESCRIPTION}}"
+
+        program = state.get("program", {})
+        criteria_text = "\n".join("- %s" % c for c in program.get("success_criteria", []))
+        constraints_text = "\n".join("- %s" % c for c in program.get("constraints", []))
+        history_text = build_step_context(state)
+
+        lock_file = DATA_DIR / name / "lock"
+        prompt = (
+            template
+            .replace("{{OBJECTIVE}}", program.get("objective", ""))
+            .replace("{{SUCCESS_CRITERIA}}", criteria_text or "(none specified)")
+            .replace("{{CONSTRAINTS}}", constraints_text or "(none specified)")
+            .replace("{{CONTEXT}}", program.get("context", ""))
+            .replace("{{STEP_NUMBER}}", str(step_number))
+            .replace("{{STEP_DESCRIPTION}}", step_description)
+            .replace("{{STEP_HISTORY}}", history_text)
+            .replace("{{BRANCH}}", state.get("branch", "main"))
+            .replace("{{STATE_FILE}}", sf)
+            .replace("{{TASK_NAME}}", name)
+            .replace("{{LOCK_FILE}}", str(lock_file))
+            .replace("{{LOG_FILE}}", str(LOG_FILE))
+        )
+
+        # Spawn the step agent
+        model = resolve_model_preference(
+            entry.get("model"), backend, role="continuous",
+        )
+        work_dir = state.get("work_dir", "")
+
+        cmd = backend.build_spawn_command(
+            prompt=prompt,
+            model=model,
+            work_dir=work_dir,
+        )
+        stdin_payload = backend.spawn_stdin_payload(prompt)
+
+        (DATA_DIR / name).mkdir(parents=True, exist_ok=True)
+        output_log = DATA_DIR / name / "output.log"
+
+        try:
+            with open(output_log, "w") as out_f:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
+                    stdout=out_f,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=work_dir,
+                )
+                if stdin_payload is not None and proc.stdin is not None:
+                    write_result = proc.stdin.write(stdin_payload)
+                    if inspect.isawaitable(write_result):
+                        await write_result
+                    await proc.stdin.drain()
+                    close_result = proc.stdin.close()
+                    if inspect.isawaitable(close_result):
+                        await close_result
+
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            lock_file.write_text("%d %s" % (proc.pid, now_str))
+
+            # Update state: step started
+            mark_step_started(state, step_number, step_description)
+            save_state(Path(sf), state)
+
+            # Start delivery watcher for output relay
+            start_task_delivery_watch(entry, proc, output_log, lock_file, platform, backend, log)
+
+            dispatched.append((name, proc.pid))
+            append_log("%s -- DISPATCHED -- step %d PID %d" % (name, step_number, proc.pid))
+            log.info(
+                "Continuous '%s': dispatched step %d (PID %d, model: %s)",
+                name, step_number, proc.pid, model,
+            )
+
+        except (OSError, ValueError) as exc:
+            errors.append(name)
+            append_log("%s -- ERROR -- step %d failed to spawn: %s" % (name, step_number, exc))
+            log.error("Continuous '%s': failed to spawn step %d: %s", name, step_number, exc, exc_info=True)
+
+    return dispatched, errors
+
+
 # ── Log helper ───────────────────────────────────────────────────────────────
 
 
@@ -803,6 +965,14 @@ async def run_scheduler_cycle(
         task_dispatched, task_errors = await _dispatch_agent_tasks(due_tasks, backend, platform)
         dispatched.extend(task_dispatched)
         errors.extend(task_errors)
+
+    # Dispatch continuous task steps (checked independently of the claim system)
+    try:
+        cont_dispatched, cont_errors = await _handle_continuous_entries(backend, platform)
+        dispatched.extend(cont_dispatched)
+        errors.extend(cont_errors)
+    except Exception as exc:
+        log.error("Continuous task handling failed: %s", exc, exc_info=True)
 
     return {
         "dispatched": dispatched,
