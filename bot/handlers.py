@@ -832,6 +832,11 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
         if not text:
             return
 
+        # Treat bare "help" in main thread as /help command
+        if text.strip().lower() == "help" and platform.is_main_thread(msg.chat_id, msg.thread_id):
+            await cmd_help(platform, msg, msg_ref)
+            return
+
         direct_updates = parse_direct_env_updates(text)
         if direct_updates:
             keys = ", ".join("`%s`" % key for key in direct_updates)
