@@ -326,6 +326,11 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             )
             manager.save_state()
 
+            # None means the agent was interrupted — skip sending, the
+            # user's new message will be processed as a fresh invocation.
+            if response is None:
+                return
+
             # Handle AI-generated commands
             response = await handle_focus_commands(response, chat_id, platform, manager, thread_id=thread_id)
 

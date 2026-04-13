@@ -378,6 +378,9 @@ async def _invoke_ai_locked(
             combined = (out + " " + err).lower()
 
             if proc.returncode != 0:
+                if agent.interrupted:
+                    log.info("Agent [%s] interrupted by user", agent.name)
+                    return None
                 log.error(
                     "%s error for [%s] (rc=%d, stderr_len=%d, stdout_len=%d)",
                     backend.name, agent.name, proc.returncode, len(err), len(out),
@@ -410,6 +413,9 @@ async def _invoke_ai_locked(
 
         # Handle streaming errors (returned as None)
         if text is None:
+            if agent.interrupted:
+                log.info("Agent [%s] interrupted by user (streaming)", agent.name)
+                return None
             stderr_data = await proc.stderr.read()
             err = stderr_data.decode().strip() if stderr_data else ""
             combined = err.lower()
@@ -468,6 +474,7 @@ async def _invoke_ai_locked(
         return STRINGS["ai_error"] % str(e)
     finally:
         agent.busy = False
+        agent.interrupted = False
         agent.running_proc = None
         stop_keepalive.set()
         keepalive_task.cancel()
@@ -587,7 +594,8 @@ async def handle_delegations(response, chat_id, platform, manager, backend, thre
             target, task, chat_id, platform, manager, backend, thread_id=thread_id,
         )
         manager.save_state()
-        results.append(STRINGS["delegation_result"] % (target_name, delegate_response))
+        if delegate_response is not None:
+            results.append(STRINGS["delegation_result"] % (target_name, delegate_response))
 
     parts = [p for p in [clean_response] + results if p]
     return "\n\n---\n\n".join(parts)
@@ -679,7 +687,8 @@ async def handle_specialist_requests(response, chat_id, platform, manager, backe
             thread_id=thread_id,
         )
         manager.save_state()
-        results.append("*%s*:\n%s" % (specialist_name, specialist_response))
+        if specialist_response is not None:
+            results.append("*%s*:\n%s" % (specialist_name, specialist_response))
 
     parts = [p for p in [clean_response] + results if p]
     return "\n\n---\n\n".join(parts)

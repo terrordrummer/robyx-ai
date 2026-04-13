@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.3
+
+### Fixed
+- **`bot/ai_invoke.py`**, **`bot/handlers.py`**, **`bot/agents.py`** — Interrupted agents no longer show "AI Error: unknown". When a user message interrupts a busy agent, the subprocess termination is now recognized via an `interrupted` flag and handled silently — no error is sent to chat, and the user's new message is processed immediately.
+
 ## 0.20.2
 
 ### Changed
