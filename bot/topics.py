@@ -8,10 +8,11 @@ import logging
 import re
 
 from agents import AgentManager
-from config import AGENTS_DIR, SPECIALISTS_DIR, TASKS_FILE, SPECIALISTS_FILE, DATA_DIR
-from timed_scheduler import (
-    add_task as _timed_add_task,
-    cancel_tasks_for_agent_file as _timed_cancel_tasks_for_agent_file,
+from config import AGENTS_DIR, SPECIALISTS_DIR, SPECIALISTS_FILE, DATA_DIR
+from scheduler import (
+    FREQUENCY_SECONDS,
+    add_task as _add_task,
+    cancel_tasks_for_agent_file as _cancel_tasks_for_agent_file,
     validate_one_shot_scheduled_at as _validate_one_shot_scheduled_at,
 )
 
@@ -101,10 +102,9 @@ async def create_workspace(
     agent_file.write_text(full_instructions)
     log.info("Wrote agent instructions: %s", agent_file)
 
-    # 3. Register the task
+    # 3. Register the task in the unified queue
     if task_type == "one-shot":
-        # One-shot tasks go into the timed queue for precise 1-minute polling.
-        _timed_add_task({
+        _add_task({
             "name": safe_name,
             "agent_file": "agents/%s.md" % safe_name,
             "prompt": "",
@@ -114,12 +114,21 @@ async def create_workspace(
             "thread_id": str(thread_id),
             "description": display_name,
         })
-    else:
-        freq_str = frequency if frequency != "none" else "-"
-        row = "| %s | agents/%s.md | %s | %s | yes | %s | %s | %s |\n" % (
-            safe_name, safe_name, task_type, freq_str, model, thread_id, display_name,
-        )
-        _append_to_tasks(row)
+    elif task_type == "scheduled":
+        freq_str = frequency if frequency != "none" else "hourly"
+        interval = FREQUENCY_SECONDS.get(freq_str, 3600)
+        from datetime import datetime, timezone
+        _add_task({
+            "name": safe_name,
+            "agent_file": "agents/%s.md" % safe_name,
+            "type": "periodic",
+            "interval_seconds": interval,
+            "next_run": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "thread_id": str(thread_id),
+            "description": display_name,
+        })
+    # interactive workspaces don't go in the queue — agent-only
 
     # 4. Create data directory
     (DATA_DIR / safe_name).mkdir(parents=True, exist_ok=True)
@@ -151,26 +160,23 @@ async def create_workspace(
 
 
 async def close_workspace(name: str, manager: AgentManager, platform=None) -> bool:
-    """Close a workspace: disable in tasks.md, close channel, remove agent."""
+    """Close a workspace: cancel queue entries, close channel, remove agent."""
     agent = manager.get(name)
     if not agent:
         return False
-
-    # Disable in tasks.md
-    _disable_task(name)
 
     # Close channel/topic
     if agent.thread_id:
         await platform.send_to_channel(agent.thread_id, "Workspace *%s* closed." % name)
         await platform.close_channel(agent.thread_id)
 
-    canceled = _timed_cancel_tasks_for_agent_file(
+    canceled = _cancel_tasks_for_agent_file(
         "agents/%s.md" % agent.name,
         reason="workspace closed",
     )
     if canceled:
         log.info(
-            "Closed workspace '%s' and canceled %d pending timed task(s)",
+            "Closed workspace '%s' and canceled %d pending task(s)",
             agent.name,
             canceled,
         )
@@ -236,18 +242,14 @@ async def create_specialist(
     }
 
 
-def _append_to_tasks(row: str):
-    """Append a row to tasks.md, creating the file if needed."""
-    TASKS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if not TASKS_FILE.exists():
-        header = (
-            "| Task | Agent | Type | Frequency | Enabled | Model | Thread ID | Description |\n"
-            "|------|-------|------|-----------|---------|-------|-----------|-------------|\n"
-        )
-        TASKS_FILE.write_text(header + row)
-    else:
-        with open(TASKS_FILE, "a") as f:
-            f.write(row)
+def _update_queue_entry_thread_id(name: str, thread_id) -> None:
+    """Update the thread_id for a task in queue.json."""
+    from scheduler import load_queue, save_queue
+    entries = load_queue()
+    for entry in entries:
+        if entry.get("name") == name:
+            entry["thread_id"] = str(thread_id) if thread_id is not None else ""
+    save_queue(entries)
 
 
 def _append_to_specialists(row: str):
@@ -262,23 +264,6 @@ def _append_to_specialists(row: str):
     else:
         with open(SPECIALISTS_FILE, "a") as f:
             f.write(row)
-
-
-def _disable_task(name: str) -> None:
-    """Set a task's Enabled column to 'no' in tasks.md."""
-    if not TASKS_FILE.exists():
-        return
-    lines = TASKS_FILE.read_text().splitlines()
-    new_lines: list[str] = []
-    _yes_pattern = re.compile(r'\|\s*yes\s*\|')
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("|"):
-            cols = [c.strip() for c in stripped.split("|")[1:-1]]
-            if cols and cols[0] == name:
-                line = _yes_pattern.sub("| no |", line, count=1)
-        new_lines.append(line)
-    TASKS_FILE.write_text("\n".join(new_lines) + "\n")
 
 
 # ── Healing detached workspaces ────────────────────────────────────────────
@@ -300,11 +285,6 @@ def _update_table_thread_id(path, name: str, column_index: int, thread_id: int |
                 line = "| %s |" % " | ".join(cols)
         new_lines.append(line)
     path.write_text("\n".join(new_lines) + "\n")
-
-
-def _update_task_thread_id(name: str, thread_id: int | None):
-    """Rewrite the Thread ID column for *name* in tasks.md (column index 6)."""
-    _update_table_thread_id(TASKS_FILE, name, 6, thread_id)
 
 
 def _update_specialist_thread_id(name: str, thread_id: int | None):
@@ -347,7 +327,7 @@ async def heal_detached_workspaces(manager: AgentManager, platform=None) -> list
             model=agent.model,
             thread_id=thread_id,
         )
-        _update_task_thread_id(agent.name, thread_id)
+        _update_queue_entry_thread_id(agent.name, thread_id)
 
         try:
             await platform.send_to_channel(

@@ -57,14 +57,12 @@ from config import (
     SLACK_BOT_TOKEN,
     SLACK_CHANNEL_ID,
     SLACK_OWNER_ID,
-    TIMED_SCHEDULER_INTERVAL,
     UPDATE_CHECK_INTERVAL,
 )
 from handlers import make_handlers
 from messaging.base import PlatformMessage
 from migrations import run_pending as run_pending_migrations
-from scheduler import run_scheduler_cycle
-from timed_scheduler import migrate_oneshot_from_tasks_md, run_timed_cycle
+from scheduler import migrate_to_unified_queue, run_scheduler_cycle
 from topics import heal_detached_workspaces
 from updater import apply_update, check_for_updates, get_pending_update, restart_service
 from voice import is_available as voice_available
@@ -72,8 +70,6 @@ from voice import is_available as voice_available
 log = logging.getLogger("robyx")
 
 PID_FILE = DATA_DIR / "bot.pid"
-REMINDER_INTERVAL = 60
-REMINDER_BOOT_DELAY = 5
 
 # ── Telegram polling tuning ────────────────────────────────────────────────
 #
@@ -146,14 +142,17 @@ def setup_logging():
 
 
 async def scheduler_job(context):
-    """Job: run one scheduler cycle."""
+    """Job: run one unified scheduler cycle (tasks + reminders)."""
     backend = context.job.data["backend"]
     plat = context.job.data["platform"]
     control_room_id = plat.control_room_id
-    log.info("Scheduler: running cycle")
 
     try:
-        result = await run_scheduler_cycle(backend, platform=plat)
+        result = await run_scheduler_cycle(
+            backend,
+            platform=plat,
+            default_chat_id=context.job.data.get("default_chat_id"),
+        )
 
         # Notify in Main only if something happened
         if result["dispatched"] or result["errors"]:
@@ -241,58 +240,6 @@ async def update_check_job(context):
         log.error("Update check failed: %s", e, exc_info=True)
 
 
-def reminders_file_path():
-    """Return the runtime reminders file path."""
-    return DATA_DIR / "reminders.json"
-
-
-async def run_reminder_cycle(platform, default_chat_id=None, reminders_file=None):
-    """Run one reminder-engine pass for the given platform."""
-    from reminders import check_reminders
-
-    await check_reminders(
-        reminders_file=reminders_file or reminders_file_path(),
-        platform=platform,
-        default_chat_id=default_chat_id,
-    )
-
-
-async def reminder_job(context):
-    """Telegram job-queue wrapper for one reminder-engine pass."""
-    await run_reminder_cycle(
-        context.job.data["platform"],
-        default_chat_id=context.job.data.get("default_chat_id"),
-        reminders_file=context.job.data.get("reminders_file"),
-    )
-
-
-async def _slack_reminder_loop(plat):
-    """Background loop: run reminder cycles on Slack."""
-    await asyncio.sleep(REMINDER_BOOT_DELAY)
-    while True:
-        try:
-            await run_reminder_cycle(
-                plat,
-                default_chat_id=getattr(plat, "control_room_channel", None),
-            )
-        except Exception as e:
-            log.error("Reminder engine cycle failed: %s", e, exc_info=True)
-        await asyncio.sleep(REMINDER_INTERVAL)
-
-
-async def _discord_reminder_loop(plat, client):
-    """Background loop: run reminder cycles on Discord."""
-    await client.wait_until_ready()
-    await asyncio.sleep(REMINDER_BOOT_DELAY)
-    while not client.is_closed():
-        try:
-            await run_reminder_cycle(
-                plat,
-                default_chat_id=plat.control_room_id,
-            )
-        except Exception as e:
-            log.error("Reminder engine cycle failed: %s", e, exc_info=True)
-        await asyncio.sleep(REMINDER_INTERVAL)
 
 
 def main():
@@ -438,56 +385,23 @@ def _run_telegram(plat, h, backend, manager):
     # Register text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _wrap_message(h["message"])))
 
-    # Scheduler: runs every SCHEDULER_INTERVAL seconds
-    log.info("Scheduler: interval=%ds", SCHEDULER_INTERVAL)
+    # Unified scheduler: runs every SCHEDULER_INTERVAL seconds (default 60s).
+    # Handles periodic tasks, one-shot tasks, reminders, and continuous tasks.
+    log.info("Unified scheduler: interval=%ds", SCHEDULER_INTERVAL)
     app.job_queue.run_repeating(
         scheduler_job,
         interval=SCHEDULER_INTERVAL,
-        first=10,  # First run 10 seconds after startup
-        data={"backend": backend, "platform": plat},
-    )
-
-    # Timed scheduler: runs every TIMED_SCHEDULER_INTERVAL seconds (default 60s)
-    async def timed_scheduler_job(context):
-        try:
-            await run_timed_cycle(
-                context.job.data["backend"],
-                platform=context.job.data["platform"],
-            )
-        except Exception as e:
-            log.error("Timed scheduler cycle failed: %s", e, exc_info=True)
-
-    log.info("Timed scheduler: interval=%ds", TIMED_SCHEDULER_INTERVAL)
-    app.job_queue.run_repeating(
-        timed_scheduler_job,
-        interval=TIMED_SCHEDULER_INTERVAL,
         first=5,  # First run 5 seconds after startup (after migration)
-        data={"backend": backend, "platform": plat},
+        data={"backend": backend, "platform": plat, "default_chat_id": CHAT_ID},
     )
 
     # Update checker: runs every UPDATE_CHECK_INTERVAL seconds.
-    # The manager is included in the job data so apply_update can route
-    # session invalidation through manager.reset_sessions and avoid the
-    # state.json clobber that bit v0.15.0 / v0.15.1.
     log.info("Update checker: interval=%ds", UPDATE_CHECK_INTERVAL)
     app.job_queue.run_repeating(
         update_check_job,
         interval=UPDATE_CHECK_INTERVAL,
         first=30,  # First check 30 seconds after startup
         data={"platform": plat, "manager": manager},
-    )
-
-    # Reminder engine: runs every 60 seconds, fires due reminders directly (no LLM)
-    app.job_queue.run_repeating(
-        reminder_job,
-        interval=REMINDER_INTERVAL,
-        first=REMINDER_BOOT_DELAY,  # First check shortly after startup
-        data={"platform": plat, "default_chat_id": CHAT_ID},
-    )
-    log.info(
-        "Reminder engine: interval=%ds, file=%s",
-        REMINDER_INTERVAL,
-        reminders_file_path(),
     )
 
     # Send boot notification
@@ -513,13 +427,14 @@ def _run_telegram(plat, h, backend, manager):
         except Exception as e:
             log.error("heal_detached_workspaces failed: %s", e, exc_info=True)
 
-        # Migrate any legacy one-shot tasks from tasks.md → timed_queue.json
+        # Migrate legacy scheduler data (tasks.md, timed_queue.json, reminders.json)
+        # into the unified queue.json — idempotent, skips if queue.json exists.
         try:
-            n_migrated = migrate_oneshot_from_tasks_md()
+            n_migrated = migrate_to_unified_queue()
             if n_migrated:
-                log.info("Boot: migrated %d one-shot task(s) to timed queue", n_migrated)
+                log.info("Boot: migrated %d entries to unified queue", n_migrated)
         except Exception as e:
-            log.error("One-shot migration failed: %s", e, exc_info=True)
+            log.error("Unified queue migration failed: %s", e, exc_info=True)
 
         # Run pending migrations (rename channels, state patches, etc.)
         # BEFORE the boot message goes out — that way the boot message lands
@@ -666,14 +581,7 @@ def _run_slack(plat, h, backend, manager):
 
         # Start background loops
         asyncio.ensure_future(_background_scheduler_loop(plat, backend, control_room))
-        asyncio.ensure_future(_background_timed_scheduler_loop(plat, backend))
         asyncio.ensure_future(_background_update_loop(plat, control_room, manager))
-        asyncio.ensure_future(_slack_reminder_loop(plat))
-        log.info(
-            "Reminder engine: interval=%ds, file=%s",
-            REMINDER_INTERVAL,
-            reminders_file_path(),
-        )
 
         handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
         log.info("Robyx is running on Slack (Socket Mode)...")
@@ -705,14 +613,7 @@ def _run_discord(plat, h, backend, manager):
 
         # Start background loops
         client.loop.create_task(_background_scheduler_loop(plat, backend, control_room))
-        client.loop.create_task(_background_timed_scheduler_loop(plat, backend))
         client.loop.create_task(_background_update_loop(plat, control_room, manager))
-        client.loop.create_task(_discord_reminder_loop(plat, client))
-        log.info(
-            "Reminder engine: interval=%ds, file=%s",
-            REMINDER_INTERVAL,
-            reminders_file_path(),
-        )
 
     @client.event
     async def on_message(message):
@@ -782,12 +683,13 @@ def _run_discord(plat, h, backend, manager):
 async def _background_scheduler_loop(
     plat, backend, control_room_id, *, interval: int = SCHEDULER_INTERVAL,
 ) -> None:
-    """Periodically run the main scheduler cycle and notify on activity."""
+    """Periodically run the unified scheduler cycle and notify on activity."""
+    await asyncio.sleep(5)  # Let boot finish first
     while True:
-        await asyncio.sleep(interval)
-        log.info("Scheduler: running cycle")
         try:
-            result = await run_scheduler_cycle(backend, platform=plat)
+            result = await run_scheduler_cycle(
+                backend, platform=plat, default_chat_id=control_room_id,
+            )
             if result["dispatched"] or result["errors"]:
                 lines = []
                 for name, pid in result["dispatched"]:
@@ -803,18 +705,6 @@ async def _background_scheduler_loop(
                     log.error("Failed to send scheduler notification: %s", e)
         except Exception as e:
             log.error("Scheduler cycle failed: %s", e, exc_info=True)
-
-
-async def _background_timed_scheduler_loop(
-    plat, backend, *, interval: int = TIMED_SCHEDULER_INTERVAL,
-) -> None:
-    """Periodically run the timed-scheduler cycle."""
-    await asyncio.sleep(5)  # Let boot finish first
-    while True:
-        try:
-            await run_timed_cycle(backend, platform=plat)
-        except Exception as e:
-            log.error("Timed scheduler cycle failed: %s", e, exc_info=True)
         await asyncio.sleep(interval)
 
 
@@ -875,11 +765,11 @@ async def _run_boot_sequence(plat, manager, control_room_id) -> list:
     from updater import get_current_version
 
     try:
-        n_migrated = migrate_oneshot_from_tasks_md()
+        n_migrated = migrate_to_unified_queue()
         if n_migrated:
-            log.info("Boot: migrated %d one-shot task(s) to timed queue", n_migrated)
+            log.info("Boot: migrated %d entries to unified queue", n_migrated)
     except Exception as e:
-        log.error("One-shot migration failed: %s", e, exc_info=True)
+        log.error("Unified queue migration failed: %s", e, exc_info=True)
 
     try:
         executed = await run_pending_migrations(plat, manager)

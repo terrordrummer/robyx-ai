@@ -56,7 +56,8 @@ def _patch_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setattr(cfg, "CLAUDE_PERMISSION_MODE", "")
     monkeypatch.setattr(cfg, "TIMED_QUEUE_FILE", data_dir / "timed_queue.json")
-    monkeypatch.setattr(cfg, "TIMED_SCHEDULER_INTERVAL", 60)
+    monkeypatch.setattr(cfg, "QUEUE_FILE", data_dir / "queue.json")
+    monkeypatch.setattr(cfg, "CONTINUOUS_DIR", data_dir / "continuous")
     monkeypatch.setattr(cfg, "DISCORD_BOT_TOKEN", "test-discord-token")
     monkeypatch.setattr(cfg, "DISCORD_GUILD_ID", None)
     monkeypatch.setattr(cfg, "DISCORD_OWNER_ID", None)
@@ -64,9 +65,7 @@ def _patch_env(tmp_path, monkeypatch):
 
     # Also patch module-level copies in modules that do "from config import X"
     import agents as agents_mod
-    import reminders as reminders_mod
     import scheduler as scheduler_mod
-    import timed_scheduler as timed_scheduler_mod
     import topics as topics_mod
     import voice as voice_mod
 
@@ -75,20 +74,14 @@ def _patch_env(tmp_path, monkeypatch):
     monkeypatch.setattr(agents_mod, "STATE_FILE", data_dir / "state.json")
     monkeypatch.setattr(agents_mod, "WORKSPACE", tmp_path / "workspace")
 
-    monkeypatch.setattr(reminders_mod, "CLAIM_TIMEOUT_SECONDS", 300)
-    monkeypatch.setattr(reminders_mod, "MAX_REMINDER_ATTEMPTS", 10)
-
+    monkeypatch.setattr(scheduler_mod, "CLAIM_TIMEOUT_SECONDS", 300)
+    monkeypatch.setattr(scheduler_mod, "MAX_REMINDER_ATTEMPTS", 10)
     monkeypatch.setattr(scheduler_mod, "TASKS_FILE", data_dir / "tasks.md")
+    monkeypatch.setattr(scheduler_mod, "TIMED_QUEUE_FILE", data_dir / "timed_queue.json")
+    monkeypatch.setattr(scheduler_mod, "QUEUE_FILE", data_dir / "queue.json")
     monkeypatch.setattr(scheduler_mod, "LOG_FILE", tmp_path / "log.txt")
     monkeypatch.setattr(scheduler_mod, "DATA_DIR", data_dir)
 
-    monkeypatch.setattr(timed_scheduler_mod, "CLAIM_TIMEOUT_SECONDS", 300)
-    monkeypatch.setattr(timed_scheduler_mod, "TIMED_QUEUE_FILE", data_dir / "timed_queue.json")
-    monkeypatch.setattr(timed_scheduler_mod, "TASKS_FILE", data_dir / "tasks.md")
-    monkeypatch.setattr(timed_scheduler_mod, "LOG_FILE", tmp_path / "log.txt")
-    monkeypatch.setattr(timed_scheduler_mod, "DATA_DIR", data_dir)
-
-    monkeypatch.setattr(topics_mod, "TASKS_FILE", data_dir / "tasks.md")
     monkeypatch.setattr(topics_mod, "SPECIALISTS_FILE", data_dir / "specialists.md")
     monkeypatch.setattr(topics_mod, "AGENTS_DIR", data_dir / "agents")
     monkeypatch.setattr(topics_mod, "SPECIALISTS_DIR", data_dir / "specialists")

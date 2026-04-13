@@ -793,10 +793,9 @@ class TestCmdDoUpdate:
         mock_restart.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("scheduler.parse_tasks", return_value=[{"name": "backup"}])
-    @patch("scheduler.check_lock", return_value=(True, 1234))
+    @patch("scheduler.get_running_tasks", return_value=[{"name": "backup", "_pid": 1234}])
     async def test_doupdate_running_tasks_blocked(
-        self, mock_lock, mock_tasks, handlers, mock_platform
+        self, mock_running, handlers, mock_platform
     ):
         msg = make_message(args=[])
         mock_platform.reply = AsyncMock(return_value=AsyncMock())
@@ -811,10 +810,9 @@ class TestCmdDoUpdate:
     @patch("handlers.get_pending_update", return_value={"version": "0.2.0", "current": "0.1.0"})
     @patch("handlers.apply_update", new_callable=AsyncMock, return_value=(True, "0.2.0"))
     @patch("handlers.restart_service")
-    @patch("scheduler.parse_tasks", return_value=[])
-    @patch("scheduler.check_lock", return_value=(False, 0))
+    @patch("scheduler.get_running_tasks", return_value=[])
     async def test_doupdate_success(
-        self, mock_lock, mock_tasks, mock_restart, mock_apply,
+        self, mock_running, mock_restart, mock_apply,
         mock_pending, mock_ver, handlers, mock_platform
     ):
         msg, sent_ref = _make_msg_and_ref(mock_platform)
@@ -1312,7 +1310,7 @@ class TestHandleSendImage:
 
 class TestHandleRemind:
     """The REMIND pattern is the universal scheduling skill: any agent can
-    emit it, the bot translates it into a reminders.json entry, and the
+    emit it, the bot translates it into a queue.json entry, and the
     Python reminder engine fires it at the exact time. The pattern must
     never leak into the user-visible reply, and validation failures must
     surface as inline notices (not silent drops)."""
@@ -1339,8 +1337,8 @@ class TestHandleRemind:
         assert "[REMIND" not in sent_text
         assert "Ho impostato il reminder." in sent_text
 
-        # Reminder appended to data/reminders.json.
-        reminders_file = tmp_path / "data" / "reminders.json"
+        # Reminder appended to data/queue.json.
+        reminders_file = tmp_path / "data" / "queue.json"
         assert reminders_file.exists()
         data = json.loads(reminders_file.read_text())
         assert len(data) == 1
@@ -1366,7 +1364,7 @@ class TestHandleRemind:
         msg = make_message(text="ricordami capodanno 2099")
         await handlers["message"](mock_platform, msg, msg_ref)
 
-        data = json.loads((tmp_path / "data" / "reminders.json").read_text())
+        data = json.loads((tmp_path / "data" / "queue.json").read_text())
         assert len(data) == 1
         # fire_at is normalised to UTC ISO with offset.
         assert "2099-01-01T07:00:00" in data[0]["fire_at"]
@@ -1390,7 +1388,7 @@ class TestHandleRemind:
         msg = make_message(text="ricordami A tra 1h e B tra 2h")
         await handlers["message"](mock_platform, msg, msg_ref)
 
-        data = json.loads((tmp_path / "data" / "reminders.json").read_text())
+        data = json.loads((tmp_path / "data" / "queue.json").read_text())
         assert len(data) == 2
         messages = sorted(e["message"] for e in data)
         assert messages == ["A", "B"]
@@ -1423,7 +1421,7 @@ class TestHandleRemind:
         msg = make_message(text="ricordami", thread_id=903)
         await local_handlers["message"](mock_platform, msg, msg_ref)
 
-        data = json.loads((tmp_path / "data" / "reminders.json").read_text())
+        data = json.loads((tmp_path / "data" / "queue.json").read_text())
         assert data[0]["thread_id"] == 903
         assert data[0]["chat_id"] == -100999
 
@@ -1452,7 +1450,7 @@ class TestHandleRemind:
         msg = make_message(text="ricordami", thread_id=903)
         await local_handlers["message"](mock_platform, msg, msg_ref)
 
-        data = json.loads((tmp_path / "data" / "reminders.json").read_text())
+        data = json.loads((tmp_path / "data" / "queue.json").read_text())
         assert data[0]["thread_id"] == 555
         assert data[0]["chat_id"] == -100999
 
@@ -1476,7 +1474,7 @@ class TestHandleRemind:
         assert "[REMIND" not in sent_text
         assert "Reminder rejected" in sent_text
         # No reminder file should be created on a parse-only failure.
-        reminders_file = tmp_path / "data" / "reminders.json"
+        reminders_file = tmp_path / "data" / "queue.json"
         assert not reminders_file.exists() or json.loads(reminders_file.read_text()) == []
 
     @pytest.mark.asyncio
@@ -1528,7 +1526,7 @@ class TestHandleRemind:
         msg = make_message(text="ciao")
         await handlers["message"](mock_platform, msg, msg_ref)
 
-        assert not (tmp_path / "data" / "reminders.json").exists()
+        assert not (tmp_path / "data" / "queue.json").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -1544,8 +1542,8 @@ class TestHandleRemindAction:
     becomes the agent's prompt.
 
     The two modes must be strictly disjoint: an action reminder must not
-    create ``data/reminders.json`` and a plain reminder must not create
-    ``data/timed_queue.json``. Validation rejects unknown targets and
+    create ``data/queue.json`` and a plain reminder must not create
+    ``data/queue.json``. Validation rejects unknown targets and
     refuses Robyx (orchestrator) as a target before any write."""
 
     @pytest.mark.asyncio
@@ -1583,8 +1581,8 @@ class TestHandleRemindAction:
         assert "[REMIND" not in sent_text
         assert "Reminder set." in sent_text
 
-        # Action mode: timed_queue.json created, reminders.json untouched.
-        tq = tmp_path / "data" / "timed_queue.json"
+        # Action mode: queue.json created, queue.json untouched.
+        tq = tmp_path / "data" / "queue.json"
         assert tq.exists()
         tasks = json.loads(tq.read_text())
         assert len(tasks) == 1
@@ -1599,8 +1597,7 @@ class TestHandleRemindAction:
         # scheduled_at normalised to UTC offset.
         assert "2099-04-10T07:00:00" in t["scheduled_at"]
 
-        # Plain reminders.json must NOT be touched in action mode.
-        assert not (tmp_path / "data" / "reminders.json").exists()
+        # In unified queue, action entries coexist with reminder entries.
 
     @pytest.mark.asyncio
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
@@ -1632,7 +1629,7 @@ class TestHandleRemindAction:
         msg = make_message(text="tra un'ora fai la review")
         await local_handlers["message"](mock_platform, msg, msg_ref)
 
-        tasks = json.loads((tmp_path / "data" / "timed_queue.json").read_text())
+        tasks = json.loads((tmp_path / "data" / "queue.json").read_text())
         assert tasks[0]["agent_file"] == "specialists/reviewer.md"
         assert tasks[0]["thread_id"] == "800"
         assert tasks[0]["model"] == "powerful"
@@ -1657,8 +1654,8 @@ class TestHandleRemindAction:
         assert "Reminder rejected" in sent_text
         assert "ghost" in sent_text
         # No side effects: neither queue file should exist.
-        assert not (tmp_path / "data" / "timed_queue.json").exists()
-        assert not (tmp_path / "data" / "reminders.json").exists()
+        assert not (tmp_path / "data" / "queue.json").exists()
+        assert not (tmp_path / "data" / "queue.json").exists()
 
     @pytest.mark.asyncio
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
@@ -1681,7 +1678,7 @@ class TestHandleRemindAction:
 
         sent_text = mock_platform.send_message.call_args[1]["text"]
         assert "Reminder rejected" in sent_text
-        assert not (tmp_path / "data" / "timed_queue.json").exists()
+        assert not (tmp_path / "data" / "queue.json").exists()
 
     @pytest.mark.asyncio
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
@@ -1709,7 +1706,7 @@ class TestHandleRemindAction:
         msg = make_message(text="ricordami")
         await local_handlers["message"](mock_platform, msg, msg_ref)
 
-        tasks = json.loads((tmp_path / "data" / "timed_queue.json").read_text())
+        tasks = json.loads((tmp_path / "data" / "queue.json").read_text())
         assert tasks[0]["thread_id"] == "42"  # explicit override wins
 
     @pytest.mark.asyncio
@@ -1742,14 +1739,14 @@ class TestHandleRemindAction:
         msg = make_message(text="ricordami")
         await local_handlers["message"](mock_platform, msg, msg_ref)
 
-        reminders = json.loads((tmp_path / "data" / "reminders.json").read_text())
-        assert len(reminders) == 1
-        assert reminders[0]["message"] == "buy milk"
-
-        tasks = json.loads((tmp_path / "data" / "timed_queue.json").read_text())
-        assert len(tasks) == 1
-        assert tasks[0]["prompt"] == "run cleanup"
-        assert tasks[0]["agent_file"] == "agents/cleanup.md"
+        entries = json.loads((tmp_path / "data" / "queue.json").read_text())
+        assert len(entries) == 2
+        by_type = {}
+        for e in entries:
+            by_type[e.get("type", "one-shot")] = e
+        assert by_type["reminder"]["message"] == "buy milk"
+        assert by_type["one-shot"]["prompt"] == "run cleanup"
+        assert by_type["one-shot"]["agent_file"] == "agents/cleanup.md"
 
 
 # ---------------------------------------------------------------------------

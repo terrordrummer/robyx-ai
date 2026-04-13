@@ -30,8 +30,7 @@ from ai_invoke import (
 import config as _config
 from config_updates import apply_env_updates, parse_direct_env_updates
 from config import WORKSPACE
-from reminders import append_reminder
-from timed_scheduler import add_task as _timed_add_task
+from scheduler import add_reminder, add_task as _timed_add_task
 from i18n import STRINGS
 from topics import create_workspace, close_workspace, create_specialist
 from updater import (
@@ -253,12 +252,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             )
 
         # Check for running scheduled tasks
-        from scheduler import parse_tasks, check_lock
-        running_tasks = []
-        for task in parse_tasks():
-            is_locked, pid = check_lock(task["name"])
-            if is_locked:
-                running_tasks.append((task["name"], pid))
+        from scheduler import get_running_tasks
+        running_tasks = [
+            (t["name"], t["_pid"]) for t in get_running_tasks()
+        ]
         if running_tasks:
             force = msg.args and msg.args[0] == "force"
             task_list = ", ".join("*%s* (PID %d)" % (n, p) for n, p in running_tasks)
@@ -592,11 +589,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
     def _queue_text_reminder(
         text: str, fire_at, chat_id, target_thread, agent, now,
     ) -> str | None:
-        """Queue a text-mode reminder into reminders.json.
+        """Queue a text-mode reminder into the unified queue.
 
         Returns an error string on failure, or ``None`` on success.
         """
-        reminders_file = _config.DATA_DIR / "reminders.json"
         entry = {
             "id": "r-" + uuid.uuid4().hex[:8],
             "chat_id": chat_id,
@@ -607,7 +603,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             "status": "pending",
         }
         try:
-            append_reminder(reminders_file, entry)
+            add_reminder(entry)
             log.info(
                 "REMIND queued: id=%s fire_at=%s thread=%s text=%r (agent=%s)",
                 entry["id"], entry["fire_at"], target_thread,
