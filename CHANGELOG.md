@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.20.1
+
+### Changed
+- **`bot/ai_backend.py`** — Claude Code now defaults to `--permission-mode bypassPermissions` for all invocations (interactive and spawn). Agents operate autonomously without terminal interaction. Override via `CLAUDE_PERMISSION_MODE` env var.
+
+## 0.20.0
+
+### Breaking
+- **Unified scheduler** — `bot/timed_scheduler.py` and `bot/reminders.py` deleted. All scheduling logic merged into `bot/scheduler.py` (60s cycle). Single queue file `data/queue.json` replaces `data/tasks.md`, `data/timed_queue.json`, and `data/reminders.json`. Auto-migration at boot.
+- **`TIMED_SCHEDULER_INTERVAL`** env var removed. `SCHEDULER_INTERVAL` default changed from `600` to `60`.
+
+### Added
+- **Continuous tasks** (`bot/continuous.py`) — autonomous iterative work. Agent executes one step, commits, plans next step, terminates. Scheduler dispatches next step automatically. Dedicated workspace topic (🔄 prefix), git branch in target project repo, state file tracking.
+- **Agent interruption** — `Agent.interrupt()` method (SIGTERM + 5s grace + SIGKILL). Users can interrupt a continuous task by messaging its topic.
+- **`[CREATE_CONTINUOUS]` pattern** — orchestrator/workspace agents can spawn continuous tasks with structured program definition.
+- **`templates/CONTINUOUS_SETUP.md`** — interview template for continuous task program definition.
+- **`templates/CONTINUOUS_STEP.md`** — step execution template with state management instructions.
+- **Git branch setup** in `bot/topics.py` — three scenarios: existing repo (create branch), no repo (git init + branch), no git (proceed without versioning).
+
 ## 0.19.0
 
 ### Changed
