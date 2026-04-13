@@ -50,6 +50,7 @@ class Agent:
     session_started: bool = False
     thread_id: Any = None
     busy: bool = False
+    interrupted: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     running_proc: Any = field(default=None, repr=False, compare=False)
 
@@ -61,6 +62,7 @@ class Agent:
         proc = self.running_proc
         if proc is None:
             return False
+        self.interrupted = True
         try:
             proc.terminate()  # SIGTERM
             try:
