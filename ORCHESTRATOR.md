@@ -28,8 +28,7 @@ When the user asks for something that needs its own space (monitoring, reminders
 The system will automatically:
 - Create a topic/channel for the workspace (forum topic on Telegram, channel on Discord/Slack)
 - Write the agent instruction file
-- For `one-shot` tasks: add an entry to `data/timed_queue.json` (polled every 60 s)
-- For `scheduled`/`interactive` tasks: register in `data/tasks.md`
+- For all task types: add an entry to `data/queue.json` (polled every 60 s)
 - Seed the workspace's stored `work_dir` from `ROBYX_WORKSPACE`
 - Spawn the workspace agent
 
@@ -73,8 +72,9 @@ The focused agent will respond with `[FOCUS off]` when the user wants to return 
 | Type | When to use | Scheduler |
 |------|-------------|-----------|
 | `interactive` | User-driven work — agent responds when messaged in its topic | — |
-| `scheduled` | Periodic autonomous work — agent runs on a timer (hourly, daily, etc.) | Periodic (every 10 min) |
-| `one-shot` | Single execution at a specific date/time (reminders, deadlines) | Timed queue (every 60 s) |
+| `scheduled` | Periodic autonomous work — agent runs on a timer (hourly, daily, etc.) | Unified (every 60 s) |
+| `one-shot` | Single execution at a specific date/time (reminders, deadlines) | Unified (every 60 s) |
+| `continuous` | Iterative autonomous work — step-by-step until objective reached | Unified (every 60 s) |
 
 Scheduled and one-shot runs post their result back into the target workspace topic/channel. Logs remain an operational artifact, not the primary delivery path.
 
@@ -91,9 +91,65 @@ Scheduled and one-shot runs post their result back into the target workspace top
 
 ---
 
+## Continuous Tasks
+
+Continuous tasks are iterative, autonomous work programs that run step-by-step
+until an objective is reached or the user intervenes. Each continuous task gets:
+
+- A **dedicated workspace topic** (auto-created, prefixed with 🔄)
+- A **git branch** (`continuous/<name>`)
+- A **state file** (`data/continuous/<name>/state.json`)
+- An entry in `data/queue.json` (type: `continuous`)
+
+### Creating a Continuous Task
+
+When the user asks for iterative, ongoing work (research, optimization,
+improvement loops), use the setup/interview flow to clarify the program,
+then emit:
+
+```
+[CREATE_CONTINUOUS name="<slug>" work_dir="<path>"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "...",
+  "success_criteria": ["...", "..."],
+  "constraints": ["...", "..."],
+  "checkpoint_policy": "on-demand",
+  "context": "...",
+  "first_step": {
+    "number": 1,
+    "description": "..."
+  }
+}
+[/CONTINUOUS_PROGRAM]
+```
+
+### How It Works
+
+1. The scheduler checks continuous entries every 60 seconds
+2. If the last step completed and a `next_step` is planned, a new agent is spawned
+3. The agent executes the step, commits to the branch, updates the state file
+4. The agent plans the next step and terminates
+5. The scheduler picks up the next step on the following cycle
+
+### User Interaction
+
+- The user can send a message in the continuous task's topic to **interrupt**
+  the running step agent and interact directly
+- The user can ask the agent to pause, resume, or change direction
+- If the agent needs input, it sets `status: "awaiting-input"` and the
+  scheduler pauses until the user responds
+
+### Rate Limits
+
+If the step agent encounters a rate limit, it sets `status: "rate-limited"`.
+The scheduler checks hourly and resumes when the limit clears.
+
+---
+
 ## Reminders
 
-The `[REMIND ...]` pattern is the universal scheduling skill: any interactive agent in Robyx — Robyx, every workspace agent, every specialist, and any focused-mode agent — can schedule a plain text message to be delivered to its own topic/channel at a precise future time. The bot parses the pattern, queues the entry into `data/reminders.json`, and a Python engine fires it at the exact minute (it survives bot restarts via late-firing on recovery).
+The `[REMIND ...]` pattern is the universal scheduling skill: any interactive agent in Robyx — Robyx, every workspace agent, every specialist, and any focused-mode agent — can schedule a plain text message to be delivered to its own topic/channel at a precise future time. The bot parses the pattern, queues the entry into `data/queue.json`, and the unified scheduler fires it at the exact minute (it survives bot restarts via late-firing on recovery).
 
 ```text
 [REMIND in="2m" text="⏰ buy milk"]
@@ -155,7 +211,7 @@ execution of the named workspace or specialist agent:
 ```
 
 When `agent=` is present the reminder is routed into the **timed task
-queue** (`data/timed_queue.json`), not the plain-text reminders engine.
+queue** (`data/queue.json`), not the plain-text reminders engine.
 At the scheduled time the named agent is spawned as an independent
 one-shot run with your `text` as its prompt. This is heavier than a plain
 text reminder but is the correct tool when the user says "at this time
@@ -169,7 +225,7 @@ Validation:
 - Reserved names (`robyx`, `orchestrator`) are not valid targets — Robyx
   coordinates, it does not execute scheduled work.
 
-Multiple `[REMIND ...]` patterns per response are allowed (e.g. one nudge the day before plus one on the day, or a text reminder *and* a delegated action). Validation failures surface as inline notices in the user-visible reply — never as silent drops. **Never write to `data/reminders.json` directly.** Use `[REMIND ...]` for reminders. For future autonomous work that must actually run, use the validated timed-queue helper below instead of appending raw JSON to `data/timed_queue.json` yourself.
+Multiple `[REMIND ...]` patterns per response are allowed (e.g. one nudge the day before plus one on the day, or a text reminder *and* a delegated action). Validation failures surface as inline notices in the user-visible reply — never as silent drops. **Never write to `data/queue.json` directly.** Use `[REMIND ...]` for reminders. For future autonomous work that must actually run, use the validated timed-queue helper below instead of appending raw JSON to `data/queue.json` yourself.
 
 For the rare case where you need to be re-invoked at a future time to *do work* (not just deliver a message), use the Timed Task Queue described below — it spawns a fresh agent run, which is much heavier and only worth it when actual work is required.
 
@@ -177,8 +233,8 @@ For the rare case where you need to be re-invoked at a future time to *do work* 
 
 ## Timed Task Queue
 
-Any agent can programmatically schedule a one-shot or periodic task with `timed_scheduler.add_task(...)`.
-The helper validates task names and `agent_file` references, writes atomically to `data/timed_queue.json`, and the timed scheduler dispatches due tasks every 60 seconds.
+Any agent can programmatically schedule a one-shot or periodic task with `scheduler.add_task(...)`.
+The helper validates task names and `agent_file` references, writes atomically to `data/queue.json`, and the timed scheduler dispatches due tasks every 60 seconds.
 
 ### When to use the timed queue directly (inside an agent)
 
@@ -192,7 +248,7 @@ Use this when you need to **re-invoke an agent at a precise future time to perfo
 ```python
 import uuid
 from datetime import datetime, timezone
-from timed_scheduler import add_task
+from scheduler import add_task
 
 add_task({
     "id": str(uuid.uuid4()),
@@ -236,7 +292,7 @@ When the user provides API keys, tokens, or configuration values:
 
 Prefer explicit `KEY=value` lines when the user is giving you a secret or config value. Robyx applies recognized env-key assignments locally, so values like `OPENAI_API_KEY=...` do not need to be forwarded to the AI backend for interpretation.
 
-Known `.env` keys: `OPENAI_API_KEY`, `AI_BACKEND`, `SCHEDULER_INTERVAL`, `TIMED_SCHEDULER_INTERVAL`, `UPDATE_CHECK_INTERVAL`, `ROBYX_PLATFORM`.
+Known `.env` keys: `OPENAI_API_KEY`, `AI_BACKEND`, `SCHEDULER_INTERVAL`, `UPDATE_CHECK_INTERVAL`, `ROBYX_PLATFORM`.
 Also support common keys `AI_CLI_PATH`, `CLAUDE_PERMISSION_MODE`, `ROBYX_WORKSPACE`; Telegram keys `ROBYX_BOT_TOKEN`, `ROBYX_CHAT_ID`, `ROBYX_OWNER_ID`; Slack keys `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID`, `SLACK_OWNER_ID`; Discord keys `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CONTROL_CHANNEL_ID`, `DISCORD_OWNER_ID`.
 
 ---
