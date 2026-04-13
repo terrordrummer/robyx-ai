@@ -245,39 +245,24 @@ async def invoke_ai(
     explicit backend model id, or ``None`` (in which case the agent's own
     preference and the role default from ``models.yaml`` are consulted).
 
-    If the agent is currently busy with a running subprocess and the
-    incoming message targets a continuous-task topic, the running process
-    is interrupted (SIGTERM → SIGKILL) so the user's message is processed
-    immediately instead of queuing behind the lock.
+    If the agent is currently busy with a running subprocess, the running
+    process is interrupted (SIGTERM → SIGKILL) so the user's message is
+    processed immediately instead of queuing behind the lock.
     """
-    # Interrupt running subprocess if the agent is busy and this is a
-    # continuous task topic (user wants to interact with the running task).
+    # Interrupt running subprocess if the agent is busy — the user's new
+    # message takes priority over the in-flight task.
     if agent.busy and agent.running_proc is not None:
-        if _is_continuous_task_topic(agent):
-            log.info(
-                "Interrupting agent [%s] (PID %d) for user message",
-                agent.name, agent.running_proc.pid,
-            )
-            await agent.interrupt()
+        log.info(
+            "Interrupting agent [%s] (PID %d) for user message",
+            agent.name, agent.running_proc.pid,
+        )
+        await agent.interrupt()
 
     async with agent.lock:
         return await _invoke_ai_locked(
             agent, message, chat_id, platform, manager, backend,
             is_orchestrator_call, model, _retry, thread_id,
         )
-
-
-def _is_continuous_task_topic(agent) -> bool:
-    """Return True if the agent is associated with a continuous task queue entry."""
-    try:
-        from scheduler import load_queue
-        entries = load_queue()
-        return any(
-            e.get("type") == "continuous" and e.get("name") == agent.name
-            for e in entries
-        )
-    except Exception:
-        return False
 
 
 async def _invoke_ai_locked(

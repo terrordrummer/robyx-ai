@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.2
+
+### Changed
+- **`bot/ai_invoke.py`** — Agent interruption now applies to **all** user messages to any busy agent, not just continuous task topics. Any incoming message takes priority over a running subprocess (SIGTERM + 5s grace + SIGKILL), preventing messages from queuing behind the lock. Removed `_is_continuous_task_topic()` helper.
+
 ## 0.20.1
 
 ### Changed
@@ -13,7 +18,7 @@
 
 ### Added
 - **Continuous tasks** (`bot/continuous.py`) — autonomous iterative work. Agent executes one step, commits, plans next step, terminates. Scheduler dispatches next step automatically. Dedicated workspace topic (🔄 prefix), git branch in target project repo, state file tracking.
-- **Agent interruption** — `Agent.interrupt()` method (SIGTERM + 5s grace + SIGKILL). Users can interrupt a continuous task by messaging its topic.
+- **Agent interruption** — `Agent.interrupt()` method (SIGTERM + 5s grace + SIGKILL). Any user message to a busy agent interrupts the running subprocess immediately.
 - **`[CREATE_CONTINUOUS]` pattern** — orchestrator/workspace agents can spawn continuous tasks with structured program definition.
 - **`templates/CONTINUOUS_SETUP.md`** — interview template for continuous task program definition.
 - **`templates/CONTINUOUS_STEP.md`** — step execution template with state management instructions.

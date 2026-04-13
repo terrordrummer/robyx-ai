@@ -399,7 +399,7 @@ After one-shot tasks fire, the queue marks them `dispatched`; closing a workspac
 
 ### Continuous Tasks
 
-Continuous tasks enable autonomous, iterative work. Each gets a dedicated workspace topic, a git branch (in the target project's repo), and a state file. The scheduler dispatches one step at a time; each step commits, updates the state, and plans the next step. The user can interrupt at any time by messaging the continuous task's topic.
+Continuous tasks enable autonomous, iterative work. Each gets a dedicated workspace topic, a git branch (in the target project's repo), and a state file. The scheduler dispatches one step at a time; each step commits, updates the state, and plans the next step. Any user message to a busy agent interrupts the running subprocess immediately, so the user's request is processed without waiting for the current task to finish.
 
 ---
 
