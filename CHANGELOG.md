@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.5
+
+### Changed
+- **`README.md`** — Major documentation overhaul: replaced outdated `interactive/scheduled/one-shot` workspace type table with unified description; rewrote Scheduler section with clear explanations of reminders, one-shot, periodic, and continuous tasks; added Agent Interruption section; fixed ASCII diagram (KAEL → ROBYX); updated all env var names to `ROBYX_` prefix with legacy fallback notes; corrected `SCHEDULER_INTERVAL` default (600 → 60); fixed `CLAUDE_PERMISSION_MODE` description; updated project structure (removed deleted `reminders.py`, added `queue.json` and `continuous/`).
+- **`bot/handlers.py`**, **`bot/migrations.py`** — Replaced remaining "Kael" references with "Robyx" / "orchestrator" in code comments and migration descriptions.
+
 ## 0.20.4
 
 ### Added
