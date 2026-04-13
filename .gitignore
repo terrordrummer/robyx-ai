@@ -1,0 +1,10 @@
+.env
+data/
+*.log
+*.log.*
+bot.pid
+.venv/
+__pycache__/
+.DS_Store
+*.pyc
+.coverage
