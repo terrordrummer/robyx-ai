@@ -31,8 +31,8 @@ def _env(new_key, old_key, default=None):
 
 # ── Required ──
 BOT_TOKEN = _env("ROBYX_BOT_TOKEN", "KAELOPS_BOT_TOKEN")
-CHAT_ID = int(_env("ROBYX_CHAT_ID", "KAELOPS_CHAT_ID"))
-OWNER_ID = int(_env("ROBYX_OWNER_ID", "KAELOPS_OWNER_ID"))
+CHAT_ID = int(_env("ROBYX_CHAT_ID", "KAELOPS_CHAT_ID", "0")) or None
+OWNER_ID = int(_env("ROBYX_OWNER_ID", "KAELOPS_OWNER_ID", "0")) or None
 AI_BACKEND = os.environ.get("AI_BACKEND", "claude")
 AI_CLI_PATH = os.environ.get("AI_CLI_PATH", "")  # auto-detected if empty
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "").strip()

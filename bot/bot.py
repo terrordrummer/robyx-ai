@@ -256,6 +256,11 @@ def main():
 
     # Create platform
     if PLATFORM == "telegram":
+        if not (BOT_TOKEN and CHAT_ID and OWNER_ID):
+            raise RuntimeError(
+                "Telegram platform requires ROBYX_BOT_TOKEN, ROBYX_CHAT_ID, "
+                "and ROBYX_OWNER_ID in .env"
+            )
         from messaging.telegram import TelegramPlatform
         plat = TelegramPlatform(BOT_TOKEN, CHAT_ID, OWNER_ID)
     elif PLATFORM == "slack":
