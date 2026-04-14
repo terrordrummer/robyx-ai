@@ -453,6 +453,7 @@ def _make_git_side_effect(
     diff_files=None,
     head_detached=False,
     checkout_main_ok=True,
+    current_branch="main",
 ):
     """Build a fake ``_git`` callable for ``apply_update`` integration tests.
 
@@ -474,9 +475,14 @@ def _make_git_side_effect(
             stdout = "\n".join(diff_files or []) + ("\n" if diff_files else "")
             return subprocess.CompletedProcess(["git", *args], 0, stdout, "")
         if cmd == "symbolic-ref":
-            rc = 1 if head_detached else 0
-            stderr = "fatal: ref HEAD is not a symbolic ref" if head_detached else ""
-            return subprocess.CompletedProcess(["git", *args], rc, "", stderr)
+            if head_detached:
+                return subprocess.CompletedProcess(
+                    ["git", *args], 1, "",
+                    "fatal: ref HEAD is not a symbolic ref",
+                )
+            return subprocess.CompletedProcess(
+                ["git", *args], 0, current_branch + "\n", "",
+            )
         if cmd == "checkout" and len(args) > 1 and args[1] == "main":
             rc = 0 if checkout_main_ok else 1
             stderr = "" if checkout_main_ok else "error: pathspec 'main' did not match"
@@ -546,7 +552,46 @@ class TestApplyUpdate:
         )
         success, msg = await updater.apply_update("0.2.0")
         assert success is False
-        assert "could not reattach to main" in msg
+        assert "could not switch to main" in msg
+
+    @pytest.mark.asyncio
+    @patch("updater.asyncio.create_subprocess_exec")
+    @patch("updater._git")
+    async def test_feature_branch_switches_to_main(self, mock_git, mock_exec, tmp_path):
+        """If the operator checked out a feature branch manually, the
+        update must still target ``main`` — not whatever HEAD is on.
+        """
+        mock_git.side_effect = _make_git_side_effect(current_branch="experimental")
+        pip_proc = AsyncMock()
+        pip_proc.communicate = AsyncMock(return_value=(b"", b""))
+        pip_proc.returncode = 0
+        mock_exec.return_value = pip_proc
+
+        success, _ = await updater.apply_update("0.2.0")
+        assert success is True
+        checkout_main = [c for c in mock_git.call_args_list
+                         if len(c[0]) > 1 and c[0][0] == "checkout" and c[0][1] == "main"]
+        assert len(checkout_main) == 1
+
+    @pytest.mark.asyncio
+    @patch("updater.asyncio.create_subprocess_exec")
+    @patch("updater._git")
+    async def test_already_on_main_no_extra_checkout(self, mock_git, mock_exec, tmp_path):
+        """The normal path: already on main → no redundant checkout."""
+        mock_git.side_effect = _make_git_side_effect(current_branch="main")
+        pip_proc = AsyncMock()
+        pip_proc.communicate = AsyncMock(return_value=(b"", b""))
+        pip_proc.returncode = 0
+        mock_exec.return_value = pip_proc
+
+        success, _ = await updater.apply_update("0.2.0")
+        assert success is True
+        pre_pull_checkouts = [
+            c for c in mock_git.call_args_list
+            if len(c[0]) > 1 and c[0][0] == "checkout" and c[0][1] == "main"
+        ]
+        # Zero pre-pull checkout-main calls (rollback path never reached on success).
+        assert len(pre_pull_checkouts) == 0
 
     @pytest.mark.asyncio
     @patch("updater.asyncio.create_subprocess_exec")
@@ -633,12 +678,13 @@ class TestApplyUpdate:
         assert success is False
         assert "pip install returned 1" in msg
         assert "could not find a version" in msg
-        # Rollback to previous tag must have been called
-        checkout_calls = [
+        # Rollback must reset main to the previous tag (v0.20.22+: no
+        # more detached-HEAD `git checkout v<tag>`).
+        reset_calls = [
             c for c in mock_git.call_args_list
-            if len(c[0]) >= 2 and c[0][0] == "checkout" and c[0][1] == "v0.1.0"
+            if c[0][:3] == ("reset", "--hard", "v0.1.0")
         ]
-        assert len(checkout_calls) >= 1
+        assert len(reset_calls) >= 1
 
     @pytest.mark.asyncio
     @patch("updater.asyncio.create_subprocess_exec")

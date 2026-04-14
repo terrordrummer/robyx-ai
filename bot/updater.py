@@ -276,6 +276,26 @@ async def _git(*args, check=True) -> subprocess.CompletedProcess:
     )
 
 
+async def _rollback_code_to(tag: str) -> None:
+    """Roll the working tree back to ``v<tag>`` while keeping HEAD on ``main``.
+
+    Previously the rollback path was ``git checkout v<tag>``, which
+    leaves HEAD detached at the tag. From that state every subsequent
+    ``git pull --ff-only`` aborts with "You are not currently on a
+    branch", so the install would get stuck until a human intervened.
+
+    This helper instead re-attaches to ``main`` (if not already there)
+    and then does a hard reset to the tag. The end state is identical
+    content-wise, but HEAD is a named branch, so the next update cycle
+    can fast-forward cleanly.
+
+    Best-effort: every step uses ``check=False``. Rollback should never
+    raise — the caller is already in an error path.
+    """
+    await _git("checkout", "main", check=False)
+    await _git("reset", "--hard", "v" + tag, check=False)
+
+
 async def fetch_remote_tags() -> list[str]:
     """List version tags on origin, sorted ascending.
 
@@ -544,21 +564,35 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         log.warning("Personal-data migration raised — continuing: %s", e, exc_info=True)
 
     try:
-        # 2. Ensure we're on main before pulling. A previous rollback
-        # leaves HEAD detached at a tag (``git checkout v<old>`` in the
-        # failure path below); from that state ``git pull --ff-only``
-        # aborts with "You are not currently on a branch". Re-attach to
-        # main so subsequent updates can recover without manual
-        # intervention. Local work was already stashed at step 1.
-        head_check = await _git("symbolic-ref", "--quiet", "HEAD", check=False)
-        if head_check.returncode != 0:
-            await notify("Detached HEAD detected — reattaching to main")
+        # 2. Ensure we're on main before pulling. Two failure modes are
+        # handled here: (a) a previous rollback left HEAD detached at a
+        # tag (pre-v0.20.22 rollbacks used ``git checkout v<old>``, and
+        # a detached HEAD makes ``git pull --ff-only`` abort with "not on
+        # a branch"); (b) the operator manually checked out a feature
+        # branch or an older tag — the update must still target ``main``,
+        # not whatever the working tree happens to be on. In both cases
+        # we re-attach to main before the pull. Local work was already
+        # stashed at step 1.
+        head_check = await _git(
+            "symbolic-ref", "--quiet", "--short", "HEAD", check=False,
+        )
+        current_branch = (
+            head_check.stdout.strip() if head_check.returncode == 0 else ""
+        )
+        if current_branch != "main":
+            if not current_branch:
+                await notify("Detached HEAD detected — reattaching to main")
+            else:
+                await notify(
+                    "On branch '%s', update targets 'main' — switching"
+                    % current_branch,
+                )
             attach = await _git("checkout", "main", check=False)
             if attach.returncode != 0:
                 error = attach.stderr.strip() or attach.stdout.strip()
                 if has_stash:
                     await _git("stash", "pop", check=False)
-                return False, "could not reattach to main: %s" % error
+                return False, "could not switch to main: %s" % error
 
         # 3. Fast-forward pull only
         await notify("Pulling latest changes...")
@@ -591,14 +625,14 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                     if proc.returncode != 0:
                         error = stderr.decode().strip() or stdout.decode().strip()
                         # Rollback: previous version tag + restore data/.
-                        await _git("checkout", "v" + current, check=False)
+                        await _rollback_code_to(current)
                         if snapshot is not None:
                             _restore_data_dir(snapshot)
                         if has_stash:
                             await _git("stash", "pop", check=False)
                         return False, "Migration step failed: `%s`\n%s" % (step, error)
                 except asyncio.TimeoutError:
-                    await _git("checkout", "v" + current, check=False)
+                    await _rollback_code_to(current)
                     if snapshot is not None:
                         _restore_data_dir(snapshot)
                     if has_stash:
@@ -615,7 +649,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         pip_name = "pip.exe" if sys.platform == "win32" else "pip"
         pip_path = PROJECT_ROOT / ".venv" / venv_bin / pip_name
         if not pip_path.exists():
-            await _git("checkout", "v" + current, check=False)
+            await _rollback_code_to(current)
             if has_stash:
                 await _git("stash", "pop", check=False)
             return False, "venv pip not found at %s" % pip_path
@@ -633,7 +667,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             )
         except asyncio.TimeoutError:
             deps_proc.kill()
-            await _git("checkout", "v" + current, check=False)
+            await _rollback_code_to(current)
             if has_stash:
                 await _git("stash", "pop", check=False)
             return False, "pip install timed out after 600s"
@@ -646,7 +680,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             log.info("pip install stderr:\n%s", pip_err_text.strip())
 
         if deps_proc.returncode != 0:
-            await _git("checkout", "v" + current, check=False)
+            await _rollback_code_to(current)
             if has_stash:
                 await _git("stash", "pop", check=False)
             tail_lines = (pip_err_text or pip_out_text).strip().splitlines()[-8:]
@@ -675,7 +709,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         smoke_ok, smoke_err = await _post_update_smoke_test()
         if not smoke_ok:
             await notify("Smoke test failed; rolling back: %s" % smoke_err)
-            await _git("checkout", "v" + current, check=False)
+            await _rollback_code_to(current)
             if snapshot is not None:
                 _restore_data_dir(snapshot)
             if has_stash:
@@ -756,7 +790,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
     except Exception as e:
         # Catastrophic rollback: code + data.
         log.error("Update failed with exception: %s", e, exc_info=True)
-        await _git("checkout", "v" + current, check=False)
+        await _rollback_code_to(current)
         if snapshot is not None:
             _restore_data_dir(snapshot)
         if has_stash:
