@@ -115,22 +115,35 @@ def _parse_release_notes(text: str) -> dict:
 # ── Git operations ──
 
 
-def _git(*args, check=True) -> subprocess.CompletedProcess:
-    """Run a git command in the project root."""
-    return subprocess.run(
-        ["git", *args],
+async def _git(*args, check=True) -> subprocess.CompletedProcess:
+    """Run a git command in the project root without blocking the event loop."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args,
         cwd=str(PROJECT_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=check,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise subprocess.TimeoutExpired(["git", *args], 60)
+    stdout = stdout_b.decode(errors="replace")
+    stderr = stderr_b.decode(errors="replace")
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(
+            proc.returncode, ["git", *args], stdout, stderr,
+        )
+    return subprocess.CompletedProcess(
+        ["git", *args], proc.returncode, stdout, stderr,
     )
 
 
-def fetch_remote_tags() -> list[str]:
+async def fetch_remote_tags() -> list[str]:
     """Fetch tags from origin and return all version tags sorted ascending."""
-    _git("fetch", "--tags", "--force")
-    result = _git("tag", "--list", "v*", "--sort=version:refname")
+    await _git("fetch", "--tags", "--force")
+    result = await _git("tag", "--list", "v*", "--sort=version:refname")
     tags = [t.strip() for t in result.stdout.splitlines() if t.strip()]
     return tags
 
@@ -144,14 +157,14 @@ def _get_latest_remote_version(tags: list[str]) -> str | None:
     return latest_tag.lstrip("v")
 
 
-def _get_release_notes_for(version: str, tags: list[str]) -> dict | None:
+async def _get_release_notes_for(version: str, tags: list[str]) -> dict | None:
     """Get release notes from the tagged commit's releases/<version>.md."""
     tag = "v" + version
     if tag not in tags:
         return None
 
     # Read the release notes file from the tag
-    result = _git("show", "%s:releases/%s.md" % (tag, version), check=False)
+    result = await _git("show", "%s:releases/%s.md" % (tag, version), check=False)
     if result.returncode != 0:
         return None
 
@@ -161,7 +174,7 @@ def _get_release_notes_for(version: str, tags: list[str]) -> dict | None:
 # ── Check for updates ──
 
 
-def check_for_updates() -> dict | None:
+async def check_for_updates() -> dict | None:
     """Check if a new version is available.
 
     Returns a dict with update info, or None if up to date.
@@ -172,7 +185,7 @@ def check_for_updates() -> dict | None:
     current = get_current_version()
 
     try:
-        tags = fetch_remote_tags()
+        tags = await fetch_remote_tags()
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         log.error("Failed to fetch tags: %s", e)
         return None
@@ -189,7 +202,7 @@ def check_for_updates() -> dict | None:
         return None
 
     # Get release notes
-    notes = _get_release_notes_for(latest, tags)
+    notes = await _get_release_notes_for(latest, tags)
 
     # Determine status
     status = "available"
@@ -325,7 +338,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         log.info(msg)
 
     # 1. Stash local changes
-    stash_result = _git("stash", "--include-untracked", check=False)
+    stash_result = await _git("stash", "--include-untracked", check=False)
     has_stash = "No local changes" not in stash_result.stdout
 
     # Capture the pre-pull commit so we can compute, after the pull, which
@@ -338,7 +351,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
     # invalidation step and log it.
     pre_pull_sha: str | None = None
     try:
-        pre_pull = _git("rev-parse", "HEAD", check=False)
+        pre_pull = await _git("rev-parse", "HEAD", check=False)
         if pre_pull.returncode == 0:
             pre_pull_sha = pre_pull.stdout.strip() or None
     except Exception as e:
@@ -364,11 +377,11 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
     try:
         # 2. Fast-forward pull only
         await notify("Pulling latest changes...")
-        pull = _git("pull", "--ff-only", check=False)
+        pull = await _git("pull", "--ff-only", check=False)
         if pull.returncode != 0:
             error = pull.stderr.strip() or pull.stdout.strip()
             if has_stash:
-                _git("stash", "pop", check=False)
+                await _git("stash", "pop", check=False)
             return False, "git pull --ff-only failed: %s" % error
 
         # 3. Read release notes from the now-available local file
@@ -393,14 +406,14 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                     if proc.returncode != 0:
                         error = stderr.decode().strip() or stdout.decode().strip()
                         # Rollback: go back to the previous version tag
-                        _git("checkout", "v" + current, check=False)
+                        await _git("checkout", "v" + current, check=False)
                         if has_stash:
-                            _git("stash", "pop", check=False)
+                            await _git("stash", "pop", check=False)
                         return False, "Migration step failed: `%s`\n%s" % (step, error)
                 except asyncio.TimeoutError:
-                    _git("checkout", "v" + current, check=False)
+                    await _git("checkout", "v" + current, check=False)
                     if has_stash:
-                        _git("stash", "pop", check=False)
+                        await _git("stash", "pop", check=False)
                     return False, "Migration step timed out: `%s`" % step
 
         # 5. Always reinstall deps. A silently-failed install was the root
@@ -413,9 +426,9 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         pip_name = "pip.exe" if sys.platform == "win32" else "pip"
         pip_path = PROJECT_ROOT / ".venv" / venv_bin / pip_name
         if not pip_path.exists():
-            _git("checkout", "v" + current, check=False)
+            await _git("checkout", "v" + current, check=False)
             if has_stash:
-                _git("stash", "pop", check=False)
+                await _git("stash", "pop", check=False)
             return False, "venv pip not found at %s" % pip_path
 
         deps_proc = await asyncio.create_subprocess_exec(
@@ -431,9 +444,9 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             )
         except asyncio.TimeoutError:
             deps_proc.kill()
-            _git("checkout", "v" + current, check=False)
+            await _git("checkout", "v" + current, check=False)
             if has_stash:
-                _git("stash", "pop", check=False)
+                await _git("stash", "pop", check=False)
             return False, "pip install timed out after 600s"
 
         pip_out_text = pip_stdout.decode(errors="replace")
@@ -444,9 +457,9 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             log.info("pip install stderr:\n%s", pip_err_text.strip())
 
         if deps_proc.returncode != 0:
-            _git("checkout", "v" + current, check=False)
+            await _git("checkout", "v" + current, check=False)
             if has_stash:
-                _git("stash", "pop", check=False)
+                await _git("stash", "pop", check=False)
             tail_lines = (pip_err_text or pip_out_text).strip().splitlines()[-8:]
             tail_str = "\n".join(tail_lines)
             return False, "pip install returned %d:\n%s" % (deps_proc.returncode, tail_str)
@@ -463,7 +476,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
 
         # 6. Pop stash if we had one
         if has_stash:
-            _git("stash", "pop", check=False)
+            await _git("stash", "pop", check=False)
 
         # 6.5 Invalidate AI-CLI sessions for any agent whose system prompt
         # or per-agent brief was changed by this update. See the module
@@ -480,7 +493,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         # the update — the restart still happens.
         if pre_pull_sha and manager is not None:
             try:
-                diff = _git(
+                diff = await _git(
                     "diff", "--name-only", pre_pull_sha, "HEAD",
                     check=False,
                 )
@@ -535,9 +548,9 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
     except Exception as e:
         # Catastrophic rollback
         log.error("Update failed with exception: %s", e, exc_info=True)
-        _git("checkout", "v" + current, check=False)
+        await _git("checkout", "v" + current, check=False)
         if has_stash:
-            _git("stash", "pop", check=False)
+            await _git("stash", "pop", check=False)
 
         state = _load_state()
         state["update_history"].append({

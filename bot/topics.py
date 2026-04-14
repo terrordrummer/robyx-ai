@@ -186,7 +186,7 @@ async def close_workspace(name: str, manager: AgentManager, platform=None) -> bo
     return True
 
 
-def _setup_git_branch(work_dir: str, branch: str) -> dict:
+async def _setup_git_branch(work_dir: str, branch: str) -> dict:
     """Set up a git branch for continuous task work in the target project.
 
     Returns a dict with:
@@ -199,18 +199,33 @@ def _setup_git_branch(work_dir: str, branch: str) -> dict:
     2. work_dir is not a git repo → git init + create branch
     3. git is not available → proceed without versioning
     """
+    import asyncio
     import subprocess
     from pathlib import Path
+
+    async def _run_git(*args, timeout=10):
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise subprocess.TimeoutExpired(["git", *args], timeout)
+        return subprocess.CompletedProcess(
+            ["git", *args], proc.returncode,
+            stdout, stderr,
+        )
 
     work_path = Path(work_dir)
 
     # Check if git is available
     try:
-        subprocess.run(
-            ["git", "--version"],
-            capture_output=True, check=True, timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
+        await _run_git("--version", timeout=5)
+    except (FileNotFoundError, Exception):
         return {
             "branch": branch,
             "versioning": "none",
@@ -221,41 +236,35 @@ def _setup_git_branch(work_dir: str, branch: str) -> dict:
     is_repo = (work_path / ".git").exists()
     if not is_repo:
         try:
-            # Check if it's inside a git repo (subdirectory)
-            result = subprocess.run(
-                ["git", "-C", work_dir, "rev-parse", "--git-dir"],
-                capture_output=True, timeout=5,
-            )
+            result = await _run_git("-C", work_dir, "rev-parse", "--git-dir", timeout=5)
             is_repo = result.returncode == 0
-        except subprocess.SubprocessError:
+        except Exception:
             pass
 
     if is_repo:
         # Create branch in existing repo
         try:
-            subprocess.run(
-                ["git", "-C", work_dir, "checkout", "-b", branch],
-                capture_output=True, check=True, timeout=10,
-            )
+            result = await _run_git("-C", work_dir, "checkout", "-b", branch)
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    result.returncode, result.args, result.stdout, result.stderr,
+                )
             return {
                 "branch": branch,
                 "versioning": "git-branch",
                 "message": "created branch `%s` in existing repo" % branch,
             }
         except subprocess.CalledProcessError as exc:
-            # Branch might already exist
-            if b"already exists" in exc.stderr:
+            if b"already exists" in (exc.stderr or b""):
                 try:
-                    subprocess.run(
-                        ["git", "-C", work_dir, "checkout", branch],
-                        capture_output=True, check=True, timeout=10,
-                    )
-                    return {
-                        "branch": branch,
-                        "versioning": "git-branch",
-                        "message": "switched to existing branch `%s`" % branch,
-                    }
-                except subprocess.SubprocessError:
+                    result = await _run_git("-C", work_dir, "checkout", branch)
+                    if result.returncode == 0:
+                        return {
+                            "branch": branch,
+                            "versioning": "git-branch",
+                            "message": "switched to existing branch `%s`" % branch,
+                        }
+                except Exception:
                     pass
             log.warning("Failed to create branch '%s' in %s: %s", branch, work_dir, exc.stderr)
             return {
@@ -266,20 +275,22 @@ def _setup_git_branch(work_dir: str, branch: str) -> dict:
     else:
         # Initialize a new repo
         try:
-            subprocess.run(
-                ["git", "-C", work_dir, "init"],
-                capture_output=True, check=True, timeout=10,
-            )
-            subprocess.run(
-                ["git", "-C", work_dir, "checkout", "-b", branch],
-                capture_output=True, check=True, timeout=10,
-            )
+            result = await _run_git("-C", work_dir, "init")
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    result.returncode, result.args, result.stdout, result.stderr,
+                )
+            result = await _run_git("-C", work_dir, "checkout", "-b", branch)
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    result.returncode, result.args, result.stdout, result.stderr,
+                )
             return {
                 "branch": branch,
                 "versioning": "git-init",
                 "message": "initialized git repo and created branch `%s`" % branch,
             }
-        except subprocess.SubprocessError as exc:
+        except Exception as exc:
             log.warning("Failed to init git in %s: %s", work_dir, exc)
             return {
                 "branch": branch,
@@ -320,7 +331,7 @@ async def create_continuous_workspace(
         return None
 
     # 2. Set up git branch in the target project's work_dir
-    git_info = _setup_git_branch(work_dir, branch)
+    git_info = await _setup_git_branch(work_dir, branch)
     branch = git_info["branch"]
     versioning = git_info["versioning"]
     log.info(

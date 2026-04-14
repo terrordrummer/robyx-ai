@@ -106,15 +106,15 @@ def telegram_polling_kwargs() -> dict:
 
 def ensure_single_instance():
     """Verify no other bot instance is running. Write PID file for current process."""
-    from process import is_pid_alive, is_bot_process, get_process_name
+    from process import is_pid_alive, is_bot_process_sync, get_process_name_sync
 
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text().strip())
             if is_pid_alive(pid):
-                if is_bot_process(pid):
+                if is_bot_process_sync(pid):
                     sys.exit("Robyx already running (PID %d)" % pid)
-                proc_name = get_process_name(pid)
+                proc_name = get_process_name_sync(pid)
                 log.warning("Stale PID file: PID %d is now '%s'. Overwriting.", pid, proc_name)
             else:
                 log.warning("Stale PID file found. Overwriting.")
@@ -186,7 +186,7 @@ async def update_check_job(context):
     control_room_id = plat.control_room_id
     log.info("Update check: running")
     try:
-        info = check_for_updates()
+        info = await check_for_updates()
         if not info:
             return
 
