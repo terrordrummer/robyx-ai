@@ -40,7 +40,16 @@ def test_env_example_lists_cross_platform_config_keys():
 
 
 def test_readme_documents_current_cross_platform_contract():
-    contents = _read("README.md")
+    """v0.20.15 split the README into ``docs/`` files. The cross-platform
+    contract is now spread across README + docs/configuration.md +
+    docs/scheduler.md + docs/backends.md, so we concatenate them and
+    assert against the union."""
+    contents = "\n".join([
+        _read("README.md"),
+        _read("docs/configuration.md"),
+        _read("docs/scheduler.md"),
+        _read("docs/backends.md"),
+    ])
 
     assert "SCHEDULER_INTERVAL" in contents
     assert "CLAUDE_PERMISSION_MODE" in contents
