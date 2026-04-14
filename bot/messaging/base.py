@@ -3,8 +3,48 @@
 from __future__ import annotations
 
 import abc
+import asyncio
+import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable, TypeVar
+
+_log = logging.getLogger("robyx.messaging")
+
+_T = TypeVar("_T")
+
+
+async def retry_send(
+    op: Callable[[], Awaitable[_T]],
+    *,
+    label: str = "platform send",
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+) -> _T:
+    """Run *op* with exponential backoff on transient exceptions.
+
+    Used by adapters to shield ``send_message`` (and friends) from
+    momentary platform hiccups (network blips, 5xx responses) without
+    each adapter reimplementing the retry loop. The final failure is
+    re-raised so callers can surface it to the user.
+    """
+    delay = base_delay
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await op()
+        except Exception as exc:  # noqa: BLE001 - platforms raise heterogeneous types
+            last_exc = exc
+            if attempt >= max_attempts:
+                break
+            _log.warning(
+                "%s failed (attempt %d/%d): %s. Retrying in %.1fs",
+                label, attempt, max_attempts, exc, delay,
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+    assert last_exc is not None
+    _log.error("%s failed after %d attempts: %s", label, max_attempts, last_exc)
+    raise last_exc
 
 
 @dataclass

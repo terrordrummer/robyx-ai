@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from messaging.base import Platform, PlatformMessage
+from messaging.base import Platform, PlatformMessage, retry_send
 
 log = logging.getLogger("robyx.platform.telegram")
 
@@ -113,16 +113,19 @@ class TelegramPlatform(Platform):
         if parse_mode == "markdown":
             data["parse_mode"] = "Markdown"
 
-        client = self._get_client()
-        resp = await client.post(
-            "%s/sendMessage" % self._api_base, data=data, timeout=30,
-        )
-        result = resp.json()
-        if not result.get("ok"):
-            raise RuntimeError(
-                result.get("description") or "Telegram sendMessage failed"
+        async def _do_send() -> Any:
+            client = self._get_client()
+            resp = await client.post(
+                "%s/sendMessage" % self._api_base, data=data, timeout=30,
             )
-        return result.get("result")
+            result = resp.json()
+            if not result.get("ok"):
+                raise RuntimeError(
+                    result.get("description") or "Telegram sendMessage failed"
+                )
+            return result.get("result")
+
+        return await retry_send(_do_send, label="telegram.send_message")
 
     async def send_typing(self, chat_id: int, thread_id: int | None = None) -> None:
         data: dict[str, Any] = {"chat_id": chat_id, "action": "typing"}
