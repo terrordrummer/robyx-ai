@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.20.21
+
+### Fixed (updater hotfix)
+- **`bot/bot.py`** — new `--smoke-test` flag. Exits 0 right after all module-level imports complete, before `main()` opens sockets or acquires the pid lock. Used by the post-update smoke test to verify the new code at least imports cleanly.
+- **`bot/updater.py`** — `_post_update_smoke_test()` now runs `python bot/bot.py --smoke-test` (production-shape invocation) instead of `python -c "import bot.bot"`. The old form failed on every real install because `bot/` was not on `sys.path` and `bot/bot.py` does `import _bootstrap` at module scope. Latent since v0.20.14.
+- **`bot/updater.py`** — `apply_update()` now re-attaches to `main` before `git pull --ff-only` when HEAD is detached. The rollback path (`git checkout v<old>`) leaves HEAD detached, so the *next* update attempt used to fail permanently with "You are not currently on a branch". Fixes the Linux-side stuck install.
+
+### Tests
+982 passed, 1 skipped (+3 regression tests for the new invocation shape and the detached-HEAD recovery).
+
+### Migration
+None. `bot/migrations/v0_20_21.py` is a no-op.
+
+### Recovery for affected installs
+The broken v0.20.19/0.20.20 updater runs in-process, so an affected install cannot auto-update its way out. Manual one-shot recovery: `cd <project_root> && git checkout main && git pull --ff-only && ./install/install-*.sh`. From v0.20.21 onwards auto-update works normally.
+
 ## 0.20.20
 
 ### Added (agents)

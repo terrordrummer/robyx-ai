@@ -158,14 +158,20 @@ def _restore_data_dir(snapshot: Path) -> bool:
 
 
 async def _post_update_smoke_test() -> tuple[bool, str]:
-    """Spawn ``<venv>/bin/python -c "import bot.bot"`` to verify the new
-    code at least imports cleanly.
+    """Run ``<venv>/bin/python bot/bot.py --smoke-test`` to verify the
+    new code at least imports cleanly.
 
     A failed pip install can succeed at the package-resolution level
     while still leaving the venv in a broken state (e.g. a transitive
     dependency conflict that only surfaces at import time). Catching
     that here lets the caller roll back instead of restarting into a
     broken bot.
+
+    We invoke ``bot/bot.py`` exactly the way the production service
+    launches it, so ``sys.path[0]`` is ``bot/`` and ``import _bootstrap``
+    resolves cleanly. The ``--smoke-test`` flag makes ``bot.py`` exit 0
+    after all module-level imports have completed, before ``main()``
+    opens network sockets or acquires the pid lock.
     """
     venv_bin = "Scripts" if sys.platform == "win32" else "bin"
     py_name = "python.exe" if sys.platform == "win32" else "python"
@@ -173,8 +179,9 @@ async def _post_update_smoke_test() -> tuple[bool, str]:
     if not py.exists():
         return False, "venv python not found at %s" % py
 
+    bot_py = PROJECT_ROOT / "bot" / "bot.py"
     proc = await asyncio.create_subprocess_exec(
-        str(py), "-c", "import bot.bot",
+        str(py), str(bot_py), "--smoke-test",
         cwd=str(PROJECT_ROOT),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -187,7 +194,7 @@ async def _post_update_smoke_test() -> tuple[bool, str]:
 
     if proc.returncode != 0:
         err = (stderr.decode(errors="replace") or stdout.decode(errors="replace")).strip()
-        return False, "import bot.bot exited %d: %s" % (proc.returncode, err[-500:])
+        return False, "bot.py --smoke-test exited %d: %s" % (proc.returncode, err[-500:])
     return True, ""
 
 
@@ -537,7 +544,23 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         log.warning("Personal-data migration raised — continuing: %s", e, exc_info=True)
 
     try:
-        # 2. Fast-forward pull only
+        # 2. Ensure we're on main before pulling. A previous rollback
+        # leaves HEAD detached at a tag (``git checkout v<old>`` in the
+        # failure path below); from that state ``git pull --ff-only``
+        # aborts with "You are not currently on a branch". Re-attach to
+        # main so subsequent updates can recover without manual
+        # intervention. Local work was already stashed at step 1.
+        head_check = await _git("symbolic-ref", "--quiet", "HEAD", check=False)
+        if head_check.returncode != 0:
+            await notify("Detached HEAD detected — reattaching to main")
+            attach = await _git("checkout", "main", check=False)
+            if attach.returncode != 0:
+                error = attach.stderr.strip() or attach.stdout.strip()
+                if has_stash:
+                    await _git("stash", "pop", check=False)
+                return False, "could not reattach to main: %s" % error
+
+        # 3. Fast-forward pull only
         await notify("Pulling latest changes...")
         pull = await _git("pull", "--ff-only", check=False)
         if pull.returncode != 0:

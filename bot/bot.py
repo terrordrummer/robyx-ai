@@ -808,4 +808,14 @@ async def _run_boot_sequence(plat, manager, control_room_id) -> list:
 
 
 if __name__ == "__main__":
+    # --smoke-test exits 0 right after all module-level imports have
+    # completed. Used by bot/updater.py:_post_update_smoke_test() to
+    # verify that a freshly-pulled release at least imports cleanly
+    # before restarting the service. A successful pip install can still
+    # leave the venv with a broken import graph (transitive dep conflict,
+    # syntax error from a partial commit, missing migration constant);
+    # running the same interpreter + code path as production catches
+    # those before we return from apply_update with success.
+    if "--smoke-test" in sys.argv:
+        sys.exit(0)
     main()

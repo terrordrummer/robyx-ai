@@ -451,6 +451,8 @@ def _make_git_side_effect(
     has_stash=True,
     pre_pull_sha="OLDSHA",
     diff_files=None,
+    head_detached=False,
+    checkout_main_ok=True,
 ):
     """Build a fake ``_git`` callable for ``apply_update`` integration tests.
 
@@ -471,6 +473,14 @@ def _make_git_side_effect(
         if cmd == "diff" and "--name-only" in args:
             stdout = "\n".join(diff_files or []) + ("\n" if diff_files else "")
             return subprocess.CompletedProcess(["git", *args], 0, stdout, "")
+        if cmd == "symbolic-ref":
+            rc = 1 if head_detached else 0
+            stderr = "fatal: ref HEAD is not a symbolic ref" if head_detached else ""
+            return subprocess.CompletedProcess(["git", *args], rc, "", stderr)
+        if cmd == "checkout" and len(args) > 1 and args[1] == "main":
+            rc = 0 if checkout_main_ok else 1
+            stderr = "" if checkout_main_ok else "error: pathspec 'main' did not match"
+            return subprocess.CompletedProcess(["git", *args], rc, "", stderr)
         if cmd == "pull":
             rc = 0 if pull_ok else 1
             stderr = "" if pull_ok else "fatal: Not possible to fast-forward"
@@ -506,6 +516,37 @@ class TestApplyUpdate:
         success, msg = await updater.apply_update("0.2.0")
         assert success is False
         assert "git pull --ff-only failed" in msg
+
+    @pytest.mark.asyncio
+    @patch("updater.asyncio.create_subprocess_exec")
+    @patch("updater._git")
+    async def test_detached_head_reattaches_to_main(self, mock_git, mock_exec, tmp_path):
+        """Regression for v0.20.20: a prior rollback leaves HEAD detached
+        at the old tag; the next update must re-attach to main before
+        ``git pull --ff-only`` (which aborts on detached HEAD).
+        """
+        mock_git.side_effect = _make_git_side_effect(head_detached=True)
+        pip_proc = AsyncMock()
+        pip_proc.communicate = AsyncMock(return_value=(b"", b""))
+        pip_proc.returncode = 0
+        mock_exec.return_value = pip_proc
+
+        success, _ = await updater.apply_update("0.2.0")
+        assert success is True
+        checkout_calls = [c for c in mock_git.call_args_list
+                          if len(c[0]) > 1 and c[0][0] == "checkout" and c[0][1] == "main"]
+        assert len(checkout_calls) == 1
+
+    @pytest.mark.asyncio
+    @patch("updater.asyncio.create_subprocess_exec")
+    @patch("updater._git")
+    async def test_detached_head_checkout_main_fails(self, mock_git, mock_exec):
+        mock_git.side_effect = _make_git_side_effect(
+            head_detached=True, checkout_main_ok=False,
+        )
+        success, msg = await updater.apply_update("0.2.0")
+        assert success is False
+        assert "could not reattach to main" in msg
 
     @pytest.mark.asyncio
     @patch("updater.asyncio.create_subprocess_exec")
@@ -1275,6 +1316,25 @@ class TestPostUpdateSmokeTest:
             ok, err = await updater._post_update_smoke_test()
         assert ok is True
         assert err == ""
+
+    @pytest.mark.asyncio
+    async def test_invokes_bot_py_with_smoke_test_flag(self, tmp_path):
+        """Regression for v0.20.20: the old ``python -c "import bot.bot"``
+        form fails on any real install because ``bot/`` is not on
+        ``sys.path`` and ``bot/bot.py`` does ``import _bootstrap``. The
+        fix runs ``bot/bot.py --smoke-test`` directly, mirroring the
+        production service invocation.
+        """
+        (updater.PROJECT_ROOT / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        spawn = AsyncMock(return_value=proc)
+        with patch("updater.asyncio.create_subprocess_exec", spawn):
+            await updater._post_update_smoke_test()
+        args = spawn.call_args.args
+        assert args[1].endswith("bot/bot.py") or args[1].endswith("bot\\bot.py")
+        assert "--smoke-test" in args
 
     @pytest.mark.asyncio
     async def test_nonzero_exit_is_failure_with_tail(self, tmp_path):
