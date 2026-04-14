@@ -142,10 +142,19 @@ RATE_LIMIT_KEYWORDS = [
     "usage cap", "over capacity", "quota exceeded", "throttl",
 ]
 
-# Transient stream / network errors emitted by the backend (typically Claude
-# Code after a macOS sleep/wake cycle has broken the underlying TCP stream).
-# They show up on stderr, on stdout, or embedded in the result payload —
-# all three paths are checked and retried with a fresh session.
+# Transient stream / network errors that any CLI backend (Claude Code, Codex,
+# OpenCode) can emit when the underlying TCP stream is disrupted — most often
+# after a macOS sleep/wake cycle. They may appear on stderr, on stdout, or
+# embedded in the parsed result payload; all three paths are checked and the
+# invocation is retried with a fresh session.
+#
+# Keywords grouped by origin:
+#   - Claude Code: "stream idle timeout", "partial response received"
+#   - Node.js (Codex): "econnreset", "etimedout", "socket hang up",
+#     "fetch failed", "network timeout"
+#   - Go / OS-level (OpenCode + generic): "connection reset",
+#     "connection refused", "broken pipe", "context deadline exceeded",
+#     "unexpected eof"
 STREAM_RETRYABLE_KEYWORDS = [
     "stream idle timeout",
     "partial response received",
@@ -154,6 +163,11 @@ STREAM_RETRYABLE_KEYWORDS = [
     "broken pipe",
     "econnreset",
     "etimedout",
+    "socket hang up",
+    "fetch failed",
+    "network timeout",
+    "context deadline exceeded",
+    "unexpected eof",
 ]
 
 
