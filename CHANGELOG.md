@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.20.17
+
+### Fixed (P0 — correctness)
+- **`bot/scheduler.py`** — Continuous task dispatch race: `save_state(status=running)` now precedes the lock-file write. A crash in the middle leaves `state=running` with no lock, which the existing recovery branch (`check_lock` → `mark_step_failed`) already handles; the previous order let a dead-PID lock linger while state stayed pre-running, hiding the orphan and allowing silent re-dispatch that overwrote `output.log`.
+- **`bot/scheduler.py`** — Stale-claim reconciliation in `_reconcile_task_results()` now distinguishes removed-entry (INFO) / token-mismatch (WARNING) / dispatched-but-unrecorded (ERROR). The last case is the only one that risks duplicate dispatch on the next cycle, and it was previously indistinguishable from benign skips.
+- **`bot/scheduler.py`** — Added `_queue_mutex()` combining the in-process `threading.Lock` with a POSIX `fcntl.LOCK_EX` sidecar (`data/queue.json.lock`), so two bot instances (e.g. during a rolling restart) can no longer double-claim the same queue entry. All eight queue critical sections migrated. No-op on non-POSIX.
+- **`bot/agents.py`** — `AgentManager.save_state()` now writes atomically (`tmp + os.replace`), matching `save_queue()` and `continuous.save_state()` everywhere else in the codebase.
+- **`bot/config.py`, `bot/bot.py`** — `CHAT_ID`/`OWNER_ID` default to `None` instead of crashing `int(None)` at module import; validation moved to `bot.main()` and only enforced when `PLATFORM=telegram`. Unblocks test collection outside the conftest fixture.
+
+### Added (P1 — robustness)
+- **`bot/scheduler.py`** — Reminder max-age guard: `REMINDER_MAX_AGE_SECONDS` (default 24h) in `bot/config.py`. Reminders older than that limit are marked `failed` with `failure_reason="expired"` instead of retrying forever. The existing `MAX_REMINDER_ATTEMPTS` path now also annotates `failure_reason` for observability.
+- **`bot/scheduler.py`** — `cleanup_stale_locks_on_startup()`: on the first scheduler cycle, scans `data/*/lock` and removes every entry whose PID is dead or recycled into a non-AI process. `check_lock()` only cleaned lazily during task polling, so locks on workspaces without a queue entry lingered indefinitely.
+- **`bot/orphan_tracker.py`** (new) — Small JSON registry at `data/active-pids.json` of subprocesses the bot believes are alive. `register()` / `unregister()` wrap every `invoke_ai` spawn. `cleanup_on_startup()` runs from `bot.main()` before backend init and force-kills survivors, but only when the PID is both alive and mapped to one of our process names (`claude`, `codex`, `opencode`, `python`, `node`). Recycled PIDs are left alone.
+- **`bot/messaging/base.py`** — `retry_send()` helper with exponential backoff (3 attempts, 1-2-4s). Applied to `send_message` in all three adapters (`telegram.py`, `discord.py`, `slack.py`). Transient platform hiccups no longer lose a message on the first try.
+- **`bot/ai_invoke.py`** — Heartbeat watchdog in `_invoke_ai_locked`: an asyncio side-task logs `"agent X still running (Ys elapsed)"` every 60s so operators reading `bot.log` can tell a long task from a hung one. User-facing liveness is already covered by the typing-indicator loop in `handlers.py`.
+
+### Migration
+None — all changes are backward-compatible (new queue fields are optional, sidecar lock and active-pids registry are created lazily). `bot/migrations/v0_20_17.py` is a no-op required only for chain continuity.
+
+### Tests
+971 passed, 1 skipped. No regressions.
+
 ## 0.20.16
 
 ### Fixed

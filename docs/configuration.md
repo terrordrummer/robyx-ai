@@ -21,6 +21,7 @@ All env vars use the `ROBYX_` prefix. Legacy `KAELOPS_` prefixes are still accep
 | `OPENAI_API_KEY` | — | For voice message transcription (Whisper) |
 | `SCHEDULER_INTERVAL` | — | Scheduler check interval in seconds (default: `60`) |
 | `UPDATE_CHECK_INTERVAL` | — | Auto-update check interval in seconds (default: `3600`) |
+| `REMINDER_MAX_AGE_SECONDS` | — | Reminders whose `fire_at` is older than this limit are marked `failed` with `failure_reason="expired"` instead of retrying forever (default: `86400` = 24 h). |
 
 ## Telegram
 
