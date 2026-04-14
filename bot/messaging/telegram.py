@@ -88,17 +88,11 @@ class TelegramPlatform(Platform):
             return result.get("result")
 
     async def send_typing(self, chat_id: int, thread_id: int | None = None) -> None:
-        from telegram.constants import ChatAction
-        kwargs = {"chat_id": chat_id, "action": ChatAction.TYPING}
-        # In forum supergroups, sendChatAction requires message_thread_id
-        # to show the typing indicator in the correct topic. Messages from
-        # the General topic arrive with thread_id=None, so we default to
-        # control_room_id (0) — otherwise the indicator is silently invisible.
+        data: dict[str, Any] = {"chat_id": chat_id, "action": "typing"}
         if thread_id is not None:
-            kwargs["message_thread_id"] = thread_id
-        else:
-            kwargs["message_thread_id"] = self.control_room_id
-        await self._bot.send_chat_action(**kwargs)
+            data["message_thread_id"] = thread_id
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post("%s/sendChatAction" % self._api_base, data=data)
 
     async def send_photo(
         self,
