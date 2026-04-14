@@ -203,39 +203,48 @@ class TestCancelTasks:
 
 
 class TestCheckLock:
-    def test_no_lock_file(self):
-        assert check_lock("no-task") == (False, None)
+    """``check_lock`` became async in v0.20.6 (it delegates to the async
+    ``process.is_ai_process`` / ``get_process_name``). Tests must ``await``
+    it and use :class:`AsyncMock` for the process helpers."""
 
-    def test_invalid_task_name_is_rejected(self):
-        assert check_lock("../escape") == (False, None)
+    @pytest.mark.asyncio
+    async def test_no_lock_file(self):
+        assert await check_lock("no-task") == (False, None)
 
-    def test_invalid_lock_content(self):
+    @pytest.mark.asyncio
+    async def test_invalid_task_name_is_rejected(self):
+        assert await check_lock("../escape") == (False, None)
+
+    @pytest.mark.asyncio
+    async def test_invalid_lock_content(self):
         lock_dir = cfg.DATA_DIR / "bad-lock"
         lock_dir.mkdir(parents=True, exist_ok=True)
         (lock_dir / "lock").write_text("not-a-number")
-        locked, pid = check_lock("bad-lock")
+        locked, pid = await check_lock("bad-lock")
         assert locked is False
         assert not (lock_dir / "lock").exists()
 
-    def test_alive_pid_ai_process(self):
+    @pytest.mark.asyncio
+    async def test_alive_pid_ai_process(self):
         lock_dir = cfg.DATA_DIR / "alive-task"
         lock_dir.mkdir(parents=True, exist_ok=True)
         (lock_dir / "lock").write_text("12345 2026-01-01T00:00:00Z")
 
         with patch("process.is_pid_alive", return_value=True), \
-             patch("process.is_ai_process", return_value=True):
-            locked, pid = check_lock("alive-task")
+             patch("process.is_ai_process", new=AsyncMock(return_value=True)):
+            locked, pid = await check_lock("alive-task")
 
         assert locked is True
         assert pid == 12345
 
-    def test_dead_pid_cleans_lock(self):
+    @pytest.mark.asyncio
+    async def test_dead_pid_cleans_lock(self):
         lock_dir = cfg.DATA_DIR / "dead-task"
         lock_dir.mkdir(parents=True, exist_ok=True)
         (lock_dir / "lock").write_text("12345 2026-01-01T00:00:00Z")
 
         with patch("process.is_pid_alive", return_value=False):
-            locked, pid = check_lock("dead-task")
+            locked, pid = await check_lock("dead-task")
 
         assert locked is False
         assert not (lock_dir / "lock").exists()

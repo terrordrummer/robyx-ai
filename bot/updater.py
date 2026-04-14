@@ -225,16 +225,17 @@ async def check_for_updates() -> dict | None:
     }
 
 
-def get_pending_update() -> dict | None:
+async def get_pending_update() -> dict | None:
     """Check if there is an update that can be applied (already notified, not yet applied).
 
-    Unlike check_for_updates(), this doesn't re-notify — it just verifies
-    the latest remote version is newer than current.
+    Unlike :func:`check_for_updates`, this doesn't re-notify — it just
+    verifies the latest remote version is newer than current, and that
+    the release notes allow auto-application (non-breaking, compatible).
     """
     current = get_current_version()
 
     try:
-        tags = fetch_remote_tags()
+        tags = await fetch_remote_tags()
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         log.error("Failed to fetch tags: %s", e)
         return None
@@ -243,7 +244,7 @@ def get_pending_update() -> dict | None:
     if not latest or Version(latest) <= Version(current):
         return None
 
-    notes = _get_release_notes_for(latest, tags)
+    notes = await _get_release_notes_for(latest, tags)
     if notes and notes["breaking"]:
         return None  # Breaking updates cannot be auto-applied
     if notes and Version(current) < Version(notes["min_compatible"]):
