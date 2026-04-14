@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.20.6
+
+### Fixed
+- **Event loop responsiveness** — Converted all synchronous `subprocess.run()` calls to `asyncio.create_subprocess_exec()` in `updater.py`, `scheduler.py`, `topics.py`, and `process.py`. These calls blocked the asyncio event loop for up to 9 minutes during git operations, preventing any message from being processed.
+
+### Added
+- **Continuous typing indicator** — A persistent typing loop now runs from message receipt until response delivery, so the user always sees "typing..." while the bot is working.
+
 ## 0.20.5
 
 ### Changed
