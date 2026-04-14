@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -60,6 +61,134 @@ def _save_state(state: dict):
     """Persist update state to disk."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     UPDATES_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+# ── Pre-update data backup + post-update smoke test ──
+
+BACKUPS_DIR_NAME = "backups"
+SNAPSHOT_RETENTION = 3
+SNAPSHOT_PREFIX = "pre-update-"
+
+
+def _snapshot_data_dir(from_version: str, to_version: str) -> Path | None:
+    """Tar+gzip ``DATA_DIR`` to a versioned snapshot under ``DATA_DIR/backups/``.
+
+    A failed update can then roll back not only the code (via the
+    previous git tag) but also any data mutated by a migration that ran
+    before the failure was detected. The snapshot excludes the
+    ``backups/`` subdirectory itself to avoid runaway recursive growth
+    across successive updates.
+
+    Returns the snapshot path, or ``None`` on failure (snapshot failure
+    is logged but never blocks the update — better to attempt an
+    unprotected update than to refuse to update because backup is
+    flaky).
+    """
+    backups = DATA_DIR / BACKUPS_DIR_NAME
+    try:
+        backups.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("Cannot create backups dir %s: %s", backups, e)
+        return None
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name = "%s%s-to-%s-%s.tar.gz" % (SNAPSHOT_PREFIX, from_version, to_version, ts)
+    out = backups / name
+
+    def _filter(tarinfo):
+        rel = tarinfo.name.lstrip("./")
+        if rel == BACKUPS_DIR_NAME or rel.startswith(BACKUPS_DIR_NAME + "/"):
+            return None
+        return tarinfo
+
+    try:
+        with tarfile.open(str(out), "w:gz") as tf:
+            tf.add(str(DATA_DIR), arcname=".", filter=_filter)
+    except (OSError, tarfile.TarError) as e:
+        log.warning("Snapshot of %s failed: %s", DATA_DIR, e)
+        try:
+            out.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    log.info("Created data/ snapshot: %s", out)
+    _prune_old_snapshots(backups)
+    return out
+
+
+def _prune_old_snapshots(backups: Path, keep: int = SNAPSHOT_RETENTION) -> None:
+    """Keep only the most recent *keep* snapshots; best-effort prune."""
+    try:
+        snaps = sorted(
+            backups.glob(SNAPSHOT_PREFIX + "*.tar.gz"),
+            key=lambda p: p.stat().st_mtime,
+        )
+    except OSError:
+        return
+    if len(snaps) <= keep:
+        return
+    for p in snaps[:-keep]:
+        try:
+            p.unlink()
+            log.debug("Pruned old snapshot: %s", p)
+        except OSError as e:
+            log.debug("Could not prune %s: %s", p, e)
+
+
+def _restore_data_dir(snapshot: Path) -> bool:
+    """Extract *snapshot* back into ``DATA_DIR`` overwriting any files
+    mutated since the snapshot was taken.
+
+    The snapshot was created with ``backups/`` excluded, so existing
+    snapshots in ``DATA_DIR/backups/`` are untouched by the restore.
+    Returns ``True`` on success.
+    """
+    if not snapshot.exists():
+        log.error("Cannot restore: snapshot %s missing", snapshot)
+        return False
+    try:
+        with tarfile.open(str(snapshot), "r:gz") as tf:
+            tf.extractall(str(DATA_DIR))
+    except (OSError, tarfile.TarError) as e:
+        log.error("Restore from %s failed: %s", snapshot, e)
+        return False
+    log.info("Restored data/ from %s", snapshot)
+    return True
+
+
+async def _post_update_smoke_test() -> tuple[bool, str]:
+    """Spawn ``<venv>/bin/python -c "import bot.bot"`` to verify the new
+    code at least imports cleanly.
+
+    A failed pip install can succeed at the package-resolution level
+    while still leaving the venv in a broken state (e.g. a transitive
+    dependency conflict that only surfaces at import time). Catching
+    that here lets the caller roll back instead of restarting into a
+    broken bot.
+    """
+    venv_bin = "Scripts" if sys.platform == "win32" else "bin"
+    py_name = "python.exe" if sys.platform == "win32" else "python"
+    py = PROJECT_ROOT / ".venv" / venv_bin / py_name
+    if not py.exists():
+        return False, "venv python not found at %s" % py
+
+    proc = await asyncio.create_subprocess_exec(
+        str(py), "-c", "import bot.bot",
+        cwd=str(PROJECT_ROOT),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return False, "smoke test timed out after 60s"
+
+    if proc.returncode != 0:
+        err = (stderr.decode(errors="replace") or stdout.decode(errors="replace")).strip()
+        return False, "import bot.bot exited %d: %s" % (proc.returncode, err[-500:])
+    return True, ""
 
 
 # ── Release note parser ──
@@ -342,6 +471,12 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
     stash_result = await _git("stash", "--include-untracked", check=False)
     has_stash = "No local changes" not in stash_result.stdout
 
+    # 1.5 Snapshot data/ so a failed migration / smoke test can be rolled
+    # back. Snapshot failure is logged but never blocks the update.
+    snapshot = _snapshot_data_dir(current, version)
+    if snapshot is not None:
+        await notify("Created data snapshot: %s" % snapshot.name)
+
     # Capture the pre-pull commit so we can compute, after the pull, which
     # files this update actually changed. The diff drives the per-agent
     # session invalidation in step 7 — without it, agents whose AI-CLI
@@ -406,13 +541,17 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
                     if proc.returncode != 0:
                         error = stderr.decode().strip() or stdout.decode().strip()
-                        # Rollback: go back to the previous version tag
+                        # Rollback: previous version tag + restore data/.
                         await _git("checkout", "v" + current, check=False)
+                        if snapshot is not None:
+                            _restore_data_dir(snapshot)
                         if has_stash:
                             await _git("stash", "pop", check=False)
                         return False, "Migration step failed: `%s`\n%s" % (step, error)
                 except asyncio.TimeoutError:
                     await _git("checkout", "v" + current, check=False)
+                    if snapshot is not None:
+                        _restore_data_dir(snapshot)
                     if has_stash:
                         await _git("stash", "pop", check=False)
                     return False, "Migration step timed out: `%s`" % step
@@ -474,6 +613,25 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             marker.write_text(hashlib.sha1(req_file.read_bytes()).hexdigest())
         except Exception as e:
             log.warning("Could not refresh bootstrap marker: %s", e)
+
+        # 5.5 Smoke test: import the new code in a fresh subprocess to
+        # catch import-time errors (e.g. broken pip-resolved dependency
+        # graph, syntax error from a partial commit, missing migration
+        # constant). pip exit 0 isn't enough — a successful resolve can
+        # still leave the runtime broken. On failure we roll back the
+        # code (checkout previous tag) AND restore data/ from the
+        # snapshot so a partially-applied migration doesn't leave the
+        # next boot reading half-mutated state.
+        await notify("Smoke-testing imports...")
+        smoke_ok, smoke_err = await _post_update_smoke_test()
+        if not smoke_ok:
+            await notify("Smoke test failed; rolling back: %s" % smoke_err)
+            await _git("checkout", "v" + current, check=False)
+            if snapshot is not None:
+                _restore_data_dir(snapshot)
+            if has_stash:
+                await _git("stash", "pop", check=False)
+            return False, "Smoke test failed: %s" % smoke_err
 
         # 6. Pop stash if we had one
         if has_stash:
@@ -547,9 +705,11 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         return True, version
 
     except Exception as e:
-        # Catastrophic rollback
+        # Catastrophic rollback: code + data.
         log.error("Update failed with exception: %s", e, exc_info=True)
         await _git("checkout", "v" + current, check=False)
+        if snapshot is not None:
+            _restore_data_dir(snapshot)
         if has_stash:
             await _git("stash", "pop", check=False)
 
