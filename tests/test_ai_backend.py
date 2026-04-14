@@ -1,6 +1,7 @@
 """Tests for the ai_backend module — backends + factory."""
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -243,6 +244,37 @@ class TestCodexBackend:
     def test_parse_response_empty(self, codex_backend):
         assert codex_backend.parse_response("", 0) == ""
 
+    # ── unsafe-autonomy defaults ──
+
+    def test_build_command_defaults_to_unsafe_autonomy(self, codex_backend):
+        cmd = codex_backend.build_command(
+            message="hi", session_id=None, system_prompt=None,
+            model="gpt-4", work_dir="/tmp", is_resume=False,
+        )
+        assert "--approval-policy" in cmd
+        assert cmd[cmd.index("--approval-policy") + 1] == "never"
+        assert "--sandbox" in cmd
+        assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
+
+    def test_build_spawn_command_forces_unsafe_autonomy(self, codex_backend):
+        cmd = codex_backend.build_spawn_command(
+            prompt="t", model="gpt-4", work_dir="/tmp",
+        )
+        assert cmd[cmd.index("--approval-policy") + 1] == "never"
+        assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
+
+    def test_env_overrides_approval_policy_and_sandbox(self, monkeypatch):
+        from ai_backend import CodexBackend
+        monkeypatch.setenv("CODEX_APPROVAL_POLICY", "on-request")
+        monkeypatch.setenv("CODEX_SANDBOX", "workspace-write")
+        backend = CodexBackend("/usr/bin/codex")
+        cmd = backend.build_command(
+            message="hi", session_id=None, system_prompt=None,
+            model="gpt-4", work_dir="/tmp", is_resume=False,
+        )
+        assert cmd[cmd.index("--approval-policy") + 1] == "on-request"
+        assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
+
 
 # ═══════════════════════════════════════════════════════════════════
 # OpenCodeBackend
@@ -381,6 +413,50 @@ class TestOpenCodeBackend:
         assert result["session_id"] == "ses_xyz"
         assert "hi" in result["text"]
         assert "there" in result["text"]
+
+
+    # ── managed-config for unsafe-autonomy defaults ──
+
+    def test_managed_config_written_with_allow_permission(self, tmp_path, monkeypatch):
+        """Instantiating OpenCodeBackend must write a managed config with
+        ``permission: allow`` and export OPENCODE_CONFIG so the CLI picks it up."""
+        import config as cfg
+        from ai_backend import OpenCodeBackend
+
+        monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+        monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+        monkeypatch.delenv("OPENCODE_PERMISSION", raising=False)
+
+        backend = OpenCodeBackend("/usr/bin/opencode")
+        expected = tmp_path / "opencode-managed.json"
+        assert os.environ.get("OPENCODE_CONFIG") == str(expected)
+        assert expected.exists()
+        data = json.loads(expected.read_text())
+        assert data["permission"] == "allow"
+        assert backend.permission == "allow"
+
+    def test_existing_opencode_config_is_respected(self, tmp_path, monkeypatch):
+        """If the user has already exported OPENCODE_CONFIG, we must not
+        overwrite their choice — they've opted out of Robyx' defaults."""
+        import config as cfg
+        from ai_backend import OpenCodeBackend
+
+        monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+        monkeypatch.setenv("OPENCODE_CONFIG", "/user/custom.json")
+        OpenCodeBackend("/usr/bin/opencode")
+        assert os.environ["OPENCODE_CONFIG"] == "/user/custom.json"
+        assert not (tmp_path / "opencode-managed.json").exists()
+
+    def test_opencode_permission_env_overrides_default(self, tmp_path, monkeypatch):
+        import config as cfg
+        from ai_backend import OpenCodeBackend
+
+        monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+        monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+        monkeypatch.setenv("OPENCODE_PERMISSION", "ask")
+        OpenCodeBackend("/usr/bin/opencode")
+        data = json.loads((tmp_path / "opencode-managed.json").read_text())
+        assert data["permission"] == "ask"
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.11
+
+### Changed
+- **`bot/ai_backend.py`** — All three backends now default to fully autonomous / unsafe-bypass execution, since Robyx agents run headless and cannot answer approval prompts. **Claude Code** already used `--permission-mode bypassPermissions`; **Codex** now adds `--approval-policy never --sandbox danger-full-access` (overridable via `CODEX_APPROVAL_POLICY` / `CODEX_SANDBOX`); **OpenCode** now writes a managed `opencode-managed.json` at boot with `"permission": "allow"` and points the CLI at it via `OPENCODE_CONFIG` (overridable via `OPENCODE_PERMISSION`, or by setting `OPENCODE_CONFIG` to your own config file). Spawned scheduled tasks force full autonomy regardless of env config, since a scheduled task cannot be approved interactively.
+- **`README.md`** — Added a dedicated "Autonomous-by-default permissions" section documenting the three defaults and the Linux/MDM caveat (enterprise `disableBypassPermissionsMode: disable` setting is enforced by Claude regardless of what Robyx asks for).
+
 ## 0.20.10
 
 ### Changed

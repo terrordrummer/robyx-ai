@@ -179,7 +179,37 @@ class ClaudeBackend(AIBackend):
 
 
 class CodexBackend(AIBackend):
-    """OpenAI Codex CLI backend."""
+    """OpenAI Codex CLI backend.
+
+    Defaults to unsafe autonomous execution (``--approval-policy never
+    --sandbox danger-full-access``) so spawned agents can actually modify the
+    workspace without human prompts. Override per-deployment via
+    ``CODEX_APPROVAL_POLICY`` / ``CODEX_SANDBOX`` env vars when a stricter
+    policy is explicitly required.
+    """
+
+    DEFAULT_APPROVAL_POLICY = "never"
+    DEFAULT_SANDBOX = "danger-full-access"
+
+    def __init__(
+        self,
+        cli_path: str,
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
+    ):
+        super().__init__(cli_path)
+        self.approval_policy = (
+            approval_policy
+            if approval_policy is not None
+            else os.environ.get("CODEX_APPROVAL_POLICY", "").strip()
+            or self.DEFAULT_APPROVAL_POLICY
+        )
+        self.sandbox = (
+            sandbox
+            if sandbox is not None
+            else os.environ.get("CODEX_SANDBOX", "").strip()
+            or self.DEFAULT_SANDBOX
+        )
 
     @property
     def name(self) -> str:
@@ -188,8 +218,17 @@ class CodexBackend(AIBackend):
     def supports_sessions(self) -> bool:
         return False
 
+    def _autonomy_flags(self) -> list[str]:
+        flags: list[str] = []
+        if self.approval_policy:
+            flags.extend(["--approval-policy", self.approval_policy])
+        if self.sandbox:
+            flags.extend(["--sandbox", self.sandbox])
+        return flags
+
     def build_command(self, message, session_id, system_prompt, model, work_dir, is_resume):
         cmd = [self.cli_path, "-q", message]
+        cmd.extend(self._autonomy_flags())
         if model:
             cmd.extend(["--model", model])
         if system_prompt:
@@ -198,6 +237,9 @@ class CodexBackend(AIBackend):
 
     def build_spawn_command(self, prompt, model, work_dir):
         cmd = [self.cli_path, "-q", prompt]
+        # Spawned tasks run without a terminal — always force full autonomy so
+        # they never block on an approval prompt nobody can answer.
+        cmd.extend(["--approval-policy", "never", "--sandbox", "danger-full-access"])
         if model:
             cmd.extend(["--model", model])
         return cmd
@@ -217,9 +259,68 @@ class OpenCodeBackend(AIBackend):
     Native OpenCode session IDs always start with ``ses_`` — Robyx' generic
     UUID is rejected by the CLI, so :meth:`can_resume_session` filters those
     out before they ever reach the command line.
+
+    **Permissions.** OpenCode has no CLI flag to disable its
+    permission-prompting tools (``edit``, ``bash``, ``webfetch``), only a
+    JSON config file. For autonomous operation Robyx writes a managed config
+    file at init time with ``"permission": "allow"`` and points OpenCode at
+    it via the ``OPENCODE_CONFIG`` env var (unless the user has already set
+    that env var, in which case we defer to the user's config). Override the
+    default permission level with ``OPENCODE_PERMISSION`` env var
+    (``allow`` | ``ask`` | ``deny``).
     """
 
     SESSION_PREFIX = "ses_"
+    DEFAULT_PERMISSION = "allow"
+
+    def __init__(self, cli_path: str, permission: str | None = None):
+        super().__init__(cli_path)
+        self.permission = (
+            permission
+            if permission is not None
+            else os.environ.get("OPENCODE_PERMISSION", "").strip()
+            or self.DEFAULT_PERMISSION
+        )
+        self._ensure_managed_config()
+
+    def _ensure_managed_config(self) -> None:
+        """Write a managed OpenCode config and point the CLI at it.
+
+        Respects a pre-existing ``OPENCODE_CONFIG`` env var: if the user
+        has already configured OpenCode explicitly, we don't override their
+        choice — they've opted out of Robyx' autonomous defaults.
+        """
+        if os.environ.get("OPENCODE_CONFIG", "").strip():
+            log.debug(
+                "OPENCODE_CONFIG already set, not writing managed config",
+            )
+            return
+
+        # Import here to avoid a hard dependency cycle with config.py at
+        # module import time (ai_backend is imported very early).
+        try:
+            from config import DATA_DIR  # type: ignore[import-not-found]
+        except Exception:
+            log.warning(
+                "Could not import config.DATA_DIR; skipping managed OpenCode config",
+            )
+            return
+
+        cfg_path = DATA_DIR / "opencode-managed.json"
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "$schema": "https://opencode.ai/config.json",
+                "permission": self.permission,
+            }
+            cfg_path.write_text(json.dumps(payload, indent=2) + "\n")
+            os.environ["OPENCODE_CONFIG"] = str(cfg_path)
+            log.info(
+                "OpenCode managed config written at %s (permission=%s)",
+                cfg_path, self.permission,
+            )
+        except OSError as e:
+            log.warning("Failed to write OpenCode managed config: %s", e)
 
     @staticmethod
     def _supports_explicit_model(model: str | None) -> bool:
