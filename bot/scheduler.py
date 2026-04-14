@@ -22,6 +22,7 @@ Tasks with due times in the past are dispatched on the next cycle.
 """
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -33,6 +34,11 @@ import uuid as _uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+try:  # POSIX only; on Windows we fall back to thread-lock-only.
+    import fcntl  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 from ai_backend import AIBackend
 from config import (
@@ -71,6 +77,32 @@ FREQUENCY_SECONDS = {
 _queue_lock = threading.Lock()
 
 
+@contextlib.contextmanager
+def _queue_mutex():
+    """Acquire intra-process + inter-process exclusive access to the queue.
+
+    Holds ``_queue_lock`` (threads in this process) **and** a POSIX
+    ``fcntl.LOCK_EX`` on a sidecar lockfile (other bot processes). On
+    non-POSIX systems the file-level lock is a no-op; the thread lock
+    alone still protects single-instance deployments.
+    """
+    with _queue_lock:
+        if fcntl is None:
+            yield
+            return
+        QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = QUEUE_FILE.with_name(QUEUE_FILE.name + ".lock")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 # ── Queue I/O ────────────────────────────────────────────────────────────────
 
 
@@ -86,7 +118,7 @@ def _load_queue_unlocked() -> list[dict]:
 
 
 def load_queue() -> list[dict]:
-    with _queue_lock:
+    with _queue_mutex():
         return _load_queue_unlocked()
 
 
@@ -98,7 +130,7 @@ def _save_queue_unlocked(entries: list[dict]) -> None:
 
 
 def save_queue(entries: list[dict]) -> None:
-    with _queue_lock:
+    with _queue_mutex():
         _save_queue_unlocked(entries)
 
 
@@ -157,7 +189,7 @@ def add_task(task: dict) -> None:
     queued.setdefault("status", "pending")
     queued.setdefault("created_at", datetime.now(timezone.utc).isoformat())
 
-    with _queue_lock:
+    with _queue_mutex():
         entries = _load_queue_unlocked()
         entries.append(queued)
         _save_queue_unlocked(entries)
@@ -175,7 +207,7 @@ def add_reminder(entry: dict) -> None:
     queued.setdefault("attempts", 0)
     queued.setdefault("created_at", datetime.now(timezone.utc).isoformat())
 
-    with _queue_lock:
+    with _queue_mutex():
         entries = _load_queue_unlocked()
         entries.append(queued)
         _save_queue_unlocked(entries)
@@ -188,7 +220,7 @@ def cancel_tasks_for_agent_file(
     if not agent_file:
         return 0
 
-    with _queue_lock:
+    with _queue_mutex():
         entries = _load_queue_unlocked()
         canceled = 0
         canceled_at = datetime.now(timezone.utc).isoformat()
@@ -301,7 +333,7 @@ def _claim_due_entries() -> tuple[list[dict], list[dict]]:
 
     Returns (due_tasks, due_reminders) — each entry carries a claim_token.
     """
-    with _queue_lock:
+    with _queue_mutex():
         entries = _load_queue_unlocked()
         if not entries:
             return [], []
@@ -405,7 +437,7 @@ def _reconcile_task_results(results: list[dict]) -> None:
     if not results:
         return
 
-    with _queue_lock:
+    with _queue_mutex():
         entries = _load_queue_unlocked()
         if not entries:
             return
@@ -421,10 +453,35 @@ def _reconcile_task_results(results: list[dict]) -> None:
                 None,
             )
             if entry is None:
-                log.warning(
-                    "Task %s changed before reconciliation; skipping stale claim",
-                    result["id"],
+                # Claim did not reconcile. Two scenarios:
+                # 1. Entry fully removed (user cancelled) — acceptable.
+                # 2. Claim token mismatch (stale-claim reset or concurrent
+                #    mutation from another bot instance) — serious: if the
+                #    result status was "dispatched", the task actually ran
+                #    but we cannot record it, so the next cycle may run it
+                #    again. Log at ERROR so it is visible.
+                current = next(
+                    (item for item in entries if item.get("id") == result["id"]),
+                    None,
                 )
+                if current is None:
+                    log.info(
+                        "Task %s reconciliation skipped: entry removed",
+                        result["id"],
+                    )
+                elif result.get("status") == "dispatched":
+                    log.error(
+                        "Task %s dispatched but claim token stale "
+                        "(current status=%s). Possible duplicate dispatch "
+                        "on next cycle. Check for concurrent bot instances.",
+                        result["id"], current.get("status"),
+                    )
+                else:
+                    log.warning(
+                        "Task %s reconciliation skipped: claim token stale "
+                        "(current status=%s, result status=%s)",
+                        result["id"], current.get("status"), result.get("status"),
+                    )
                 continue
 
             if result["status"] == "dispatched":
@@ -457,7 +514,7 @@ def _reconcile_reminder_results(results: list[dict]) -> None:
     if not results:
         return
 
-    with _queue_lock:
+    with _queue_mutex():
         entries = _load_queue_unlocked()
         if not entries:
             return
@@ -901,12 +958,18 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                     if inspect.isawaitable(close_result):
                         await close_result
 
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            lock_file.write_text("%d %s" % (proc.pid, now_str))
-
-            # Update state: step started
+            # Persist state=running BEFORE writing the lock file. If we
+            # crash between the two writes, the next scheduler cycle sees
+            # state="running" and triggers the orphan-recovery branch above
+            # (check_lock → mark_step_failed). The reverse order would leak
+            # a stale lock with a dead PID and leave state in a pre-running
+            # status, allowing a silent re-dispatch that overwrites
+            # output.log and stomps on the prior attempt.
             mark_step_started(state, step_number, step_description)
             save_state(Path(sf), state)
+
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            lock_file.write_text("%d %s" % (proc.pid, now_str))
 
             # Start delivery watcher for output relay
             start_task_delivery_watch(entry, proc, output_log, lock_file, platform, backend, log)

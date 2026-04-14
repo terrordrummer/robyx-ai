@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -172,7 +173,9 @@ class AgentManager:
             "agents": {n: a.to_dict() for n, a in self.agents.items()},
             "focused_agent": self.focused_agent,
         }
-        STATE_FILE.write_text(json.dumps(data, indent=2))
+        tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, STATE_FILE)
 
     async def async_save_state(self):
         """Save state under the agents lock for concurrent-safe writes."""
