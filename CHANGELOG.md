@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.15
+
+### Changed
+- **`README.md` → `docs/`** — Split the 809-line README into a 300-line landing page (Why + Quick Start + project structure) plus 9 topical files under `docs/`: `architecture.md`, `scheduler.md`, `memory.md`, `team.md`, `configuration.md`, `commands.md`, `backends.md`, `media.md`, `updates.md`. Each doc has a "Back to README" link top and bottom; README has a documentation index table mapping topics to files.
+- **`tests/test_docs_contract.py`** — `test_readme_documents_current_cross_platform_contract` now concatenates README + the relevant docs files before asserting; the contract still holds, just spread across multiple files now.
+
 ## 0.20.14
 
 ### Added
