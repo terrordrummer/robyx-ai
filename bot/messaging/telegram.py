@@ -21,6 +21,41 @@ class TelegramPlatform(Platform):
         self._chat_id = chat_id
         self._owner_id = owner_id
         self._api_base = "https://api.telegram.org/bot%s" % bot_token
+        # Persistent httpx client. Creating a fresh AsyncClient per call
+        # (the pre-0.20.16 behaviour) was the root cause of the
+        # "typing indicator doesn't show immediately in Headquarters"
+        # bug: every send_typing / send_message did a cold DNS + TCP +
+        # TLS handshake, easily costing 200-500ms per call. Reusing a
+        # single client lets httpx pool connections to api.telegram.org,
+        # dropping the per-call latency to ~RTT.
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Lazy-create a persistent httpx client.
+
+        We can't create it at ``__init__`` time because there is no
+        running event loop yet (``__init__`` runs at import / wiring
+        time). The first call from inside an async handler creates it.
+        """
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=10, read=30, write=30, pool=10),
+                # Keep connections to api.telegram.org alive across calls
+                # so subsequent sends pay only the RTT, not the TLS
+                # handshake.
+                limits=httpx.Limits(
+                    max_keepalive_connections=4,
+                    max_connections=8,
+                    keepalive_expiry=300,
+                ),
+            )
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the persistent client. Safe to call multiple times."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     @property
     def max_message_length(self) -> int:
@@ -78,21 +113,25 @@ class TelegramPlatform(Platform):
         if parse_mode == "markdown":
             data["parse_mode"] = "Markdown"
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post("%s/sendMessage" % self._api_base, data=data)
-            result = resp.json()
-            if not result.get("ok"):
-                raise RuntimeError(
-                    result.get("description") or "Telegram sendMessage failed"
-                )
-            return result.get("result")
+        client = self._get_client()
+        resp = await client.post(
+            "%s/sendMessage" % self._api_base, data=data, timeout=30,
+        )
+        result = resp.json()
+        if not result.get("ok"):
+            raise RuntimeError(
+                result.get("description") or "Telegram sendMessage failed"
+            )
+        return result.get("result")
 
     async def send_typing(self, chat_id: int, thread_id: int | None = None) -> None:
         data: dict[str, Any] = {"chat_id": chat_id, "action": "typing"}
         if thread_id is not None:
             data["message_thread_id"] = thread_id
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post("%s/sendChatAction" % self._api_base, data=data)
+        client = self._get_client()
+        await client.post(
+            "%s/sendChatAction" % self._api_base, data=data, timeout=10,
+        )
 
     async def send_photo(
         self,
@@ -139,32 +178,35 @@ class TelegramPlatform(Platform):
     async def create_channel(self, name: str) -> int | None:
         data = {"chat_id": self._chat_id, "name": name}
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post("%s/createForumTopic" % self._api_base, data=data)
-                result = resp.json()
-                if result.get("ok"):
-                    thread_id = result["result"]["message_thread_id"]
-                    log.info("Created topic '%s' (thread_id=%d)", name, thread_id)
-                    return thread_id
-                log.error("Failed to create topic '%s': %s", name, result)
-                return None
+            client = self._get_client()
+            resp = await client.post(
+                "%s/createForumTopic" % self._api_base, data=data, timeout=30,
+            )
+            result = resp.json()
+            if result.get("ok"):
+                thread_id = result["result"]["message_thread_id"]
+                log.info("Created topic '%s' (thread_id=%d)", name, thread_id)
+                return thread_id
+            log.error("Failed to create topic '%s': %s", name, result)
+            return None
         except Exception as e:
             log.error("Error creating topic '%s': %s", name, e)
             return None
 
     async def close_channel(self, channel_id: int) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post(
-                    "%s/closeForumTopic" % self._api_base,
-                    data={"chat_id": self._chat_id, "message_thread_id": channel_id},
-                )
-                result = resp.json()
-                if result.get("ok"):
-                    log.info("Closed topic (thread_id=%d)", channel_id)
-                    return True
-                log.error("Failed to close topic: %s", result)
-                return False
+            client = self._get_client()
+            resp = await client.post(
+                "%s/closeForumTopic" % self._api_base,
+                data={"chat_id": self._chat_id, "message_thread_id": channel_id},
+                timeout=30,
+            )
+            result = resp.json()
+            if result.get("ok"):
+                log.info("Closed topic (thread_id=%d)", channel_id)
+                return True
+            log.error("Failed to close topic: %s", result)
+            return False
         except Exception as e:
             log.error("Error closing topic: %s", e)
             return False
@@ -180,9 +222,11 @@ class TelegramPlatform(Platform):
                 data["parse_mode"] = parse_mode
             elif parse_mode is None:
                 data["parse_mode"] = "Markdown"
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.post("%s/sendMessage" % self._api_base, data=data)
-                return resp.json().get("ok", False)
+            client = self._get_client()
+            resp = await client.post(
+                "%s/sendMessage" % self._api_base, data=data, timeout=30,
+            )
+            return resp.json().get("ok", False)
         except Exception as e:
             log.error("Error sending to topic %d: %s", channel_id, e)
             return False

@@ -484,6 +484,130 @@ class TestHandleMessage:
 
         mock_platform.reply.assert_not_awaited()
 
+    # ─────────────────────────────────────────────────────────────────
+    # Regression coverage for the v0.20.16 typing-latency bug:
+    # "in Headquarters the typing indicator does not appear immediately
+    # when I send a message."
+    #
+    # Three contracts must hold:
+    #   1. ``send_typing`` is invoked for messages that land in the
+    #      General topic / Headquarters (thread_id=None) — same as for
+    #      forum topics. This exercises the routing for Telegram's
+    #      main destination, which earlier regressions had silently
+    #      broken by gating typing behind a forum-topic check.
+    #   2. The typing call does NOT block the rest of the handler — it
+    #      runs as a background task so the agent invocation can start
+    #      in parallel with Telegram's roundtrip. This rules out the
+    #      class of bugs where a slow ``send_typing`` (cold TLS
+    #      handshake, network blip) postpones the entire message
+    #      processing pipeline.
+    #   3. A failing ``send_typing`` is logged at WARNING, not silently
+    #      swallowed — silent failures were how the previous bug
+    #      survived multiple "fixed" releases.
+    # ─────────────────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="ok")
+    @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.split_message", return_value=["ok"])
+    async def test_typing_fires_for_headquarters_general_topic(
+        self, mock_split, mock_deleg, mock_focus, mock_invoke,
+        handlers, mock_platform, msg_ref,
+    ):
+        """Headquarters = Telegram's General topic, addressed with
+        ``thread_id=None``. Typing must be sent with ``thread_id=None``
+        so Telegram displays it in General (NOT routed to a forum
+        topic). This is the exact case the user reported."""
+        msg = make_message(text="ciao", thread_id=None)
+        await handlers["message"](mock_platform, msg, msg_ref)
+        # Yield the loop once so the create_task'd typing send actually
+        # runs before we make assertions.
+        import asyncio as _aio
+        await _aio.sleep(0)
+
+        mock_platform.send_typing.assert_awaited()
+        # Must be addressed at the chat with no thread_id — that's how
+        # Telegram routes typing to General in a forum supergroup.
+        call_args = mock_platform.send_typing.await_args
+        assert call_args.args[0] == msg.chat_id
+        # Either positional or kw — the contract is "thread_id is None".
+        thread_arg = call_args.args[1] if len(call_args.args) > 1 else call_args.kwargs.get("thread_id")
+        assert thread_arg is None
+
+    @pytest.mark.asyncio
+    @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="ok")
+    @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.split_message", return_value=["ok"])
+    async def test_typing_does_not_block_message_processing(
+        self, mock_split, mock_deleg, mock_focus, mock_invoke,
+        handlers, mock_platform, msg_ref,
+    ):
+        """If ``send_typing`` is slow (cold TLS handshake, network blip
+        post-wake), the agent invocation must NOT wait for it. The
+        early send_typing is a background task; the handler proceeds to
+        ``invoke_ai`` immediately."""
+        import asyncio as _aio
+
+        typing_started = _aio.Event()
+        typing_can_finish = _aio.Event()
+
+        async def slow_typing(chat_id, thread_id=None):
+            typing_started.set()
+            # Block until the test releases us — simulating a slow
+            # network call.
+            await typing_can_finish.wait()
+
+        mock_platform.send_typing = AsyncMock(side_effect=slow_typing)
+
+        msg = make_message(text="ciao", thread_id=None)
+        # Run the handler with a short timeout — if it blocks waiting
+        # on ``send_typing`` we'll hit the timeout and fail clearly.
+        async def _run():
+            await handlers["message"](mock_platform, msg, msg_ref)
+
+        handler_task = _aio.create_task(_run())
+        # Give the handler a tick to spawn the typing task and proceed.
+        await _aio.sleep(0)
+        # The typing call should have started but the handler should
+        # already have moved past it and called invoke_ai.
+        await _aio.wait_for(handler_task, timeout=2)
+        mock_invoke.assert_awaited_once()
+        # Now release the slow typing so the background task completes
+        # cleanly (otherwise pytest reports an unawaited coroutine).
+        typing_can_finish.set()
+        await _aio.sleep(0)
+
+    @pytest.mark.asyncio
+    @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="ok")
+    @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.split_message", return_value=["ok"])
+    async def test_typing_failure_is_logged_not_silenced(
+        self, mock_split, mock_deleg, mock_focus, mock_invoke,
+        handlers, mock_platform, msg_ref, caplog,
+    ):
+        """A bare ``except Exception: pass`` was hiding send_typing
+        failures, which is why the original bug slipped past every
+        release that claimed to fix it. Failures must surface in the
+        log so we can diagnose them."""
+        import asyncio as _aio
+        import logging
+
+        mock_platform.send_typing = AsyncMock(side_effect=RuntimeError("network down"))
+
+        msg = make_message(text="ciao", thread_id=None)
+        with caplog.at_level(logging.WARNING):
+            await handlers["message"](mock_platform, msg, msg_ref)
+            await _aio.sleep(0)  # let the background task run
+
+        assert any(
+            "Early typing send failed" in record.message
+            and "network down" in record.message
+            for record in caplog.records
+        ), "send_typing failure must be logged at WARNING, not silenced"
+
 
 # ---------------------------------------------------------------------------
 # _resolve_from_context (tested via handle_message behavior)

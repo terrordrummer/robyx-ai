@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.20.16
+
+### Fixed
+- **`bot/messaging/telegram.py`** — Replaced per-call `httpx.AsyncClient` instantiation with a single persistent client per `TelegramPlatform` instance. Every `send_typing` / `send_message` / `send_photo` / `send_to_channel` was paying a cold DNS + TCP + TLS handshake on each invocation (200-500ms+ on the first call after a quiet period), which is why the typing indicator in Headquarters often appeared late or not at all even after the v0.20.6/7/8/9 fixes. Connection pooling now drops per-call latency to ~RTT.
+- **`bot/handlers.py`** — Replaced `try/except Exception: pass` around the early `send_typing` with proper `WARNING`-level logging, and dispatched the typing send as a background `asyncio.create_task` so the handler proceeds to agent invocation in parallel with Telegram's roundtrip.
+
+### Added (test coverage)
+- **`tests/test_handlers.py`** — Three regression tests for the typing-latency contract: typing fires for the General topic (`thread_id=None`), typing does not block message processing, typing failures are logged at WARNING (not silenced).
+- **`tests/test_telegram_platform.py`** — Five tests for the persistent httpx client: `_get_client` returns the same instance across calls, 5 sequential `send_typing` calls construct only 1 `AsyncClient`, `send_typing` omits `message_thread_id` for General and includes it for forum topics, `aclose` closes and resets the client.
+
 ## 0.20.15
 
 ### Changed
