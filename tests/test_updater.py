@@ -37,6 +37,19 @@ def _patch_updater_paths(tmp_path, _patch_env):
         yield
 
 
+@pytest.fixture
+def stub_safety_helpers():
+    """v0.20.14 wired ``_snapshot_data_dir`` + ``_post_update_smoke_test``
+    into ``apply_update``. Legacy ``apply_update`` tests pre-date both
+    helpers and would break or run real subprocesses if either fired —
+    opt them out via ``pytestmark = pytest.mark.usefixtures(...)`` on
+    the affected classes. Tests that exercise the safety path don't
+    request this fixture and see the real helpers."""
+    with patch.object(updater, "_snapshot_data_dir", return_value=None), \
+         patch.object(updater, "_post_update_smoke_test", new=AsyncMock(return_value=(True, ""))):
+        yield
+
+
 def _write_state(tmp_path, state: dict):
     (tmp_path / "data").mkdir(exist_ok=True)
     (tmp_path / "data" / "updates.json").write_text(json.dumps(state))
@@ -463,6 +476,8 @@ def _make_git_side_effect(
 
 
 class TestApplyUpdate:
+    pytestmark = pytest.mark.usefixtures("stub_safety_helpers")
+
     @pytest.mark.asyncio
     @patch("updater.asyncio.create_subprocess_exec")
     @patch("updater._git")
@@ -654,6 +669,8 @@ class TestApplyUpdate:
 
 
 class TestMigratePersonalDataToDataDir:
+    pytestmark = pytest.mark.usefixtures("stub_safety_helpers")
+
     """v0.16 pre-pull migration: ``migrate_personal_data_to_data_dir``
     copies tracked runtime files (``tasks.md``, ``specialists.md``,
     ``agents/*.md``, ``specialists/*.md``) to ``data/`` before the git
@@ -779,6 +796,7 @@ class TestMigratePersonalDataToDataDir:
 
 
 class TestApplyUpdateInvalidatesSessions:
+    pytestmark = pytest.mark.usefixtures("stub_safety_helpers")
     """After a successful pull, ``apply_update`` must compute the diff
     between the pre-pull commit and the new HEAD and hand the changed
     paths to :func:`session_lifecycle.invalidate_sessions_for_paths` so
@@ -1127,3 +1145,183 @@ class TestGetPendingUpdateEdgeCases:
         so get_pending_update returns None (no-latest branch)."""
         with patch("updater.fetch_remote_tags", new=AsyncMock(return_value=[])):
             assert await updater.get_pending_update() is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Snapshot + restore + smoke test (v0.20.14 safety guards)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestSnapshotDataDir:
+    def test_creates_tar_with_data_files_and_returns_path(self, tmp_path):
+        """Snapshot must contain every file that was in DATA_DIR at the
+        moment of capture, except for the backups/ subdir itself."""
+        (updater.DATA_DIR / "state.json").write_text('{"x": 1}')
+        nested = updater.DATA_DIR / "agents"
+        nested.mkdir(exist_ok=True)
+        (nested / "alice.md").write_text("hello")
+
+        snap = updater._snapshot_data_dir("0.20.13", "0.20.14")
+        assert snap is not None
+        assert snap.exists()
+        assert snap.parent.name == "backups"
+        assert snap.name.startswith("pre-update-0.20.13-to-0.20.14-")
+        assert snap.name.endswith(".tar.gz")
+
+        import tarfile as _tf
+        with _tf.open(str(snap)) as tf:
+            names = sorted(m.name for m in tf.getmembers())
+        assert "./state.json" in names
+        assert "./agents/alice.md" in names
+
+    def test_excludes_backups_subdir(self, tmp_path):
+        """Without the exclusion, every successive update would tar the
+        previous snapshot inside the new one — runaway growth."""
+        (updater.DATA_DIR / "state.json").write_text("{}")
+        backups = updater.DATA_DIR / "backups"
+        backups.mkdir()
+        (backups / "old-snapshot.tar.gz").write_bytes(b"\x1f\x8b" + b"\x00" * 40)
+
+        snap = updater._snapshot_data_dir("0.1.0", "0.2.0")
+        assert snap is not None
+
+        import tarfile as _tf
+        with _tf.open(str(snap)) as tf:
+            names = [m.name for m in tf.getmembers()]
+        assert not any(n.startswith("./backups") for n in names), (
+            "snapshot leaked the backups/ subdir: %s" % names
+        )
+
+    def test_returns_none_on_failure(self, tmp_path):
+        """Snapshot failure must NOT block the update — caller treats
+        ``None`` as "proceed without backup" (logged at WARNING)."""
+        with patch("updater.tarfile.open", side_effect=OSError("disk full")):
+            snap = updater._snapshot_data_dir("a", "b")
+        assert snap is None
+
+
+class TestPruneOldSnapshots:
+    def test_keeps_most_recent_n(self, tmp_path):
+        backups = updater.DATA_DIR / "backups"
+        backups.mkdir()
+        # Create 5 fake snapshot files with strictly increasing mtimes.
+        import os as _os
+        import time as _time
+        names = []
+        for i in range(5):
+            p = backups / ("pre-update-0.0.0-to-0.0.%d-stamp.tar.gz" % i)
+            p.write_bytes(b"")
+            ts = _time.time() + i
+            _os.utime(p, (ts, ts))
+            names.append(p)
+
+        updater._prune_old_snapshots(backups, keep=3)
+
+        survivors = sorted(p.name for p in backups.glob("pre-update-*.tar.gz"))
+        # The 2 oldest should have been removed; the 3 newest survive.
+        assert len(survivors) == 3
+        assert all(n.endswith(("0.0.2-stamp.tar.gz",
+                               "0.0.3-stamp.tar.gz",
+                               "0.0.4-stamp.tar.gz")) for n in survivors)
+
+
+class TestRestoreDataDir:
+    def test_round_trip_restores_original_contents(self, tmp_path):
+        (updater.DATA_DIR / "state.json").write_text('{"v": 1}')
+        snap = updater._snapshot_data_dir("a", "b")
+        assert snap is not None
+
+        # Mutate after snapshot — simulates a botched migration.
+        (updater.DATA_DIR / "state.json").write_text('{"v": "BROKEN"}')
+        (updater.DATA_DIR / "leftover.txt").write_text("garbage")
+
+        ok = updater._restore_data_dir(snap)
+        assert ok is True
+        assert (updater.DATA_DIR / "state.json").read_text() == '{"v": 1}'
+        # Restore overlays the snapshot — files added after the snapshot
+        # remain (they were never in the tarball). This is desirable: it
+        # means a successful migration that adds *new* files isn't undone
+        # if a *later* step fails. Migrations that need atomic rollback
+        # should write to a staging area first.
+
+    def test_returns_false_for_missing_snapshot(self, tmp_path):
+        ok = updater._restore_data_dir(tmp_path / "nope.tar.gz")
+        assert ok is False
+
+
+class TestPostUpdateSmokeTest:
+    @pytest.mark.asyncio
+    async def test_returns_false_when_venv_python_missing(self, tmp_path):
+        # Default fixture creates only a fake pip; remove the python so we
+        # exercise the missing-binary branch.
+        py = updater.PROJECT_ROOT / ".venv" / "bin" / "python"
+        if py.exists():
+            py.unlink()
+        ok, err = await updater._post_update_smoke_test()
+        assert ok is False
+        assert "venv python not found" in err
+
+    @pytest.mark.asyncio
+    async def test_success_returns_true(self, tmp_path):
+        (updater.PROJECT_ROOT / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        with patch("updater.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            ok, err = await updater._post_update_smoke_test()
+        assert ok is True
+        assert err == ""
+
+    @pytest.mark.asyncio
+    async def test_nonzero_exit_is_failure_with_tail(self, tmp_path):
+        (updater.PROJECT_ROOT / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 1\n")
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b"ImportError: No module 'foo'"))
+        proc.returncode = 1
+        with patch("updater.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            ok, err = await updater._post_update_smoke_test()
+        assert ok is False
+        assert "ImportError" in err
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_proc_and_returns_failure(self, tmp_path):
+        (updater.PROJECT_ROOT / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+        with patch("updater.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            ok, err = await updater._post_update_smoke_test()
+        assert ok is False
+        assert "timed out" in err
+        proc.kill.assert_called_once()
+
+
+class TestApplyUpdateSafetyIntegration:
+    """End-to-end: failed smoke test must roll back code AND restore data/."""
+
+    @pytest.mark.asyncio
+    async def test_failed_smoke_test_restores_snapshot_and_rolls_back(self, tmp_path):
+        # Make the snapshot helper actually write a real tar — we override
+        # the autouse stub so we can assert on the restore path.
+        (updater.DATA_DIR / "state.json").write_text('{"original": true}')
+
+        from tests.test_updater import _make_git_side_effect  # local import to reuse
+        pip_proc = AsyncMock()
+        pip_proc.communicate = AsyncMock(return_value=(b"", b""))
+        pip_proc.returncode = 0
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch("updater.asyncio.create_subprocess_exec", AsyncMock(return_value=pip_proc)), \
+             patch("updater._snapshot_data_dir", wraps=updater._snapshot_data_dir), \
+             patch(
+                 "updater._post_update_smoke_test",
+                 new=AsyncMock(return_value=(False, "ImportError: broken")),
+             ), \
+             patch("updater._restore_data_dir", wraps=updater._restore_data_dir) as restore_spy:
+            success, msg = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "Smoke test failed" in msg
+        assert "ImportError: broken" in msg
+        # The restore_data_dir spy must have been called with the snapshot
+        # path created during this update.
+        restore_spy.assert_called_once()

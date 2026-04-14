@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.20.14
+
+### Added
+- **`bot/updater.py`** — `_snapshot_data_dir()`: pre-update tar+gzip of `data/` to `data/backups/pre-update-<from>-to-<to>-<ts>.tar.gz`. Excludes the `backups/` subdir to avoid runaway recursive growth. Snapshot failure is logged but does not block the update.
+- **`bot/updater.py`** — `_prune_old_snapshots()`: keeps only the most recent 3 snapshots.
+- **`bot/updater.py`** — `_restore_data_dir()`: extracts a snapshot back into `data/`. Used by every rollback path in `apply_update` so a botched migration doesn't leave the next boot reading half-mutated state.
+- **`bot/updater.py`** — `_post_update_smoke_test()`: spawns `<venv>/bin/python -c "import bot.bot"` as a final sanity check after `pip install`. Catches the case where pip resolves successfully but the runtime is broken (transitive dep conflict, partial commit syntax error, missing migration constant). On failure: rollback to previous tag + restore data snapshot + pop stash.
+- **`tests/test_updater.py`** — 11 new tests covering snapshot creation, the backups-exclusion guard, retention pruning, restore round-trip, smoke test success/failure/timeout/missing-venv branches, and an end-to-end integration test that asserts a failed smoke test triggers `_restore_data_dir`.
+
+### Changed
+- **`bot/updater.py`** `apply_update()` rollback paths (migration step failure, migration timeout, smoke test failure, catastrophic exception) now all restore `data/` from the snapshot in addition to checking out the previous git tag.
+- **`tests/test_updater.py`** — converted the `_stub_safety_helpers` fixture from autouse to opt-in (`pytestmark = pytest.mark.usefixtures(...)` on the legacy `TestApplyUpdate` / `TestApplyUpdateInvalidatesSessions` / `TestMigratePersonalDataToDataDir` classes), so the new safety-path tests see the real helpers.
+
 ## 0.20.13
 
 ### Fixed
