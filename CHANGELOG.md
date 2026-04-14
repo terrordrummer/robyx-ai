@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.10
+
+### Changed
+- **`bot/ai_invoke.py`** — Extended `STREAM_RETRYABLE_KEYWORDS` to cover transient errors from **all three** supported backends (Claude Code, Codex, OpenCode), not just Claude. Added Node-typical strings (`socket hang up`, `fetch failed`, `network timeout`) and Go/OS-level strings (`context deadline exceeded`, `unexpected eof`) to the list. The retry path itself was already backend-agnostic; this just widens the match so Codex and OpenCode benefit from the same auto-recovery that 0.20.9 added.
+- **`tests/test_ai_invoke.py`** — Added a parametrized test (`test_stream_retryable_works_for_all_backends`) that exercises the retry path against all three backend fixtures.
+
 ## 0.20.9
 
 ### Fixed

@@ -837,6 +837,41 @@ class TestInvokeAiLocked:
         assert agent.session_id != original_sid
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend_fixture", ["claude_backend", "codex_backend", "opencode_backend"])
+    async def test_stream_retryable_works_for_all_backends(
+        self, request, agent_manager, mock_bot, backend_fixture,
+    ):
+        """Stream-retryable detection + retry must fire uniformly for every
+        backend, not just Claude Code. We hit the non-streaming path so the
+        test is backend-agnostic (streaming is Claude-only)."""
+        backend = request.getfixturevalue(backend_fixture)
+        agent = agent_manager.get("robyx")
+        proc_fail = _make_mock_process(
+            stdout_data=b"",
+            stderr_data=b"socket hang up",
+            returncode=1,
+        )
+        proc_ok = _make_mock_process(stdout_data=b"ok", returncode=0)
+        call_count = 0
+
+        async def fake_spawn(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return proc_fail if call_count == 1 else proc_ok
+
+        with patch("ai_invoke.asyncio.create_subprocess_exec", side_effect=fake_spawn), \
+             patch.object(backend, "supports_streaming", return_value=False), \
+             patch.object(backend, "build_command", return_value=["cli"]), \
+             patch.object(backend, "parse_response", return_value="recovered"):
+            result = await _invoke_ai_locked(
+                agent, "hi", 123, mock_bot, agent_manager, backend,
+                False, "sonnet", 0, None,
+            )
+
+        assert result == "recovered", "retry should produce the recovered response"
+        assert call_count == 2, "backend %s should have retried once" % backend_fixture
+
+    @pytest.mark.asyncio
     async def test_stream_idle_in_stderr_triggers_retry(self, agent_manager, mock_bot, claude_backend):
         """Transient stream error on stderr (non-streaming) -> retry, not raw error."""
         agent = agent_manager.get("robyx")
