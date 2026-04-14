@@ -256,7 +256,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
         # Check for running scheduled tasks
         from scheduler import get_running_tasks
         running_tasks = [
-            (t["name"], t["_pid"]) for t in get_running_tasks()
+            (t["name"], t["_pid"]) for t in await get_running_tasks()
         ]
         if running_tasks:
             force = msg.args and msg.args[0] == "force"

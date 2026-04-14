@@ -220,7 +220,7 @@ cancel_tasks_for_agent = cancel_tasks_for_agent_file
 # ── Lock files ───────────────────────────────────────────────────────────────
 
 
-def check_lock(task_name: str) -> tuple[bool, int | None]:
+async def check_lock(task_name: str) -> tuple[bool, int | None]:
     """Check if a task has an active lock. Cleans stale locks automatically."""
     try:
         safe_name = validate_task_name(task_name)
@@ -243,9 +243,9 @@ def check_lock(task_name: str) -> tuple[bool, int | None]:
     from process import get_process_name, is_ai_process, is_pid_alive
 
     if is_pid_alive(pid):
-        if is_ai_process(pid):
+        if await is_ai_process(pid):
             return True, pid
-        proc_name = get_process_name(pid)
+        proc_name = await get_process_name(pid)
         log.info("Stale lock for '%s': PID %d is now '%s'. Removing.", task_name, pid, proc_name)
         lock_file.unlink(missing_ok=True)
         return False, None
@@ -710,7 +710,7 @@ async def _dispatch_agent_tasks(
             })
             continue
 
-        is_locked, existing_pid = check_lock(safe_name)
+        is_locked, existing_pid = await check_lock(safe_name)
         if is_locked:
             append_log("%s -- SKIPPED -- Agent still running (PID %d)" % (safe_name, existing_pid))
             results.append({
@@ -802,7 +802,7 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
 
         # Check if a subprocess is actually running (orphan detection)
         if state["status"] == "running":
-            is_locked, pid = check_lock(name)
+            is_locked, pid = await check_lock(name)
             if is_locked:
                 continue  # Subprocess still running
             # Subprocess died without updating state
@@ -939,7 +939,7 @@ def append_log(entry: str) -> None:
 # ── Query helpers ────────────────────────────────────────────────────────────
 
 
-def get_running_tasks() -> list[dict]:
+async def get_running_tasks() -> list[dict]:
     """Return queue entries whose lock file indicates a running subprocess."""
     entries = load_queue()
     running = []
@@ -950,7 +950,7 @@ def get_running_tasks() -> list[dict]:
         name = entry.get("name", "")
         if not name:
             continue
-        is_locked, pid = check_lock(name)
+        is_locked, pid = await check_lock(name)
         if is_locked:
             running.append({**entry, "_pid": pid})
     return running
