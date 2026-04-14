@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.20.22
+
+### Fixed (updater hardening — root cause)
+- **`bot/updater.py`** — new `_rollback_code_to(tag)` helper: `git checkout main` + `git reset --hard v<tag>`. Replaces all 7 rollback points that previously did `git checkout v<current>` (which detaches HEAD). The working tree ends at the same content, but HEAD stays on `main`, so the next update cycle can fast-forward cleanly. This is the structural fix for the "not on a branch" trap that v0.20.21 only recovered from defensively.
+- **`bot/updater.py`** — `apply_update()` now compares the current branch name against `"main"` (via `git symbolic-ref --short HEAD`) instead of only checking that HEAD is not detached. If the operator manually checked out a feature branch or another tag, the update switches to `main` first. Notification distinguishes "detached HEAD" vs "wrong branch X".
+
+### Tests
+984 passed, 1 skipped (+2 regression tests for the wrong-branch and already-on-main paths; `test_pip_install_failure_rolls_back_to_prev_tag` updated to assert `reset --hard v<tag>`).
+
+### Migration
+None. `bot/migrations/v0_20_22.py` is a no-op.
+
 ## 0.20.21
 
 ### Fixed (updater hotfix)
