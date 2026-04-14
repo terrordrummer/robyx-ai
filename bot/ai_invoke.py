@@ -142,6 +142,24 @@ RATE_LIMIT_KEYWORDS = [
     "usage cap", "over capacity", "quota exceeded", "throttl",
 ]
 
+# Transient stream / network errors emitted by the backend (typically Claude
+# Code after a macOS sleep/wake cycle has broken the underlying TCP stream).
+# They show up on stderr, on stdout, or embedded in the result payload —
+# all three paths are checked and retried with a fresh session.
+STREAM_RETRYABLE_KEYWORDS = [
+    "stream idle timeout",
+    "partial response received",
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "econnreset",
+    "etimedout",
+]
+
+
+def _is_stream_retryable(text: str) -> bool:
+    return any(kw in text for kw in STREAM_RETRYABLE_KEYWORDS)
+
 
 def _normalize_backend_response(parsed_response):
     """Normalize a backend's parse_response() result into ``(text, session_id)``.
@@ -330,25 +348,11 @@ async def _invoke_ai_locked(
     )
     agent.busy = True
 
-    stop_keepalive = asyncio.Event()
-
     effective_thread_id = thread_id
 
-    async def keepalive_loop():
-        try:
-            await platform.send_typing(chat_id, effective_thread_id)
-        except Exception as e:
-            log.warning("Keep-alive initial error: %s", e)
-        while not stop_keepalive.is_set():
-            await asyncio.sleep(5)
-            if stop_keepalive.is_set():
-                break
-            try:
-                await platform.send_typing(chat_id, effective_thread_id)
-            except Exception as e:
-                log.warning("Keep-alive error: %s", e)
-
-    keepalive_task = asyncio.create_task(keepalive_loop())
+    # Note: the Telegram typing indicator is driven from handlers.py by a
+    # continuous loop that runs from message receipt until the response is
+    # delivered, so this function no longer needs its own keep-alive.
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -385,18 +389,19 @@ async def _invoke_ai_locked(
                     "%s error for [%s] (rc=%d, stderr_len=%d, stdout_len=%d)",
                     backend.name, agent.name, proc.returncode, len(err), len(out),
                 )
-                if "already in use" in combined and _retry < MAX_AI_RETRIES:
+                session_collision = "already in use" in combined
+                stream_retryable = _is_stream_retryable(combined)
+                if (session_collision or stream_retryable) and _retry < MAX_AI_RETRIES:
                     new_sid = str(uuid.uuid4())
+                    reason = "session collision" if session_collision else "transient stream error"
                     log.warning(
-                        "Session collision for [%s]: id=%s → regenerating as %s, retry %d/%d",
-                        agent.name, agent.session_id, new_sid, _retry + 1, MAX_AI_RETRIES,
+                        "Retryable backend error for [%s] (%s): id=%s → regenerating as %s, retry %d/%d",
+                        agent.name, reason, agent.session_id, new_sid, _retry + 1, MAX_AI_RETRIES,
                     )
                     agent.session_id = new_sid
                     agent.session_started = False
                     agent.message_count = 0
                     manager.save_state()
-                    stop_keepalive.set()
-                    keepalive_task.cancel()
                     agent.busy = False
                     await asyncio.sleep(min(2 ** _retry, 16))
                     return await _invoke_ai_locked(
@@ -424,18 +429,19 @@ async def _invoke_ai_locked(
                     "%s error for [%s] (rc=%d, stderr_len=%d)",
                     backend.name, agent.name, proc.returncode, len(err),
                 )
-                if "already in use" in combined and _retry < MAX_AI_RETRIES:
+                session_collision = "already in use" in combined
+                stream_retryable = _is_stream_retryable(combined)
+                if (session_collision or stream_retryable) and _retry < MAX_AI_RETRIES:
                     new_sid = str(uuid.uuid4())
+                    reason = "session collision" if session_collision else "transient stream error"
                     log.warning(
-                        "Session collision for [%s]: id=%s → regenerating as %s, retry %d/%d",
-                        agent.name, agent.session_id, new_sid, _retry + 1, MAX_AI_RETRIES,
+                        "Retryable streaming error for [%s] (%s): id=%s → regenerating as %s, retry %d/%d",
+                        agent.name, reason, agent.session_id, new_sid, _retry + 1, MAX_AI_RETRIES,
                     )
                     agent.session_id = new_sid
                     agent.session_started = False
                     agent.message_count = 0
                     manager.save_state()
-                    stop_keepalive.set()
-                    keepalive_task.cancel()
                     agent.busy = False
                     await asyncio.sleep(min(2 ** _retry, 16))
                     return await _invoke_ai_locked(
@@ -447,7 +453,29 @@ async def _invoke_ai_locked(
 
         if not text:
             return STRINGS["ai_empty"]
-        if _is_rate_limited(text.lower()):
+        text_lower = text.lower()
+        # Claude Code sometimes delivers a transient stream error *as* the
+        # result payload (e.g. "API Error: Stream idle timeout - partial
+        # response received") instead of non-zero exit + stderr. Treat that
+        # identically to a stderr failure and retry with a fresh session
+        # instead of surfacing the raw error to chat.
+        if _is_stream_retryable(text_lower) and _retry < MAX_AI_RETRIES:
+            new_sid = str(uuid.uuid4())
+            log.warning(
+                "Transient stream error in result for [%s]: %s → regenerating as %s, retry %d/%d",
+                agent.name, text[:120], new_sid, _retry + 1, MAX_AI_RETRIES,
+            )
+            agent.session_id = new_sid
+            agent.session_started = False
+            agent.message_count = 0
+            manager.save_state()
+            agent.busy = False
+            await asyncio.sleep(min(2 ** _retry, 16))
+            return await _invoke_ai_locked(
+                agent, message, chat_id, platform, manager, backend,
+                is_orchestrator_call, model, _retry + 1, thread_id,
+            )
+        if _is_rate_limited(text_lower):
             return STRINGS["rate_limited"]
 
         # If the backend handed us a native session id (e.g. OpenCode's
@@ -476,12 +504,6 @@ async def _invoke_ai_locked(
         agent.busy = False
         agent.interrupted = False
         agent.running_proc = None
-        stop_keepalive.set()
-        keepalive_task.cancel()
-        try:
-            await keepalive_task
-        except asyncio.CancelledError:
-            pass
 
 
 async def _read_stream(proc, platform, chat_id, effective_thread_id, backend):

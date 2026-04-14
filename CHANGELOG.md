@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.20.9
+
+### Fixed
+- **`bot/ai_invoke.py`** — Transient stream errors from Claude Code (e.g. `Stream idle timeout - partial response received`, typically caused by a macOS sleep/wake cycle breaking the TCP stream) are now detected and automatically retried with a fresh session instead of leaking to chat as `AI Error`. Detection covers all three delivery paths: stderr, stdout, and the case where the CLI returns the error *as* the result payload of a rc=0 run.
+- **`bot/handlers.py`** — `typing_task.cancel()` in `_process_and_send` is now awaited (and `CancelledError` swallowed), eliminating a rare race where the cancellation could surface as an unhandled exception.
+
+### Changed
+- **`bot/ai_invoke.py`** — Removed the per-invocation typing keep-alive loop from `_invoke_ai_locked`. The continuous typing loop in `bot/handlers.py` (added in 0.20.6) already covers message receipt → response delivery end-to-end, so a second loop inside the locked region was redundant.
+
 ## 0.20.8
 
 ### Fixed
