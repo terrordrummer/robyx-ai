@@ -320,6 +320,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
 
     async def _process_and_send(agent, message, chat_id, platform, thread_id=None):
         try:
+            try:
+                await platform.send_typing(chat_id, thread_id)
+            except Exception:
+                pass
             is_robyx = agent.name == "robyx"
             response = await invoke_ai(
                 agent, message, chat_id, platform, manager, backend, is_robyx, thread_id=thread_id,
