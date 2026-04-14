@@ -805,6 +805,69 @@ class TestInvokeAiLocked:
         _u.UUID(agent.session_id)  # raises if the regenerated id is not a valid UUID
 
     @pytest.mark.asyncio
+    async def test_stream_idle_in_result_triggers_retry(self, agent_manager, mock_bot, claude_backend):
+        """Transient stream error delivered as result payload -> retry with fresh session."""
+        agent = agent_manager.get("robyx")
+        original_sid = agent.session_id
+        call_count = 0
+
+        async def fake_spawn(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return _make_mock_process(returncode=0)
+
+        responses = iter([
+            "API Error: Stream idle timeout - partial response received",
+            "recovered",
+        ])
+
+        async def fake_read_stream(*args, **kwargs):
+            return next(responses)
+
+        with patch("ai_invoke.asyncio.create_subprocess_exec", side_effect=fake_spawn), \
+             patch.object(claude_backend, "build_command", return_value=["claude"]), \
+             patch("ai_invoke._read_stream", side_effect=fake_read_stream):
+            result = await _invoke_ai_locked(
+                agent, "hi", 123, mock_bot, agent_manager, claude_backend,
+                False, "sonnet", 0, None,
+            )
+
+        assert result == "recovered"
+        assert call_count == 2
+        assert agent.session_id != original_sid
+
+    @pytest.mark.asyncio
+    async def test_stream_idle_in_stderr_triggers_retry(self, agent_manager, mock_bot, claude_backend):
+        """Transient stream error on stderr (non-streaming) -> retry, not raw error."""
+        agent = agent_manager.get("robyx")
+        original_sid = agent.session_id
+        proc_fail = _make_mock_process(
+            stdout_data=b"",
+            stderr_data=b"API Error: Stream idle timeout - partial response received",
+            returncode=1,
+        )
+        proc_ok = _make_mock_process(stdout_data=b"ok", returncode=0)
+        call_count = 0
+
+        async def fake_spawn(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return proc_fail if call_count == 1 else proc_ok
+
+        with patch("ai_invoke.asyncio.create_subprocess_exec", side_effect=fake_spawn), \
+             patch.object(claude_backend, "supports_streaming", return_value=False), \
+             patch.object(claude_backend, "build_command", return_value=["claude"]), \
+             patch.object(claude_backend, "parse_response", return_value="recovered"):
+            result = await _invoke_ai_locked(
+                agent, "hi", 123, mock_bot, agent_manager, claude_backend,
+                False, "sonnet", 0, None,
+            )
+
+        assert result == "recovered"
+        assert call_count == 2
+        assert agent.session_id != original_sid
+
+    @pytest.mark.asyncio
     async def test_non_streaming_empty_stdout(self, agent_manager, mock_bot, claude_backend):
         """Line 187-188: empty stdout -> ai_no_response."""
         agent = agent_manager.get("robyx")
@@ -953,26 +1016,8 @@ class TestInvokeAiLocked:
         assert agent.busy is False
 
     @pytest.mark.asyncio
-    async def test_keepalive_sends_typing(self, agent_manager, mock_bot, claude_backend):
-        """Keepalive loop sends typing indicator via platform."""
-        agent = agent_manager.get("robyx")
-
-        async def slow_exec(*args, **kwargs):
-            # Give keepalive time to fire at least once
-            await asyncio.sleep(0.1)
-            return _make_mock_process(returncode=0)
-
-        with patch("ai_invoke.asyncio.create_subprocess_exec", side_effect=slow_exec), \
-             patch.object(claude_backend, "build_command", return_value=["claude"]), \
-             patch("ai_invoke._read_stream", new_callable=AsyncMock, return_value="ok"):
-            await _invoke_ai_locked(agent, "hi", 123, mock_bot, agent_manager, claude_backend, False, "sonnet", 0, None)
-
-        # The keepalive sends typing via platform.send_typing
-        mock_bot.send_typing.assert_called()
-
-    @pytest.mark.asyncio
     async def test_finally_cleans_up(self, agent_manager, mock_bot, claude_backend):
-        """Lines 235-238: finally block sets busy=False and stops keepalive."""
+        """Finally block clears busy flag and running_proc reference."""
         agent = agent_manager.get("robyx")
         agent.busy = True
         proc = _make_mock_process(returncode=0)

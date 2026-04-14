@@ -386,6 +386,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
         finally:
             stop_typing.set()
             typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
 
     async def _handle_workspace_commands(response, chat_id, platform, thread_id):
         """Parse and execute workspace/specialist creation/closure commands from Robyx."""
