@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.20.18
+
+### Changed (P2 — simplification)
+- **`bot/config.py`** — 604 → 233 lines. The three in-file system prompts (orchestrator, workspace agent, focused agent) moved to `templates/prompt_orchestrator.md`, `templates/prompt_workspace_agent.md`, `templates/prompt_focused_agent.md`, loaded via `_load_prompt()` helper at import time. Prompts are now diffable / version-controllable without touching Python.
+- **`bot/scheduler.py`** — extracted `_spawn_ai_subprocess()` and `_write_lock_file()` helpers. The one-shot/periodic dispatcher and the continuous-task dispatcher reuse them instead of duplicating 17 lines of subprocess + stdin + lock boilerplate each.
+- **`bot/scheduler.py`** — `_reconcile_task_results()` now keys the "advance next_run vs mark dispatched" decision on `entry.get("interval_seconds")` rather than on the legacy `task_type == "periodic"` string. Identical behaviour for every task created by `add_task`, but the discriminator now reflects the real invariant (recurring ↔ has interval).
+- **`bot/handlers.py`** — docstring on `_handle_remind_commands` expanded to make the contract explicit (text mode vs action mode routing). No functional change.
+
+### Skipped
+- Single-pass pattern extraction in `handlers.py:394-559` — current per-pattern structure is greppable and safer; consolidation was evaluated and rejected for this cycle (decision recorded in the plan file).
+
+### Migration
+None — all changes are pure refactoring. Prompts are bundled in `templates/` and loaded at module import, so no on-disk state changes. `bot/migrations/v0_20_18.py` is a no-op.
+
+### Tests
+971 passed, 1 skipped. No regressions.
+
 ## 0.20.17
 
 ### Fixed (P0 — correctness)

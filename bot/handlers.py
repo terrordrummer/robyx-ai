@@ -688,15 +688,23 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
         return None
 
     def _handle_remind_commands(response, agent, chat_id, thread_id):
-        """Parse and queue [REMIND ...] requests from an agent's response.
+        """Parse and queue ``[REMIND ...]`` requests from an agent response.
 
-        Two modes, disambiguated by the presence of an ``agent="..."``
-        attribute:
+        Single dispatch path: parse every match, validate ``text`` and
+        ``fire_at``, then route to the right queue based on whether an
+        ``agent="name"`` attribute was provided.
 
-        * **text mode** (no ``agent=``): plain message at scheduled time.
-        * **action mode** (``agent="name"``): spawn agent at scheduled time.
+        * **text mode** (no ``agent=``): append to the reminder queue via
+          ``add_reminder``; the scheduler delivers plain text at
+          ``fire_at``. Thread defaults to the channel the caller lives in.
+        * **action mode** (``agent="..."``): append to the timed-task
+          queue; the scheduler spawns the named workspace or specialist
+          at ``fire_at`` with ``text`` as the prompt. Thread defaults to
+          the target agent's own channel (so the output lands there).
 
-        Validation failures are appended as inline notices (no silent drops).
+        Validation failures are appended as inline notices — never
+        silently dropped — so the user sees exactly which reminders
+        were rejected and why.
         """
         matches = list(REMIND_PATTERN.finditer(response))
         if not matches:

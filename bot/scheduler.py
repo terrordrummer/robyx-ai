@@ -554,8 +554,12 @@ def _reconcile_task_results(results: list[dict]) -> None:
                 continue
 
             if result["status"] == "dispatched":
-                if result["task_type"] == "periodic":
-                    interval = entry.get("interval_seconds", 86400)
+                # A task is recurring iff it carries an ``interval_seconds``;
+                # the legacy ``type="periodic"`` string used to drive this
+                # branch is now purely informational. Tasks without an
+                # interval are one-shot and terminate in ``dispatched``.
+                interval = entry.get("interval_seconds")
+                if interval:
                     run_at_str = entry.get("scheduled_at") or entry.get("next_run", "")
                     try:
                         run_at = _parse_timestamp(run_at_str)
@@ -704,6 +708,51 @@ async def _dispatch_reminders(
     _reconcile_reminder_results(results)
 
 
+# ── Shared spawn helpers ────────────────────────────────────────────────────
+
+
+async def _spawn_ai_subprocess(
+    *,
+    cmd: list[str],
+    stdin_payload: bytes | str | None,
+    output_log: Path,
+    work_dir: str,
+) -> asyncio.subprocess.Process:
+    """Run an AI CLI subprocess, redirecting stdout+stderr to ``output_log``.
+
+    Centralises the boilerplate shared by the one-shot/periodic path and
+    the continuous-task path: open the log, launch the CLI, pipe the
+    prompt payload into stdin (tolerating both sync and async
+    ``write`` / ``close`` variants that asyncio StreamWriter exposes).
+    """
+    with open(output_log, "w") as out_f:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=(
+                asyncio.subprocess.PIPE if stdin_payload is not None
+                else asyncio.subprocess.DEVNULL
+            ),
+            stdout=out_f,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=work_dir,
+        )
+        if stdin_payload is not None and proc.stdin is not None:
+            write_result = proc.stdin.write(stdin_payload)
+            if inspect.isawaitable(write_result):
+                await write_result
+            await proc.stdin.drain()
+            close_result = proc.stdin.close()
+            if inspect.isawaitable(close_result):
+                await close_result
+    return proc
+
+
+def _write_lock_file(lock_file: Path, pid: int) -> None:
+    """Write ``<pid> <ISO-utc>`` to the task lock file."""
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lock_file.write_text("%d %s" % (pid, now_str))
+
+
 # ── Dispatch: agent tasks (one-shot / periodic) ─────────────────────────────
 
 
@@ -780,25 +829,13 @@ async def _spawn_agent_task(task: dict, backend: AIBackend, platform=None) -> in
     stdin_payload = backend.spawn_stdin_payload(full_prompt)
 
     try:
-        with open(output_log, "w") as out_f:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
-                stdout=out_f,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=runtime.work_dir,
-            )
-            if stdin_payload is not None and proc.stdin is not None:
-                write_result = proc.stdin.write(stdin_payload)
-                if inspect.isawaitable(write_result):
-                    await write_result
-                await proc.stdin.drain()
-                close_result = proc.stdin.close()
-                if inspect.isawaitable(close_result):
-                    await close_result
-
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        lock_file.write_text("%d %s" % (proc.pid, now_str))
+        proc = await _spawn_ai_subprocess(
+            cmd=cmd,
+            stdin_payload=stdin_payload,
+            output_log=output_log,
+            work_dir=runtime.work_dir,
+        )
+        _write_lock_file(lock_file, proc.pid)
         start_task_delivery_watch(task, proc, output_log, lock_file, platform, backend, log)
 
         log.info("Spawned '%s' (PID %d, model: %s)", task_name, proc.pid, model)
@@ -1010,22 +1047,12 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
         output_log = DATA_DIR / name / "output.log"
 
         try:
-            with open(output_log, "w") as out_f:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
-                    stdout=out_f,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=work_dir,
-                )
-                if stdin_payload is not None and proc.stdin is not None:
-                    write_result = proc.stdin.write(stdin_payload)
-                    if inspect.isawaitable(write_result):
-                        await write_result
-                    await proc.stdin.drain()
-                    close_result = proc.stdin.close()
-                    if inspect.isawaitable(close_result):
-                        await close_result
+            proc = await _spawn_ai_subprocess(
+                cmd=cmd,
+                stdin_payload=stdin_payload,
+                output_log=output_log,
+                work_dir=work_dir,
+            )
 
             # Persist state=running BEFORE writing the lock file. If we
             # crash between the two writes, the next scheduler cycle sees
@@ -1037,8 +1064,7 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             mark_step_started(state, step_number, step_description)
             save_state(Path(sf), state)
 
-            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            lock_file.write_text("%d %s" % (proc.pid, now_str))
+            _write_lock_file(lock_file, proc.pid)
 
             # Start delivery watcher for output relay
             start_task_delivery_watch(entry, proc, output_log, lock_file, platform, backend, log)
