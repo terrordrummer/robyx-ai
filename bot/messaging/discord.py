@@ -6,7 +6,7 @@ import logging
 import tempfile
 from typing import Any
 
-from messaging.base import Platform
+from messaging.base import Platform, retry_send
 
 log = logging.getLogger("robyx.platform.discord")
 
@@ -82,7 +82,9 @@ class DiscordPlatform(Platform):
             except Exception:
                 log.error("Could not find channel %d", target_id)
                 return None
-        return await channel.send(text)
+        return await retry_send(
+            lambda: channel.send(text), label="discord.send_message",
+        )
 
     async def send_typing(self, chat_id: int, thread_id: int | None = None) -> None:
         """Send a typing indicator to a channel."""

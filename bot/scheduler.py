@@ -47,6 +47,7 @@ from config import (
     LOG_FILE,
     MAX_REMINDER_ATTEMPTS,
     QUEUE_FILE,
+    REMINDER_MAX_AGE_SECONDS,
     TASKS_FILE,
     TIMED_QUEUE_FILE,
 )
@@ -249,6 +250,58 @@ def cancel_tasks_for_agent_file(
 cancel_tasks_for_agent = cancel_tasks_for_agent_file
 
 
+# ── Startup cleanup ──────────────────────────────────────────────────────────
+
+
+async def cleanup_stale_locks_on_startup() -> list[str]:
+    """Remove lock files left behind by crashed subprocesses.
+
+    A crash between writing a lock file and the subprocess actually exiting
+    leaves a ``data/<task>/lock`` pointing at a dead PID. ``check_lock()``
+    already cleans these lazily, but only for tasks that are actively
+    checked during the scheduler cycle — a workspace that has no pending
+    queue entry never hits check_lock and its stale lock lingers.
+
+    At bot startup we proactively scan every ``data/*/lock`` and remove
+    those whose PID is not alive or is not an AI subprocess. Returns the
+    list of task names that had their lock cleaned, for logging.
+    """
+    from process import get_process_name, is_ai_process, is_pid_alive
+
+    if not DATA_DIR.exists():
+        return []
+
+    cleaned: list[str] = []
+    for lock_file in DATA_DIR.glob("*/lock"):
+        task_name = lock_file.parent.name
+        try:
+            content = lock_file.read_text().strip()
+            pid = int(content.split()[0])
+        except (OSError, ValueError, IndexError):
+            lock_file.unlink(missing_ok=True)
+            cleaned.append(task_name)
+            continue
+
+        if not is_pid_alive(pid):
+            lock_file.unlink(missing_ok=True)
+            cleaned.append(task_name)
+            log.info("Startup cleanup: removed stale lock for '%s' (PID %d dead)", task_name, pid)
+            continue
+
+        if not await is_ai_process(pid):
+            proc_name = await get_process_name(pid)
+            lock_file.unlink(missing_ok=True)
+            cleaned.append(task_name)
+            log.info(
+                "Startup cleanup: removed stale lock for '%s' (PID %d recycled as '%s')",
+                task_name, pid, proc_name,
+            )
+
+    if cleaned:
+        log.info("Startup cleanup: removed %d stale lock(s): %s", len(cleaned), ", ".join(cleaned))
+    return cleaned
+
+
 # ── Lock files ───────────────────────────────────────────────────────────────
 
 
@@ -362,6 +415,21 @@ def _claim_due_entries() -> tuple[list[dict], list[dict]]:
                 if fire_at > now:
                     continue
 
+                # Reject reminders whose fire_at is too far in the past to
+                # still be relevant. Without this guard, a reminder that
+                # keeps failing (e.g. transient network error on every
+                # attempt) could linger in the queue retrying for days.
+                age_seconds = (now - fire_at).total_seconds()
+                if age_seconds > REMINDER_MAX_AGE_SECONDS:
+                    log.warning(
+                        "Reminder %s expired (%.0fs past fire_at, limit %ds), marking failed",
+                        entry.get("id"), age_seconds, REMINDER_MAX_AGE_SECONDS,
+                    )
+                    entry["status"] = "failed"
+                    entry["failure_reason"] = "expired"
+                    changed = True
+                    continue
+
                 attempts = entry.get("attempts", 0)
                 if attempts >= MAX_REMINDER_ATTEMPTS:
                     log.warning(
@@ -369,6 +437,7 @@ def _claim_due_entries() -> tuple[list[dict], list[dict]]:
                         entry.get("id"), MAX_REMINDER_ATTEMPTS,
                     )
                     entry["status"] = "failed"
+                    entry["failure_reason"] = "max-attempts"
                     changed = True
                     continue
 
@@ -1022,6 +1091,9 @@ async def get_running_tasks() -> list[dict]:
 # ── Main cycle ───────────────────────────────────────────────────────────────
 
 
+_startup_cleanup_done = False
+
+
 async def run_scheduler_cycle(
     backend: AIBackend,
     platform=None,
@@ -1031,6 +1103,14 @@ async def run_scheduler_cycle(
 
     Returns a summary dict with dispatched tasks, errors, and reminder counts.
     """
+    global _startup_cleanup_done
+    if not _startup_cleanup_done:
+        _startup_cleanup_done = True
+        try:
+            await cleanup_stale_locks_on_startup()
+        except Exception as exc:
+            log.error("Startup lock cleanup failed: %s", exc, exc_info=True)
+
     due_tasks, due_reminders = _claim_due_entries()
 
     dispatched: list[tuple[str, int]] = []

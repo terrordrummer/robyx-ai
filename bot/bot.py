@@ -247,6 +247,17 @@ def main():
     ensure_single_instance()
     log.info("Starting Robyx...")
 
+    # Force-kill any subprocess the previous bot lifetime left behind
+    # (interrupted-but-not-confirmed SIGTERM recipients, etc.). Safe to
+    # run before backend init — it only touches PIDs we recorded.
+    try:
+        import orphan_tracker
+        killed = orphan_tracker.cleanup_on_startup()
+        if killed:
+            log.warning("Startup: killed %d orphan subprocess(es): %s", len(killed), killed)
+    except Exception as exc:
+        log.error("Orphan cleanup failed: %s", exc, exc_info=True)
+
     # Initialize AI backend
     backend = create_backend(AI_BACKEND, AI_CLI_PATH or None)
     log.info("AI backend: %s (%s)", backend.name, backend.cli_path)

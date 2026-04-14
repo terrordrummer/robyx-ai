@@ -378,6 +378,28 @@ async def _invoke_ai_locked(
             limit=1024 * 1024,
         )
         agent.running_proc = proc
+        import orphan_tracker
+        orphan_tracker.register(proc.pid, owner=agent.name)
+
+        # Heartbeat watchdog: periodic log line while the subprocess runs,
+        # so operators scrolling bot.log can see "agent X still working at
+        # minute N" instead of a silent gap. Does NOT bother the user —
+        # the typing indicator already covers user-facing liveness.
+        _hb_start = asyncio.get_event_loop().time()
+
+        async def _heartbeat():
+            try:
+                while True:
+                    await asyncio.sleep(60)
+                    elapsed = asyncio.get_event_loop().time() - _hb_start
+                    log.info(
+                        "Agent [%s] still running (PID %d, %.0fs elapsed)",
+                        agent.name, proc.pid, elapsed,
+                    )
+            except asyncio.CancelledError:
+                pass
+
+        heartbeat_task = asyncio.create_task(_heartbeat())
 
         backend_session_id: str | None = None
         if backend.supports_streaming():
@@ -515,8 +537,15 @@ async def _invoke_ai_locked(
         log.error("AI exception for [%s]: %s", agent.name, e, exc_info=True)
         return STRINGS["ai_error"] % str(e)
     finally:
+        try:
+            heartbeat_task.cancel()
+        except NameError:
+            pass
         agent.busy = False
         agent.interrupted = False
+        if agent.running_proc is not None:
+            import orphan_tracker
+            orphan_tracker.unregister(agent.running_proc.pid)
         agent.running_proc = None
 
 

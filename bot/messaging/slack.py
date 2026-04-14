@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from messaging.base import Platform
+from messaging.base import Platform, retry_send
 
 log = logging.getLogger("robyx.platform.slack")
 
@@ -99,7 +99,10 @@ class SlackPlatform(Platform):
         kwargs: dict[str, Any] = {"channel": str(chat_id), "text": text}
         if thread_id is not None:
             kwargs["thread_ts"] = str(thread_id)
-        resp = await self._client.chat_postMessage(**kwargs)
+        resp = await retry_send(
+            lambda: self._client.chat_postMessage(**kwargs),
+            label="slack.send_message",
+        )
         return {"channel": resp["channel"], "ts": resp["ts"]}
 
     async def reply(self, msg_ref: Any, text: str, parse_mode: str | None = None) -> Any:
