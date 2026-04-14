@@ -1,9 +1,15 @@
-"""Robyx — migration framework.
+"""Legacy (pre-0.20.12) name-keyed migration registry.
 
-Each migration is a small async function that runs exactly once per
-deployment, after an update is applied and before the bot starts handling
-messages. Migrations are identified by a stable string ID and tracked in
-``data/migrations.json``.
+**Historical, kept running for backwards compatibility.** The new
+framework for post-0.20.11 migrations lives in :mod:`migrations.runner`
+and is version-chained; it executes *after* this legacy registry on
+every boot. Do not add new migrations here — use a versioned
+``vX_Y_Z.py`` module instead.
+
+Each legacy migration is a small async function that runs exactly once
+per deployment, after an update is applied and before the bot starts
+handling messages. Migrations are identified by a stable string ID and
+tracked at the root of ``data/migrations.json``.
 
 Design choices:
 
@@ -49,13 +55,13 @@ MIGRATIONS_FILE = DATA_DIR / "migrations.json"
 
 
 @dataclass
-class Migration:
+class LegacyMigrationEntry:
     id: str
     description: str
     apply: Callable[[Any, Any], Awaitable[bool]]
 
 
-_REGISTRY: List[Migration] = []
+_REGISTRY: List[LegacyMigrationEntry] = []
 
 
 def migration(id: str, description: str):
@@ -68,7 +74,7 @@ def migration(id: str, description: str):
     still accept ``manager`` in the signature for uniformity.
     """
     def wrap(fn):
-        _REGISTRY.append(Migration(id=id, description=description, apply=fn))
+        _REGISTRY.append(LegacyMigrationEntry(id=id, description=description, apply=fn))
         return fn
     return wrap
 
@@ -91,8 +97,26 @@ def _load_applied() -> dict:
 
 
 def _save_applied(data: dict) -> None:
+    """Persist the legacy tracker dict, preserving the ``_chain_`` section.
+
+    The new version-chained framework writes its own state under the
+    ``_chain_`` key of the same JSON file. A naive overwrite here would
+    wipe the chain progress on every boot. We re-read the file, merge
+    anything outside our legacy ID keys, and then write.
+    """
     MIGRATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    MIGRATIONS_FILE.write_text(json.dumps(data, indent=2))
+    merged: dict = {}
+    if MIGRATIONS_FILE.exists():
+        try:
+            existing = json.loads(MIGRATIONS_FILE.read_text())
+            if isinstance(existing, dict):
+                for k, v in existing.items():
+                    if k not in data:
+                        merged[k] = v
+        except Exception:
+            pass
+    merged.update(data)
+    MIGRATIONS_FILE.write_text(json.dumps(merged, indent=2))
 
 
 async def run_pending(platform, manager) -> list[tuple[str, str]]:
