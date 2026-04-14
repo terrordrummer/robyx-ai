@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.7
+
+### Added
+- **Early typing in `handle_message`** — `send_typing` now fires immediately after initial checks (help, config updates) but before agent routing, giving instant feedback as soon as the message is received.
+
 ## 0.20.6
 
 ### Fixed
