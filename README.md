@@ -502,7 +502,10 @@ All env vars use the `ROBYX_` prefix. Legacy `KAELOPS_` prefixes are still accep
 | `ROBYX_PLATFORM` | Yes | `telegram` / `discord` / `slack` (legacy `KAELOPS_PLATFORM` also accepted) |
 | `AI_BACKEND` | Yes | `claude` / `codex` / `opencode` |
 | `AI_CLI_PATH` | — | Custom CLI path (auto-detected if on `PATH`) |
-| `CLAUDE_PERMISSION_MODE` | — | Claude Code permission mode (default: `bypassPermissions` for autonomous operation). Override to a different mode if needed. |
+| `CLAUDE_PERMISSION_MODE` | — | Claude Code permission mode (default: `bypassPermissions` for autonomous operation). Override to a different mode if needed. Note: on systems with enterprise MDM settings that set `permissions.disableBypassPermissionsMode: disable`, this override is enforced by Claude and cannot be relaxed from Robyx. |
+| `CODEX_APPROVAL_POLICY` | — | Codex approval policy (default: `never` — no prompts). Override with `untrusted` / `on-request` / `on-failure` for stricter approvals. |
+| `CODEX_SANDBOX` | — | Codex sandbox policy (default: `danger-full-access` — no sandbox). Override with `read-only` / `workspace-write` for stricter isolation. |
+| `OPENCODE_PERMISSION` | — | OpenCode global permission level (default: `allow`). Set to `ask` or `deny` for stricter policies. Robyx writes a managed `opencode-managed.json` config at boot and points OpenCode at it via `OPENCODE_CONFIG`, unless `OPENCODE_CONFIG` is already set. |
 | `ROBYX_WORKSPACE` | — | Default `work_dir` inherited by newly created workspaces and specialists (default: `~/Workspace`). Legacy `KAELOPS_WORKSPACE` is also accepted. |
 | `OPENAI_API_KEY` | — | For voice message transcription (Whisper) |
 | `SCHEDULER_INTERVAL` | — | Scheduler check interval in seconds (default: `60`) |
@@ -572,7 +575,13 @@ Adding a new backend is one class in [`ai_backend.py`](bot/ai_backend.py) — im
 
 When using Claude Code, responses are **streamed in real-time**. Agents can emit `[STATUS ...]` markers that appear instantly in chat, so you see progress instead of just "typing...".
 
-Robyx defaults to `bypassPermissions` so agents can operate autonomously without terminal interaction. Override via `CLAUDE_PERMISSION_MODE` in `.env` if you want a different mode.
+**Autonomous-by-default permissions.** Robyx ships every backend with the most permissive, non-interactive execution policy, since agents run headless and cannot answer approval prompts:
+
+- **Claude Code** — `--permission-mode bypassPermissions`. Override with `CLAUDE_PERMISSION_MODE`.
+- **Codex** — `--approval-policy never --sandbox danger-full-access`. Override with `CODEX_APPROVAL_POLICY` / `CODEX_SANDBOX`.
+- **OpenCode** — managed `opencode-managed.json` config with `"permission": "allow"`, wired via `OPENCODE_CONFIG`. Override with `OPENCODE_PERMISSION` (or set `OPENCODE_CONFIG` explicitly to point at your own config).
+
+This is **intentionally unsafe**: agents can read/write anywhere on the disk and run any shell command. If you need stricter isolation, flip the relevant env var. On Linux systems with enterprise MDM that sets `permissions.disableBypassPermissionsMode: disable`, Claude will enforce the restriction regardless of what Robyx asks for.
 
 OpenCode runs with `--format json` and resumes its native session via `--session ses_…` so multi-turn conversations stay coherent across messages and bot restarts. Robyx captures the session id from the CLI output on the first turn and replays it automatically on every subsequent turn.
 
