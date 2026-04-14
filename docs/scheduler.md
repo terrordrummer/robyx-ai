@@ -26,11 +26,13 @@ Any user message to a busy agent **interrupts the running subprocess immediately
 ## Runtime contract
 
 - Each task spawns an independent AI CLI process.
-- PID lock files under `data/<task>/lock` prevent duplicate runs and clean stale locks.
+- PID lock files under `data/<task>/lock` prevent duplicate runs and are cleaned both lazily (by `check_lock` during polling) and proactively on the first scheduler cycle of each boot, so locks on workspaces that have no queue entry never accumulate.
 - Tasks execute in the target agent's stored `work_dir`.
 - Output is logged per-task and relayed back into the target topic/channel.
-- An atomic claim system prevents double-dispatch on concurrent access.
+- An atomic claim system prevents double-dispatch on concurrent access within one process, and a POSIX `fcntl.LOCK_EX` advisory lock on `data/queue.json.lock` prevents two bot processes (e.g. during a rolling restart) from double-claiming the same entry. On non-POSIX systems the file-level lock is a no-op; single-instance deployments remain fully protected by the in-process lock.
 - One-shot tasks are marked `dispatched` after firing; closing a workspace cancels all its pending queue entries.
+- Reminders that keep failing for longer than `REMINDER_MAX_AGE_SECONDS` (default 24 h) past their `fire_at` are marked `failed` with `failure_reason="expired"` so a persistent delivery failure does not bloat the queue indefinitely.
+- The bot also maintains `data/active-pids.json`, a registry of subprocesses it spawned. On startup any survivor that is still alive **and** looks like one of our process names (`claude`, `codex`, `opencode`, `python`, `node`) is force-killed, so a crash during `agent.interrupt()` no longer leaks an unmonitored AI process.
 
 ---
 

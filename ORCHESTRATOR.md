@@ -293,7 +293,7 @@ When the user provides API keys, tokens, or configuration values:
 
 Prefer explicit `KEY=value` lines when the user is giving you a secret or config value. Robyx applies recognized env-key assignments locally, so values like `OPENAI_API_KEY=...` do not need to be forwarded to the AI backend for interpretation.
 
-Known `.env` keys: `OPENAI_API_KEY`, `AI_BACKEND`, `SCHEDULER_INTERVAL`, `UPDATE_CHECK_INTERVAL`, `ROBYX_PLATFORM`.
+Known `.env` keys: `OPENAI_API_KEY`, `AI_BACKEND`, `SCHEDULER_INTERVAL`, `UPDATE_CHECK_INTERVAL`, `REMINDER_MAX_AGE_SECONDS`, `ROBYX_PLATFORM`.
 Also support common keys `AI_CLI_PATH`, `CLAUDE_PERMISSION_MODE`, `ROBYX_WORKSPACE`; Telegram keys `ROBYX_BOT_TOKEN`, `ROBYX_CHAT_ID`, `ROBYX_OWNER_ID`; Slack keys `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_CHANNEL_ID`, `SLACK_OWNER_ID`; Discord keys `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CONTROL_CHANNEL_ID`, `DISCORD_OWNER_ID`.
 
 ---

@@ -208,7 +208,9 @@ MAX_AI_RETRIES = 3
 AI_TIMEOUT = 7200  # 2 hours max per invocation (long R&D runs need time)
 CLAIM_TIMEOUT_SECONDS = 300  # stale claim reset for reminders and timed tasks
 MAX_REMINDER_ATTEMPTS = 10  # max delivery attempts before marking a reminder failed
-REMINDER_MAX_AGE_SECONDS = 86400  # reject reminders whose fire_at is older than 24h
+REMINDER_MAX_AGE_SECONDS = int(
+    os.environ.get("REMINDER_MAX_AGE_SECONDS", "86400")
+)  # reject reminders whose fire_at is older than 24 h (default)
 
 # ── System Prompts ──
 
