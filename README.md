@@ -668,7 +668,12 @@ Auto-update is rigorous about Python dependencies:
 
 ### Post-update migrations
 
-A tiny migration framework (`bot/migrations.py`) runs post-update instructions exactly once per deployment on the next boot after an update. Each migration is a registered async function tracked in `data/migrations.json` and never retried once attempted, so an unsatisfiable migration never blocks the boot. The framework is how Robyx performs operations like renaming the main channel on the platform (e.g. *General* → *Headquarters*) after an upgrade.
+Migrations run post-update, exactly once per deployment, on the next boot after an update. Two layers live in `bot/migrations/`:
+
+- **Version chain** (since 0.20.12) — every release ships a matching `bot/migrations/vX_Y_Z.py` module with `from_version` / `to_version` / `upgrade()`. The chain must be continuous: multi-version jumps (e.g. 0.18 → 0.25) run every intermediate step in order. A contract test (`tests/test_migrations_framework.py::TestChainContract`) fails the build if any release is missing its migration. Scaffold a new one with `python scripts/new_migration.py X.Y.Z`.
+- **Legacy name-keyed registry** (pre-0.20.12) — kept in `bot/migrations/legacy.py` for backwards compatibility with existing installs; no new migrations are added here.
+
+Both layers are tracked in `data/migrations.json` (chain state lives under the `_chain_` key). Migrations are idempotent, never retried on failure, and never block the boot.
 
 ### Agent session lifecycle on updates
 
@@ -762,7 +767,12 @@ robyx-ai/
 │   ├── model_preferences.py   # Backend-aware model alias resolution
 │   ├── topics.py              # Workspace/channel creation
 │   ├── media.py               # Outgoing image compression (Pillow)
-│   ├── migrations.py          # Post-update migration framework
+│   ├── migrations/            # Migration framework (chain + legacy registry)
+│   │   ├── base.py            # Migration / MigrationContext / version utils
+│   │   ├── runner.py          # Chain discovery + execution
+│   │   ├── tracker.py         # data/migrations.json persistence
+│   │   ├── legacy.py          # Pre-0.20.12 name-keyed registry
+│   │   └── vX_Y_Z.py          # One per release, continuous chain
 │   ├── session_lifecycle.py   # Session invalidation logic
 │   ├── updater.py             # Auto-update system
 │   ├── process.py             # Subprocess management

@@ -16,12 +16,29 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _patch_migrations_file(tmp_path, monkeypatch):
-    """Redirect the migrations tracker to a tmp path and clear the in-memory
-    registry so every test starts with a clean slate."""
+    """Redirect the migrations tracker to a tmp path and snapshot/restore
+    the in-memory legacy registry so every test starts with the
+    production set of built-in migrations (fresh state is just a
+    seeded tracker).
+
+    The v0.20.12 version chain is pre-seeded at the latest migration's
+    ``to_version`` so legacy tests — written when ``run_pending`` only
+    ran the legacy registry — still see exactly the legacy entries they
+    expect in the ``executed`` list.
+    """
+    import json
     import migrations as mig_mod
+    from migrations import legacy as mig_legacy
 
     tracker = tmp_path / "data" / "migrations.json"
     monkeypatch.setattr(mig_mod, "MIGRATIONS_FILE", tracker)
+    monkeypatch.setattr(mig_legacy, "MIGRATIONS_FILE", tracker)
+    tracker.parent.mkdir(parents=True, exist_ok=True)
+    discovered = mig_mod.discover("migrations")
+    latest = discovered[-1].to_version if discovered else "0.20.11"
+    tracker.write_text(json.dumps({
+        "_chain_": {"current_version": latest, "history": []},
+    }))
     mig_mod.clear_registry_for_tests()
     yield
     mig_mod.clear_registry_for_tests()
@@ -128,9 +145,11 @@ class TestRunPending:
         import migrations as mig
 
         mig.MIGRATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        mig.MIGRATIONS_FILE.write_text(json.dumps({
-            "a": {"description": "first", "status": "success"},
-        }))
+        # Preserve the chain-up-to-date seed installed by the fixture so
+        # the chain runner stays a no-op for this legacy-registry test.
+        existing = json.loads(mig.MIGRATIONS_FILE.read_text())
+        existing["a"] = {"description": "first", "status": "success"}
+        mig.MIGRATIONS_FILE.write_text(json.dumps(existing))
 
         calls = []
 
@@ -206,7 +225,12 @@ class TestRunPending:
             return True
 
         executed = await mig.run_pending(fake_platform, fake_manager)
-        assert executed == [("a", "success")]
+        # A corrupt tracker is treated as empty by *both* layers — the
+        # chain runner reseeds from SEED_VERSION and runs the bootstrap
+        # migration too. That's the desired recovery behaviour: rebuild
+        # the tracker from scratch instead of refusing to boot.
+        assert ("a", "success") in executed
+        assert ("0.20.11→0.20.12", "ok") in executed
 
     @pytest.mark.asyncio
     async def test_runs_in_registration_order(self, fake_platform, fake_manager):
@@ -324,13 +348,14 @@ class TestRenameToHeadquartersMigration:
         """Both built-in migrations must be present and the headquarters
         rename must come *after* the command-bridge rename — otherwise a
         fresh install would end up named "Command Bridge"."""
-        # The conftest clears the registry on each test, so re-import the
-        # production module to populate it from source.
+        # The conftest clears the in-memory registry on each test; inspect
+        # the legacy sub-module directly to see the production decorators
+        # as they were registered at import time.
         import importlib
-        import migrations as mig
+        from migrations import legacy
 
-        importlib.reload(mig)
-        ids = [m.id for m in mig._REGISTRY]
+        importlib.reload(legacy)
+        ids = [m.id for m in legacy._REGISTRY]
         assert "0.12.1-rename-main-to-command-bridge" in ids
         assert "0.14.0-rename-command-bridge-to-headquarters" in ids
         assert ids.index("0.14.0-rename-command-bridge-to-headquarters") > ids.index(
@@ -451,10 +476,10 @@ class TestResetSessionsAfterClobberFix:
         """0.15.2 must come after 0.15.0 (and after the rename migrations)
         so the boot summary lists them in the correct order."""
         import importlib
-        import migrations as mig
+        from migrations import legacy
 
-        importlib.reload(mig)
-        ids = [m.id for m in mig._REGISTRY]
+        importlib.reload(legacy)
+        ids = [m.id for m in legacy._REGISTRY]
         assert "0.15.0-reset-sessions-for-reminder-skill" in ids
         assert "0.15.2-reset-sessions-after-clobber-fix" in ids
         idx_152 = ids.index("0.15.2-reset-sessions-after-clobber-fix")

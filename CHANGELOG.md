@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.20.12
+
+### Added
+- **`bot/migrations/` package** — introduces a version-chained migration framework alongside the legacy name-keyed registry. Each release from 0.20.12 onward ships a matching `vX_Y_Z.py` module with `from_version` / `to_version` / `upgrade()`. The chain must be continuous — a CI-style contract test (`tests/test_migrations_framework.py::TestChainContract`) fails the build if any intermediate release is missing its migration. Multi-version jumps (e.g. 0.20 → 0.25) now safely run every intermediate step in order instead of skipping straight to the newest.
+- **`scripts/new_migration.py`** — scaffolds a new `vX_Y_Z.py` with the correct chain links, auto-inferring the previous version from `releases/`.
+- **`tests/test_migrations_framework.py`** — 20+ tests for version comparison, tracker persistence, chain discovery / validation, chain execution (including stop-on-error and multi-version jumps), and the release-vs-migration contract.
+
+### Changed
+- **`bot/migrations.py` → `bot/migrations/` package** — the old single-module legacy registry is preserved in `bot/migrations/legacy.py` with zero behavioural change; the package `__init__.py` re-exports every previously public name, so `from migrations import run_pending`, `MIGRATIONS_FILE`, `clear_registry_for_tests`, `_rename_to_command_bridge`, etc. continue to work. The legacy `_save_applied` now merges the chain tracker state into the same JSON file instead of overwriting it.
+- **Unified `run_pending`** — now runs the legacy registry first (unchanged behaviour), then the version chain, returning a combined list. Boot summaries in chat show both layers.
+
 ## 0.20.11
 
 ### Changed
