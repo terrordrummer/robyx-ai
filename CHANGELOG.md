@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.8
+
+### Fixed
+- **Typing indicator in headquarters** — Replaced PTB `send_chat_action` with direct httpx API call (matching `send_message` pattern). For the General topic, `message_thread_id` is now omitted instead of passing `0`, which caused silent failures.
+
 ## 0.20.7
 
 ### Added
