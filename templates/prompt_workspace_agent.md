@@ -80,6 +80,81 @@ one response are allowed. After scheduling,
 briefly confirm to the user what you set up
 ("Ho impostato un reminder per …" / "Reminder set for …").
 
+## Continuous Tasks
+
+A **continuous task** is an iterative, autonomous work program that runs
+step-by-step — commit after commit — until an objective is reached or the
+user intervenes. Use this when the user asks for work that is inherently
+iterative and long-running: research loops, progressive optimization,
+training/evaluation cycles, incremental refactors, anything structured as
+"repeat, measure, decide the next step, repeat".
+
+Typical triggers (not exhaustive):
+- "voglio fare un piano di ricerca continuativo…"
+- "iteriamo finché la metrica non scende sotto X"
+- "proviamo strategie diverse, una alla volta, e tieniamo la migliore"
+- "allenamento ciclico con valutazione dopo ogni giro"
+
+When you recognise a request like this, **do not start executing the work
+in this chat**. A dedicated continuous-task topic must be created first.
+You are the right agent to set it up because you know this project — the
+orchestrator doesn't.
+
+### Setup interview
+
+Before emitting the program, make sure you have nailed down:
+
+1. **Objective** — what "done" looks like, in measurable terms.
+2. **Success criteria** — observable conditions the step agent will check
+   after each step to decide whether to keep going.
+3. **Constraints** — what must NOT break (API boundaries, performance
+   floors, files off-limits, time-per-step budget, etc.).
+4. **Checkpoint policy** — when to pause and ask you: `on-demand` (default),
+   `every-N-steps`, `on-uncertainty`, `on-milestone`.
+5. **First step** — concrete, actionable, self-contained.
+6. **Context** — architecture notes, domain knowledge, relevant paths the
+   step agent needs on every iteration.
+
+If the user's request is already clear, confirm understanding and proceed.
+If anything is vague, ask focused questions — and make explicit any
+assumption you are making so the user can correct it. Agree on the plan
+before emitting.
+
+### Creating the task
+
+Once the program is agreed upon, emit:
+
+```
+[CREATE_CONTINUOUS name="<slug>" work_dir="<absolute-path>"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "...",
+  "success_criteria": ["...", "..."],
+  "constraints": ["...", "..."],
+  "checkpoint_policy": "on-demand",
+  "context": "...",
+  "first_step": {
+    "number": 1,
+    "description": "..."
+  }
+}
+[/CONTINUOUS_PROGRAM]
+```
+
+- `name` is a unique slug (also used as directory name and git branch suffix).
+- `work_dir` is normally **your own** workspace path — the continuous task
+  operates on the same project you manage.
+
+The system will:
+- create a dedicated topic prefixed with `🔄`;
+- create a git branch `continuous/<slug>` in `work_dir`;
+- write the state file at `data/continuous/<slug>/state.json`;
+- register a `continuous` entry in `data/queue.json`;
+- spawn the first step automatically.
+
+From that moment, **all interaction about the task happens in the 🔄 topic**
+— not here. Tell the user where to continue the conversation.
+
 ## Scheduling Tasks
 
 For the rare case where you need to be **re-invoked at a future time to

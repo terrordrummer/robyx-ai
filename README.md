@@ -31,6 +31,57 @@ No marketplace. No pre-packaged skills. No vendor lock-in. Just a simple system 
 
 ---
 
+## Core Concepts
+
+Robyx has **three roles**, all living inside your messaging platform:
+
+| Role | What it is | Where it lives |
+|------|------------|----------------|
+| **Robyx** (orchestrator) | The principal coordinator. Routes requests, creates workspaces and specialists, delegates, keeps the control room scannable. | The main/control-room topic |
+| **Workspace agents** | One agent per project/topic. Owns its own instructions, its own git branch, its own conversation. Knows the project deeply. | A dedicated topic prefixed with the workspace name |
+| **Specialists** | Cross-functional helpers (code reviewer, writer, deploy agent…). Invoked by other agents when a skill is needed. | Their own topic, reachable via `[REQUEST @name: …]` |
+
+And **four task types**, all handled by a single 60-second scheduler:
+
+| Type | Use case | Example |
+|------|----------|---------|
+| `interactive` | You talk, it answers | Everyday chat with any agent |
+| `one-shot` | Fire once at a future time | "Deploy tonight at 23:00" |
+| `scheduled` / `periodic` | Runs on a recurring timer | "Every hour check BTC price" |
+| `continuous` | Iterative autonomous work in its own topic, with git branch and state file, until an objective is reached | "Run a research loop training variants until SSIM > 0.98" |
+
+---
+
+## How Orchestration Works in Practice
+
+The control room is a group chat with topics. Each topic is an agent. You talk, agents work.
+
+1. **You ask Robyx for something.** *"I need a workspace that monitors my servers."*
+2. **Robyx creates it on the fly.** A new topic appears, Robyx writes the agent's brief from your description, registers it in the scheduler, and spawns it. Zero config files.
+3. **You talk to the new agent in its topic.** It owns the work. Every message is contextually its own. If it needs a cross-functional skill, it asks a specialist via `[REQUEST @name: …]`.
+4. **You can delegate, focus, or jump topics.** `[FOCUS @agent]` routes your next messages straight to it; `[FOCUS off]` returns to Robyx.
+5. **Long-running work gets its own channel.** Ask any workspace for an iterative research or optimization loop and it spins up a **continuous task**: dedicated 🔄 topic, git branch, state file, automatic step-by-step execution. Write in that topic to interrupt — the running step is killed instantly and your message is processed.
+6. **Reminders and timers are native.** Any agent can emit `[REMIND in="1h" text="…"]` or `[REMIND at="…" agent="…" text="…"]` to schedule a message or an autonomous run. No code, no external cron.
+7. **Everything survives restarts.** State, queue, continuous task progress, scheduled jobs — all persisted under `data/`. Late-firing on recovery means no event is lost if the bot was offline.
+
+---
+
+## Main Features
+
+- **Build your team by talking** — workspaces, specialists, and agent briefs created from chat. No YAML, no dashboards.
+- **Three messaging platforms** — Telegram, Discord, Slack. Switch at any time; all workspaces and memory are preserved.
+- **Three AI backends** — Claude Code, Codex, OpenCode. Pick per-agent via semantic aliases (`fast`, `balanced`, `powerful`) or explicit model IDs in `models.yaml`.
+- **Unified 60 s scheduler** — reminders, one-shot, periodic, and continuous tasks in a single queue (`data/queue.json`) with atomic claims and late-firing on recovery.
+- **Continuous autonomous tasks** — step-by-step research/optimization loops with per-task git branch, structured state, user-pausable, user-interruptible in real time.
+- **Agent interruption** — any message to a busy agent immediately (SIGTERM → 5 s grace → SIGKILL) stops the current step and processes your new request.
+- **Memory system** — per-agent active + archive tiers, integrated with Claude Code memory files.
+- **Voice + images** — voice transcription via Whisper, agent-initiated image delivery (explicit `[SEND_IMAGE …]` only, never proactive).
+- **Safe auto-updates** — tag-based releases, pre-update snapshot, smoke test, atomic rollback on failure; migration chain runs once per version.
+- **Autonomous-by-default permissions** — CLI backends run with permissions to act; you stay in charge via chat.
+- **Production-grade service** — launchd / systemd / Task Scheduler installers with keep-alive, logs, single-instance lock.
+
+---
+
 ## Documentation
 
 | Topic | What's inside |

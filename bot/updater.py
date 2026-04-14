@@ -270,11 +270,30 @@ async def _git(*args, check=True) -> subprocess.CompletedProcess:
 
 
 async def fetch_remote_tags() -> list[str]:
-    """Fetch tags from origin and return all version tags sorted ascending."""
-    await _git("fetch", "--tags", "--force")
-    result = await _git("tag", "--list", "v*", "--sort=version:refname")
-    tags = [t.strip() for t in result.stdout.splitlines() if t.strip()]
-    return tags
+    """List version tags on origin, sorted ascending.
+
+    Uses ``git ls-remote`` so we only do a lightweight ref lookup instead of
+    a full ``git fetch --tags`` (which transfers tag objects and grows slower
+    as the number of releases grows).
+    """
+    result = await _git("ls-remote", "--tags", "--refs", "origin", "v*")
+    seen = set()
+    for line in result.stdout.splitlines():
+        # Format: "<sha>\trefs/tags/<name>"; --refs strips peeled "^{}" lines.
+        parts = line.split("refs/tags/", 1)
+        if len(parts) != 2:
+            continue
+        name = parts[1].strip()
+        if name:
+            seen.add(name)
+
+    def _key(tag):
+        try:
+            return Version(tag.lstrip("v"))
+        except Exception:
+            return Version("0")
+
+    return sorted(seen, key=_key)
 
 
 def _get_latest_remote_version(tags: list[str]) -> str | None:
@@ -292,12 +311,19 @@ async def _get_release_notes_for(version: str, tags: list[str]) -> dict | None:
     if tag not in tags:
         return None
 
-    # Read the release notes file from the tag
-    result = await _git("show", "%s:releases/%s.md" % (tag, version), check=False)
-    if result.returncode != 0:
-        return None
+    # fetch_remote_tags() uses ls-remote and does not download tag objects,
+    # so the tag may not exist locally yet. Fetch just this one tag.
+    show = await _git("show", "%s:releases/%s.md" % (tag, version), check=False)
+    if show.returncode != 0:
+        try:
+            await _git("fetch", "origin", "tag", tag, "--no-tags")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return None
+        show = await _git("show", "%s:releases/%s.md" % (tag, version), check=False)
+        if show.returncode != 0:
+            return None
 
-    return _parse_release_notes(result.stdout)
+    return _parse_release_notes(show.stdout)
 
 
 # ── Check for updates ──

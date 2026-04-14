@@ -239,12 +239,16 @@ class TestGit:
 class TestFetchRemoteTags:
     @pytest.mark.asyncio
     async def test_fetches_and_returns_tags(self):
+        ls_remote_out = (
+            "abc123\trefs/tags/v0.2.0\n"
+            "def456\trefs/tags/v0.1.0\n"
+            "ghi789\trefs/tags/v0.3.0\n"
+        )
+
         async def fake_git(*args, check=True):
-            if "fetch" in args:
-                return subprocess.CompletedProcess(["git", *args], 0, "", "")
-            if "tag" in args:
+            if "ls-remote" in args:
                 return subprocess.CompletedProcess(
-                    ["git", *args], 0, "v0.1.0\nv0.2.0\nv0.3.0\n", "",
+                    ["git", *args], 0, ls_remote_out, "",
                 )
             return subprocess.CompletedProcess(["git", *args], 0, "", "")
 
