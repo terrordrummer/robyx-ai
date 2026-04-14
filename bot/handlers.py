@@ -891,6 +891,11 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             msg.user_id, msg.chat_id, msg.thread_id, len(text),
         )
 
+        try:
+            await platform.send_typing(msg.chat_id, msg.thread_id)
+        except Exception:
+            pass
+
         await _route_and_process(platform, msg, msg_ref, text)
 
     return {
