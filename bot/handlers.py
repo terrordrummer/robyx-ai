@@ -895,10 +895,21 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             msg.user_id, msg.chat_id, msg.thread_id, len(text),
         )
 
-        try:
-            await platform.send_typing(msg.chat_id, msg.thread_id)
-        except Exception:
-            pass
+        # Fire the typing indicator as a background task so the handler
+        # doesn't block on Telegram's roundtrip — even with the
+        # persistent httpx client, we want subsequent message processing
+        # to start in parallel. The continuous loop in _process_and_send
+        # keeps refreshing typing every 4s thereafter.
+        async def _early_typing():
+            try:
+                await platform.send_typing(msg.chat_id, msg.thread_id)
+            except Exception as e:
+                log.warning(
+                    "Early typing send failed (chat=%s thread=%s): %s",
+                    msg.chat_id, msg.thread_id, e,
+                )
+
+        asyncio.create_task(_early_typing())
 
         await _route_and_process(platform, msg, msg_ref, text)
 

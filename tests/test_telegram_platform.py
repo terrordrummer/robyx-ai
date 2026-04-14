@@ -94,7 +94,7 @@ class TestSendMessageRawHttpx:
             async def __aexit__(self, *exc):
                 return False
 
-            async def post(self, url, data=None):
+            async def post(self, url, data=None, **kwargs):
                 captured["url"] = url
                 captured["data"] = data
                 return _FakeResponse()
@@ -130,7 +130,7 @@ class TestSendMessageRawHttpx:
             async def __aexit__(self, *exc):
                 return False
 
-            async def post(self, url, data=None):
+            async def post(self, url, data=None, **kwargs):
                 captured["data"] = data
                 return _FakeResponse()
 
@@ -154,7 +154,7 @@ class TestSendMessageRawHttpx:
             async def __aexit__(self, *exc):
                 return False
 
-            async def post(self, url, data=None):
+            async def post(self, url, data=None, **kwargs):
                 return _FakeResponse()
 
         monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **k: _FakeClient())
@@ -163,3 +163,146 @@ class TestSendMessageRawHttpx:
             await telegram_platform.send_message(
                 chat_id=-100999, text="x", thread_id=0,
             )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Persistent httpx client (v0.20.16): every Telegram API call must
+# reuse a single AsyncClient so connection pooling actually works.
+# Pre-0.20.16 each ``send_typing`` / ``send_message`` instantiated a
+# fresh client → cold TLS handshake on every call → 200-500ms latency
+# on the first send after a quiet period (the root cause of the
+# "typing doesn't appear immediately in Headquarters" bug).
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestPersistentHttpxClient:
+    @pytest.mark.asyncio
+    async def test_get_client_returns_same_instance_across_calls(self, telegram_platform):
+        c1 = telegram_platform._get_client()
+        c2 = telegram_platform._get_client()
+        c3 = telegram_platform._get_client()
+        assert c1 is c2 is c3, "platform must reuse a single AsyncClient"
+
+    @pytest.mark.asyncio
+    async def test_send_typing_does_not_create_a_new_client_per_call(
+        self, telegram_platform, monkeypatch,
+    ):
+        """Track AsyncClient construction count: must be 1 even after N
+        send_typing calls. This is the regression guard for the
+        cold-handshake-per-call latency bug."""
+        instances: list = []
+
+        class _FakeResponse:
+            def json(self):
+                return {"ok": True}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                instances.append(self)
+
+            async def post(self, url, data=None, **kwargs):
+                return _FakeResponse()
+
+            async def aclose(self):
+                pass
+
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+        # Reset any previously-cached client (the fixture may have
+        # constructed one via the real httpx).
+        telegram_platform._client = None
+
+        for _ in range(5):
+            await telegram_platform.send_typing(chat_id=-100999, thread_id=None)
+
+        assert len(instances) == 1, (
+            "expected exactly 1 AsyncClient across 5 send_typing calls, "
+            "got %d — connection pooling is broken" % len(instances)
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_typing_omits_thread_id_for_general_topic(
+        self, telegram_platform, monkeypatch,
+    ):
+        """Headquarters = General topic = ``thread_id=None``. Typing
+        must be sent WITHOUT ``message_thread_id`` so Telegram displays
+        it in General. Passing 0 (an earlier mistake) was rejected by
+        recent Bot API versions and silently produced no indicator."""
+        captured: dict = {}
+
+        class _FakeResponse:
+            def json(self):
+                return {"ok": True}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def post(self, url, data=None, **kwargs):
+                captured["url"] = url
+                captured["data"] = data
+                return _FakeResponse()
+
+            async def aclose(self):
+                pass
+
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+        telegram_platform._client = None
+
+        await telegram_platform.send_typing(chat_id=-100999, thread_id=None)
+
+        assert captured["url"].endswith("/sendChatAction")
+        assert captured["data"]["chat_id"] == -100999
+        assert captured["data"]["action"] == "typing"
+        assert "message_thread_id" not in captured["data"]
+
+    @pytest.mark.asyncio
+    async def test_send_typing_includes_thread_id_for_forum_topic(
+        self, telegram_platform, monkeypatch,
+    ):
+        """Forum topics (thread_id != None) must include
+        ``message_thread_id`` so the indicator lands in the right
+        topic instead of leaking into General."""
+        captured: dict = {}
+
+        class _FakeResponse:
+            def json(self):
+                return {"ok": True}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def post(self, url, data=None, **kwargs):
+                captured["data"] = data
+                return _FakeResponse()
+
+            async def aclose(self):
+                pass
+
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+        telegram_platform._client = None
+
+        await telegram_platform.send_typing(chat_id=-100999, thread_id=42)
+
+        assert captured["data"]["message_thread_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_aclose_resets_client(self, telegram_platform, monkeypatch):
+        """``aclose`` must close the cached client and clear the cache
+        so the next call lazy-creates a fresh one — important for
+        clean shutdown and for tests that swap mocks."""
+        closed_calls = {"n": 0}
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def aclose(self):
+                closed_calls["n"] += 1
+
+        monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+        telegram_platform._client = None
+        telegram_platform._get_client()  # creates one
+        await telegram_platform.aclose()
+        assert closed_calls["n"] == 1
+        assert telegram_platform._client is None
