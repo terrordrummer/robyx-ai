@@ -319,11 +319,18 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             )
 
     async def _process_and_send(agent, message, chat_id, platform, thread_id=None):
+        stop_typing = asyncio.Event()
+
+        async def _typing_loop():
+            while not stop_typing.is_set():
+                try:
+                    await platform.send_typing(chat_id, thread_id)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+
+        typing_task = asyncio.create_task(_typing_loop())
         try:
-            try:
-                await platform.send_typing(chat_id, thread_id)
-            except Exception:
-                pass
             is_robyx = agent.name == "robyx"
             response = await invoke_ai(
                 agent, message, chat_id, platform, manager, backend, is_robyx, thread_id=thread_id,
@@ -376,6 +383,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
                 STRINGS["ai_error"] % str(e),
                 thread_id=thread_id,
             )
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
 
     async def _handle_workspace_commands(response, chat_id, platform, thread_id):
         """Parse and execute workspace/specialist creation/closure commands from Robyx."""
