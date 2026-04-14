@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.20.20
+
+### Added (agents)
+- **`templates/prompt_workspace_agent.md`** — new "Continuous Tasks" section. Workspace agents now know when to run the CONTINUOUS_SETUP interview (research loops, optimization cycles, iterative long-running work) and how to emit `[CREATE_CONTINUOUS …]` + `[CONTINUOUS_PROGRAM]{…}[/CONTINUOUS_PROGRAM]` themselves. Previously this capability was only documented for the orchestrator, so workspace agents would execute iterative work in-chat instead of creating the dedicated 🔄 topic. No handler changes needed — `bot/handlers.py:511-557` already accepted `CREATE_CONTINUOUS` from any agent.
+
+### Changed (performance)
+- **`bot/updater.py`** — `fetch_remote_tags()` switched from `git fetch --tags --force` to `git ls-remote --tags --refs origin v*`, a lightweight ref lookup. Tag objects are now lazy-fetched only when `_get_release_notes_for()` actually reads a specific tag, with graceful fallback on fetch failure.
+
+### Changed (docs)
+- **`README.md`** — inserted two new sections between "Why Robyx" and the Documentation table: **Core Concepts** (roles × task types tables) and **How Orchestration Works in Practice** (seven-step narrative flow), plus a single-glance **Main Features** bulleted list. Readers now get the full picture without having to click through to `docs/`.
+
+### Tests
+979 passed, 1 skipped. `tests/test_updater.py` updated to mock the new `ls-remote` flow.
+
+### Migration
+None. `bot/migrations/v0_20_20.py` is a no-op.
+
 ## 0.20.19
 
 ### Added (P3 — performance)
