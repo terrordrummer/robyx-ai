@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.20.19
+
+### Added (P3 — performance)
+- **`bot/ai_invoke.py`** — `_load_agent_instructions()` caches the assembled payload by file mtime; the disk read now happens once per brief edit instead of once per turn. Invalidation is automatic (any write to `agents/<name>.md` / `specialists/<name>.md` bumps mtime).
+- **`bot/ai_invoke.py`** — system-prompt assembly hard-truncates at 50 000 words (~65k tokens) with a visible marker, preventing context-window exhaustion from large agent briefs or archived memory. Existing 30 000-word WARN stays as an early signal.
+- **`bot/scheduler.py`** — queue-size watchdog WARNs once when `queue.json` crosses 500 entries, so operators can prune before scheduler-tick cost grows. Resets under 250 to re-arm.
+
+### Skipped (P3)
+- In-memory queue index — evaluated and rejected; at the current scale the O(n) scan cost is not measurable and maintaining an index under `_queue_mutex()` would add four invariants for no practical gain. The size watchdog covers the growth case.
+
+### Added (P4 — DX / docs)
+- **`docs/data-directory.md`** (new) — full contract for every file under `data/`: writer, deletion safety, backup, recovery. Linked from the README docs table.
+- **`docs/scheduler.md`** — new "Timing precision" section documenting the single-tick cadence, offline-recovery guarantee (no event lost), drift-free periodic re-arm via `_next_run_after()`, and the state-file-driven nature of continuous tasks.
+- **`tests/test_integration_p0_p3.py`** (new) — 8 regression tests pinning down: fcntl sidecar, concurrent save round-trip, stale claim ERROR escalation, reminder max-age expiry, startup lock cleanup, instructions-cache hit and mtime invalidation.
+
+### Tests
+979 passed (+8 integration), 1 skipped. No regressions.
+
+### Plan closed
+Every bucket of the architecture review plan (P0–P4) is now implemented or explicitly rationalised. Two items skipped with documented reasoning (single-pass pattern extraction in v0.20.18, queue index here). See `releases/0.20.19.md` for the full recap.
+
+### Migration
+None — all changes are code-path optimisations. `bot/migrations/v0_20_19.py` is a no-op.
+
 ## 0.20.18
 
 ### Changed (P2 — simplification)

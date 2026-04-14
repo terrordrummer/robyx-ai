@@ -19,6 +19,18 @@ Robyx has a **unified scheduler** that runs every 60 seconds (configurable via `
 
 The scheduler dispatches one step at a time. Each step: executes, commits its changes, updates the state, and plans the next step. The scheduler picks up the next step on the following cycle. This is how you can say "refactor the auth module into smaller files" and walk away — the agent works through it methodically, one step at a time.
 
+## Timing precision
+
+The scheduler ticks every `SCHEDULER_INTERVAL` seconds (default 60). That is the only cadence — there is no per-event wakeup. Consequences:
+
+- **Reminders are fired with up to one tick of delay.** A reminder set for `12:00:00` on a 60-second scheduler actually fires between `12:00:00` and `12:01:00`, whenever the next tick lands. This is fine for human-scale reminders (appointments, deadlines) but not for sub-minute precision. Reduce `SCHEDULER_INTERVAL` if you need tighter timing — at the cost of 60× more disk reads of `data/queue.json`.
+
+- **There is no jitter or drift between bot restarts.** Every tick dispatches every entry whose `fire_at` or `scheduled_at` / `next_run` is already in the past. A reminder whose firing window passed while the bot was down fires on the next tick after restart (late by the outage + up to one tick). Offline recovery is deterministic: **no event is lost**, everything lands as soon as the scheduler wakes up again.
+
+- **Periodic tasks re-arm from the real clock, not from the previous run.** If a daily task was scheduled for `09:00` and fired 20 minutes late at `09:20` (bot was busy or offline), the next run is still set for `next_day 09:00`, not `next_day 09:20`. `_next_run_after()` advances `run_at` by full intervals until it is strictly in the future, so drift does not accumulate.
+
+- **Continuous tasks are not claim-based.** They re-check their state file every tick and spawn the next step whenever `is_ready_for_next_step(state)` is true. Rate-limited tasks retry on the following tick; `awaiting-input` and `paused` states are skipped silently until the user changes them.
+
 ## Agent interruption
 
 Any user message to a busy agent **interrupts the running subprocess immediately** (SIGTERM → 5s grace → SIGKILL). Your message is processed right away instead of queuing behind the current task. This works for all agent types — interactive, scheduled, or continuous. You can always stop, redirect, or interact with an agent mid-task.
