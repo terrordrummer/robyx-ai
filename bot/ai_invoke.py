@@ -189,6 +189,12 @@ def _normalize_backend_response(parsed_response):
     return parsed_response or "", None
 
 
+# mtime-keyed cache: invalidates automatically when the on-disk brief
+# changes (edits from chat commands, manual edits, `/reset`, migration,
+# etc.) without needing a separate pub-sub hook. Keyed by absolute path.
+_instructions_cache: dict[str, tuple[float, str]] = {}
+
+
 def _load_agent_instructions(agent: Agent) -> str:
     """Return the workspace/specialist markdown instructions, ready to append.
 
@@ -197,7 +203,9 @@ def _load_agent_instructions(agent: Agent) -> str:
     own per-agent instructions in ``agents/<name>.md`` /
     ``specialists/<name>.md``. This loader injects them into the system
     prompt at invocation time so interactive turns honour the same brief
-    that scheduled runs already see.
+    that scheduled runs already see. The assembled payload is cached by
+    file mtime so the disk read happens once per brief edit, not once per
+    turn.
     """
     if agent.agent_type == "workspace":
         path = AGENTS_DIR / (agent.name + ".md")
@@ -207,13 +215,23 @@ def _load_agent_instructions(agent: Agent) -> str:
         return ""
 
     if not path.exists():
+        _instructions_cache.pop(str(path), None)
         return ""
+
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return ""
+
+    key = str(path)
+    cached = _instructions_cache.get(key)
+    if cached and cached[0] == mtime:
+        return cached[1]
 
     instructions = path.read_text().strip()
-    if not instructions:
-        return ""
-
-    return "\n\n## Agent Instructions\n" + instructions
+    payload = "\n\n## Agent Instructions\n" + instructions if instructions else ""
+    _instructions_cache[key] = (mtime, payload)
+    return payload
 
 
 def _agent_model_role(agent: Agent) -> str:
@@ -325,16 +343,31 @@ async def _invoke_ai_locked(
         memory_instr = get_memory_instructions(agent.name, agent.agent_type, agent.work_dir)
         system_prompt = system_prompt + memory_ctx + "\n\n" + memory_instr
 
-        # Warn when the assembled system prompt is unusually large. A rough
-        # word-to-token ratio of 1.3 gives a conservative estimate; the hard
-        # ceiling depends on the model but 30 000 words (~40k tokens) already
-        # eats a significant chunk of any context window.
-        _prompt_words = len(system_prompt.split())
-        if _prompt_words > 30_000:
+        # Guard against runaway system prompts. Warn at 30 000 words
+        # (~40k tokens) and hard-truncate above 50 000 words — beyond
+        # that the context window is effectively consumed before the
+        # user's message even arrives. Truncation clips from the end
+        # (memory context is appended last) and stamps a visible
+        # marker so the agent can see that content was dropped.
+        _prompt_words = system_prompt.split()
+        if len(_prompt_words) > 50_000:
+            keep = _prompt_words[:50_000]
+            system_prompt = (
+                " ".join(keep)
+                + "\n\n[... system prompt truncated at 50 000 words"
+                + " (was %d). Archive memory or trim agent instructions. ...]"
+                % len(_prompt_words)
+            )
+            log.error(
+                "System prompt for %s truncated: %d → 50 000 words. "
+                "Agent instructions + memory must be reduced.",
+                agent.name, len(_prompt_words),
+            )
+        elif len(_prompt_words) > 30_000:
             log.warning(
                 "System prompt for %s is very large (%d words, ~%dk tokens). "
                 "Consider trimming agent instructions or archiving memory.",
-                agent.name, _prompt_words, int(_prompt_words * 1.3 / 1000),
+                agent.name, len(_prompt_words), int(len(_prompt_words) * 1.3 / 1000),
             )
 
     # Build command. Only reuse a stored session id if the backend can

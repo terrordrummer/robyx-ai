@@ -44,6 +44,7 @@ No marketplace. No pre-packaged skills. No vendor lock-in. Just a simple system 
 | [AI Backends](docs/backends.md) | Claude Code / Codex / OpenCode, autonomous-by-default permissions, `models.yaml` |
 | [Voice + Images](docs/media.md) | Voice transcription via Whisper, agent-initiated image delivery |
 | [Auto-Updates + Migrations + Service Management](docs/updates.md) | Update flow with snapshots & smoke tests, migration framework, service installers |
+| [Data Directory Contract](docs/data-directory.md) | What lives under `data/`, who writes it, what is safe to delete, backup & recovery |
 
 Two more useful refs at the repo root:
 - [`ORCHESTRATOR.md`](ORCHESTRATOR.md) — Robyx's behaviour reference (`[REMIND]`, `[DELEGATE]`, etc.)

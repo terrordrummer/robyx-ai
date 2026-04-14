@@ -123,11 +123,33 @@ def load_queue() -> list[dict]:
         return _load_queue_unlocked()
 
 
+# Size at which the next queue scan is expensive enough to warrant a
+# heads-up. At 500 entries the full-list scan under ``_queue_mutex``
+# starts adding perceptible latency to every mutation; an explicit log
+# line lets operators archive or prune before the scheduler tick starts
+# missing its 60 s budget. Purely observational — no behaviour change.
+_QUEUE_SIZE_WARN = 500
+_queue_size_warned = False
+
+
 def _save_queue_unlocked(entries: list[dict]) -> None:
     QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = QUEUE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(entries, indent=2, ensure_ascii=False))
     os.replace(tmp, QUEUE_FILE)
+
+    global _queue_size_warned
+    if len(entries) >= _QUEUE_SIZE_WARN and not _queue_size_warned:
+        _queue_size_warned = True
+        log.warning(
+            "Queue has %d entries (warn threshold %d). Full-list scans "
+            "start dominating scheduler cycle cost beyond this point; "
+            "consider pruning dispatched/failed entries or archiving.",
+            len(entries), _QUEUE_SIZE_WARN,
+        )
+    elif len(entries) < _QUEUE_SIZE_WARN // 2:
+        # Reset so the next time the queue grows again we warn once more.
+        _queue_size_warned = False
 
 
 def save_queue(entries: list[dict]) -> None:
