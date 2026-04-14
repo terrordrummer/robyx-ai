@@ -266,13 +266,16 @@ class TestEnsureSingleInstance:
                 ensure_single_instance()
 
     def test_pid_reused_by_non_python(self, tmp_path):
+        """``ensure_single_instance`` runs before the event loop exists, so
+        it uses the ``*_sync`` process helpers. v0.20.6 split the async/sync
+        code paths — this test must mock the sync variants."""
         pid_file = tmp_path / "bot.pid"
         pid_file.write_text(str(os.getpid()))
 
         with patch.object(bot, "PID_FILE", pid_file), \
              patch("process.is_pid_alive", return_value=True), \
-             patch("process.is_bot_process", return_value=False), \
-             patch("process.get_process_name", return_value="vim"):
+             patch("process.is_bot_process_sync", return_value=False), \
+             patch("process.get_process_name_sync", return_value="vim"):
             ensure_single_instance()  # should NOT exit
 
         assert int(pid_file.read_text().strip()) == os.getpid()

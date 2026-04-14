@@ -204,7 +204,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             msg_ref, "Checking for updates (v%s)..." % get_current_version()
         )
         try:
-            info = await asyncio.get_event_loop().run_in_executor(None, check_for_updates)
+            info = await check_for_updates()
         except Exception as e:
             await platform.edit_message(sent_ref, STRINGS["update_fetch_error"] % str(e))
             return
@@ -271,7 +271,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
                 return
 
         try:
-            pending = await asyncio.get_event_loop().run_in_executor(None, get_pending_update)
+            pending = await get_pending_update()
         except Exception as e:
             await platform.edit_message(
                 sent_ref,

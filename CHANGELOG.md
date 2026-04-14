@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.20.13
+
+### Fixed
+- **`bot/updater.py`** — `get_pending_update()` was declared sync but called the async `fetch_remote_tags()` and `_get_release_notes_for()` without awaiting them, silently returning a dict whose values were unawaited coroutines. The function is now properly async.
+- **`bot/handlers.py`** — `cmd_checkupdate` and `cmd_doupdate` were wrapping the async `check_for_updates()` / `get_pending_update()` in `asyncio.run_in_executor`, which executed the coroutine factory in a thread and bubbled the unawaited coroutine back as `info` / `pending`. Replaced both with direct `await`s, fixing the user-visible "coroutine object is not subscriptable" error on `/checkupdate` and `/doupdate`.
+
+### Changed (test infrastructure)
+- **`tests/test_process.py`** — Rewrote 14 tests to await the async `get_process_name` / `is_bot_process` / `is_ai_process` (split from the sync `_sync` siblings in v0.20.6). Sync variants are now exercised by their own dedicated test classes so regressions in either path surface immediately.
+- **`tests/test_scheduler.py`** — 5 `TestCheckLock` tests converted to `@pytest.mark.asyncio` with `AsyncMock` patches for `is_ai_process`, matching the async `check_lock` contract.
+- **`tests/test_updater.py`** — 20 tests across `TestGit`, `TestFetchRemoteTags`, `TestGetReleaseNotesFor`, `TestCheckForUpdates`, `TestGetPendingUpdate(EdgeCases)` rewritten to `await` the async APIs and patch `asyncio.create_subprocess_exec` / `_git` / `fetch_remote_tags` / `_get_release_notes_for` with `AsyncMock`.
+- **`tests/test_handlers.py::TestCmdCheckUpdate`** — 5 tests now pass automatically thanks to the `cmd_checkupdate` production fix.
+- **`tests/test_bot.py::TestEnsureSingleInstance::test_pid_reused_by_non_python`** — was patching the now-async `is_bot_process` / `get_process_name` instead of the sync siblings actually called by the pre-event-loop startup path; now patches the `*_sync` variants.
+
+### Net result
+
+**0 test failures across the whole suite** (was 44 pre-existing). Two real production bugs in the update path fixed in the process. Every fix is covered by at least one regression test.
+
 ## 0.20.12
 
 ### Added

@@ -187,28 +187,36 @@ class TestParseReleaseNotes:
 # ── _git ──
 
 
-class TestGit:
-    @patch("updater.subprocess.run")
-    def test_calls_subprocess_with_correct_args(self, mock_run, tmp_path):
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=["git", "status"], returncode=0, stdout="", stderr=""
-        )
-        updater._git("status")
-        mock_run.assert_called_once_with(
-            ["git", "status"],
-            cwd=str(tmp_path),
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=True,
-        )
+def _async_proc(stdout: bytes = b"", stderr: bytes = b"", returncode: int = 0):
+    """Build an AsyncMock standing in for ``asyncio.subprocess.Process``."""
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.returncode = returncode
+    return proc
 
-    @patch("updater.subprocess.run")
-    def test_check_false(self, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess(
-            args=["git", "stash"], returncode=1, stdout="", stderr=""
-        )
-        result = updater._git("stash", check=False)
+
+class TestGit:
+    """``_git`` spawns subprocesses via :func:`asyncio.create_subprocess_exec`
+    (v0.20.6 converted it from synchronous ``subprocess.run``). Tests must
+    be async and patch the asyncio entry point."""
+
+    @pytest.mark.asyncio
+    async def test_calls_subprocess_with_correct_args(self, tmp_path):
+        proc = _async_proc()
+        with patch("updater.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as mock_exec:
+            await updater._git("status")
+            mock_exec.assert_awaited_once()
+            # First positional arg is the executable, followed by the git args.
+            args = mock_exec.await_args.args
+            assert args[0] == "git"
+            assert args[1] == "status"
+            assert mock_exec.await_args.kwargs.get("cwd") == str(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_check_false(self):
+        proc = _async_proc(returncode=1)
+        with patch("updater.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
+            result = await updater._git("stash", check=False)
         assert result.returncode == 1
 
 
@@ -216,17 +224,19 @@ class TestGit:
 
 
 class TestFetchRemoteTags:
-    @patch("updater.subprocess.run")
-    def test_fetches_and_returns_tags(self, mock_run):
-        def side_effect(args, **kwargs):
+    @pytest.mark.asyncio
+    async def test_fetches_and_returns_tags(self):
+        async def fake_git(*args, check=True):
             if "fetch" in args:
-                return subprocess.CompletedProcess(args, 0, "", "")
+                return subprocess.CompletedProcess(["git", *args], 0, "", "")
             if "tag" in args:
-                return subprocess.CompletedProcess(args, 0, "v0.1.0\nv0.2.0\nv0.3.0\n", "")
-            return subprocess.CompletedProcess(args, 0, "", "")
+                return subprocess.CompletedProcess(
+                    ["git", *args], 0, "v0.1.0\nv0.2.0\nv0.3.0\n", "",
+                )
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
 
-        mock_run.side_effect = side_effect
-        tags = updater.fetch_remote_tags()
+        with patch("updater._git", side_effect=fake_git):
+            tags = await updater.fetch_remote_tags()
         assert tags == ["v0.1.0", "v0.2.0", "v0.3.0"]
 
 
@@ -246,27 +256,31 @@ class TestGetLatestRemoteVersion:
 
 
 class TestGetReleaseNotesFor:
-    @patch("updater.subprocess.run")
-    def test_tag_found(self, mock_run):
+    @pytest.mark.asyncio
+    async def test_tag_found(self):
         notes_text = "---\nversion: 0.2.0\nbreaking: false\n---\nNew stuff.\n"
 
-        def side_effect(args, **kwargs):
+        async def fake_git(*args, check=True):
             if "show" in args:
-                return subprocess.CompletedProcess(args, 0, notes_text, "")
-            return subprocess.CompletedProcess(args, 0, "", "")
+                return subprocess.CompletedProcess(["git", *args], 0, notes_text, "")
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
 
-        mock_run.side_effect = side_effect
-        result = updater._get_release_notes_for("0.2.0", ["v0.1.0", "v0.2.0"])
+        with patch("updater._git", side_effect=fake_git):
+            result = await updater._get_release_notes_for("0.2.0", ["v0.1.0", "v0.2.0"])
         assert result is not None
         assert result["version"] == "0.2.0"
 
-    def test_tag_not_in_list(self):
-        assert updater._get_release_notes_for("0.9.0", ["v0.1.0"]) is None
+    @pytest.mark.asyncio
+    async def test_tag_not_in_list(self):
+        assert await updater._get_release_notes_for("0.9.0", ["v0.1.0"]) is None
 
-    @patch("updater.subprocess.run")
-    def test_git_show_fails(self, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess(["git"], 1, "", "fatal")
-        result = updater._get_release_notes_for("0.2.0", ["v0.2.0"])
+    @pytest.mark.asyncio
+    async def test_git_show_fails(self):
+        async def fake_git(*args, check=True):
+            return subprocess.CompletedProcess(["git", *args], 1, "", "fatal")
+
+        with patch("updater._git", side_effect=fake_git):
+            result = await updater._get_release_notes_for("0.2.0", ["v0.2.0"])
         assert result is None
 
 
@@ -274,66 +288,82 @@ class TestGetReleaseNotesFor:
 
 
 class TestCheckForUpdates:
-    @patch("updater._save_state")
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0"])
-    def test_no_new_version(self, mock_fetch, mock_save):
-        assert updater.check_for_updates() is None
+    """``check_for_updates`` is async (since v0.20.6) and calls
+    :func:`fetch_remote_tags` / :func:`_get_release_notes_for` which are
+    also async. Patches must use :class:`AsyncMock`, and the coroutine
+    must be awaited."""
 
-    @patch("updater._save_state")
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0", "v0.2.0"])
-    def test_already_notified(self, mock_fetch, mock_save, tmp_path):
+    @pytest.mark.asyncio
+    async def test_no_new_version(self):
+        with patch("updater._save_state"), \
+             patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0"])):
+            assert await updater.check_for_updates() is None
+
+    @pytest.mark.asyncio
+    async def test_already_notified(self, tmp_path):
         _write_state(tmp_path, {
             "notified_versions": ["0.2.0"],
             "last_check": None,
             "last_update": None,
             "update_history": [],
         })
-        assert updater.check_for_updates() is None
+        with patch("updater._save_state"), \
+             patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0", "v0.2.0"])):
+            assert await updater.check_for_updates() is None
 
-    @patch("updater._save_state")
-    @patch("updater._get_release_notes_for", return_value=None)
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0", "v0.2.0"])
-    def test_new_version_available(self, mock_fetch, mock_notes, mock_save):
-        result = updater.check_for_updates()
+    @pytest.mark.asyncio
+    async def test_new_version_available(self):
+        with patch("updater._save_state"), \
+             patch("updater._get_release_notes_for", new=AsyncMock(return_value=None)), \
+             patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0", "v0.2.0"])):
+            result = await updater.check_for_updates()
         assert result is not None
         assert result["version"] == "0.2.0"
         assert result["status"] == "available"
 
-    @patch("updater._save_state")
-    @patch("updater._get_release_notes_for")
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0", "v0.2.0"])
-    def test_breaking_update(self, mock_fetch, mock_notes, mock_save):
-        mock_notes.return_value = {
+    @pytest.mark.asyncio
+    async def test_breaking_update(self):
+        notes = {
             "version": "0.2.0", "min_compatible": "0.0.0",
             "breaking": True, "requires_migration": False,
             "body": "", "migration_steps": [],
         }
-        result = updater.check_for_updates()
+        with patch("updater._save_state"), \
+             patch("updater._get_release_notes_for", new=AsyncMock(return_value=notes)), \
+             patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0", "v0.2.0"])):
+            result = await updater.check_for_updates()
         assert result["status"] == "breaking"
 
-    @patch("updater._save_state")
-    @patch("updater._get_release_notes_for")
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0", "v0.3.0"])
-    def test_incompatible(self, mock_fetch, mock_notes, mock_save):
-        mock_notes.return_value = {
+    @pytest.mark.asyncio
+    async def test_incompatible(self):
+        notes = {
             "version": "0.3.0", "min_compatible": "0.2.0",
             "breaking": False, "requires_migration": False,
             "body": "", "migration_steps": [],
         }
-        result = updater.check_for_updates()
+        with patch("updater._save_state"), \
+             patch("updater._get_release_notes_for", new=AsyncMock(return_value=notes)), \
+             patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0", "v0.3.0"])):
+            result = await updater.check_for_updates()
         assert result["status"] == "incompatible"
 
-    @patch("updater.fetch_remote_tags", side_effect=subprocess.CalledProcessError(1, "git"))
-    def test_fetch_tags_fails(self, mock_fetch):
-        assert updater.check_for_updates() is None
+    @pytest.mark.asyncio
+    async def test_fetch_tags_fails(self):
+        with patch(
+            "updater.fetch_remote_tags",
+            new=AsyncMock(side_effect=subprocess.CalledProcessError(1, "git")),
+        ):
+            assert await updater.check_for_updates() is None
 
-    @patch("updater._save_state")
-    @patch("updater._get_release_notes_for", return_value=None)
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0", "v0.2.0"])
-    def test_saves_notification_in_state(self, mock_fetch, mock_notes, mock_save):
-        updater.check_for_updates()
-        mock_save.assert_called_once()
-        saved = mock_save.call_args[0][0]
+    @pytest.mark.asyncio
+    async def test_saves_notification_in_state(self):
+        save_spy = MagicMock()
+        with patch("updater._save_state", save_spy), \
+             patch("updater._get_release_notes_for", new=AsyncMock(return_value=None)), \
+             patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0", "v0.2.0"])):
+            await updater.check_for_updates()
+        save_spy.assert_called_once()
+        saved = save_spy.call_args[0][0]
         assert "0.2.0" in saved["notified_versions"]
         assert saved["last_check"] is not None
 
@@ -342,45 +372,58 @@ class TestCheckForUpdates:
 
 
 class TestGetPendingUpdate:
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0"])
-    def test_no_new_version(self, mock_fetch):
-        assert updater.get_pending_update() is None
+    """``get_pending_update`` was rewritten to be async in v0.20.13 — the
+    pre-fix version was sync but called async dependencies without awaiting,
+    which silently produced coroutines where dicts were expected. The
+    tests below also verify the recovered contract."""
 
-    @patch("updater._get_release_notes_for")
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0", "v0.2.0"])
-    def test_breaking_returns_none(self, mock_fetch, mock_notes):
-        mock_notes.return_value = {
+    @pytest.mark.asyncio
+    async def test_no_new_version(self):
+        with patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0"])):
+            assert await updater.get_pending_update() is None
+
+    @pytest.mark.asyncio
+    async def test_breaking_returns_none(self):
+        notes = {
             "version": "0.2.0", "min_compatible": "0.0.0",
             "breaking": True, "requires_migration": False,
             "body": "", "migration_steps": [],
         }
-        assert updater.get_pending_update() is None
+        with patch("updater._get_release_notes_for", new=AsyncMock(return_value=notes)), \
+             patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0", "v0.2.0"])):
+            assert await updater.get_pending_update() is None
 
-    @patch("updater._get_release_notes_for")
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0", "v0.3.0"])
-    def test_incompatible_returns_none(self, mock_fetch, mock_notes):
-        mock_notes.return_value = {
+    @pytest.mark.asyncio
+    async def test_incompatible_returns_none(self):
+        notes = {
             "version": "0.3.0", "min_compatible": "0.2.0",
             "breaking": False, "requires_migration": False,
             "body": "", "migration_steps": [],
         }
-        assert updater.get_pending_update() is None
+        with patch("updater._get_release_notes_for", new=AsyncMock(return_value=notes)), \
+             patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0", "v0.3.0"])):
+            assert await updater.get_pending_update() is None
 
-    @patch("updater._get_release_notes_for")
-    @patch("updater.fetch_remote_tags", return_value=["v0.1.0", "v0.2.0"])
-    def test_valid_pending_update(self, mock_fetch, mock_notes):
-        mock_notes.return_value = {
+    @pytest.mark.asyncio
+    async def test_valid_pending_update(self):
+        notes = {
             "version": "0.2.0", "min_compatible": "0.0.0",
             "breaking": False, "requires_migration": False,
             "body": "Improvements.", "migration_steps": [],
         }
-        result = updater.get_pending_update()
+        with patch("updater._get_release_notes_for", new=AsyncMock(return_value=notes)), \
+             patch("updater.fetch_remote_tags", new=AsyncMock(return_value=["v0.1.0", "v0.2.0"])):
+            result = await updater.get_pending_update()
         assert result is not None
         assert result["version"] == "0.2.0"
 
-    @patch("updater.fetch_remote_tags", side_effect=subprocess.CalledProcessError(1, "git"))
-    def test_fetch_fails(self, mock_fetch):
-        assert updater.get_pending_update() is None
+    @pytest.mark.asyncio
+    async def test_fetch_fails(self):
+        with patch(
+            "updater.fetch_remote_tags",
+            new=AsyncMock(side_effect=subprocess.CalledProcessError(1, "git")),
+        ):
+            assert await updater.get_pending_update() is None
 
 
 # ── apply_update ──
@@ -1078,8 +1121,9 @@ class TestParseReleaseNotesEdgeCases:
 
 
 class TestGetPendingUpdateEdgeCases:
-    @patch("updater.fetch_remote_tags", return_value=[])
-    def test_no_tags_returns_none(self, mock_fetch):
+    @pytest.mark.asyncio
+    async def test_no_tags_returns_none(self):
         """When fetch returns empty list, _get_latest_remote_version returns None,
-        so get_pending_update returns None (line 227: `not latest` branch)."""
-        assert updater.get_pending_update() is None
+        so get_pending_update returns None (no-latest branch)."""
+        with patch("updater.fetch_remote_tags", new=AsyncMock(return_value=[])):
+            assert await updater.get_pending_update() is None
