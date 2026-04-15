@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.20.23
+
+### Changed (message filtering)
+- **`bot/ai_invoke.py`** -- new `TTS_SUMMARY_PATTERN` regex that matches `[TTS_SUMMARY]...[/TTS_SUMMARY]` blocks.
+- **`bot/handlers.py`** -- outgoing responses are now stripped of TTS summary blocks before delivery to the platform. These blocks were redundant recaps of the message content, adding no value in chat.
+
+### Migration
+None. `bot/migrations/v0_20_23.py` is a no-op.
+
 ## 0.20.22
 
 ### Fixed (updater hardening — root cause)

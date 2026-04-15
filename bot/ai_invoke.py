@@ -82,6 +82,12 @@ SEND_IMAGE_PATTERN = re.compile(
     r'\[SEND_IMAGE\s+path="([^"]+)"(?:\s+caption="([^"]*)")?\s*\]'
 )
 
+# TTS summary block: [TTS_SUMMARY]...[/TTS_SUMMARY]
+# Stripped before sending to the platform — redundant recap of the response.
+TTS_SUMMARY_PATTERN = re.compile(
+    r'\[TTS_SUMMARY\].*?\[/TTS_SUMMARY\]', re.DOTALL
+)
+
 # Schedule a reminder: [REMIND at="2026-04-08T17:32:00+02:00" text="..."]
 # or [REMIND in="2m" text="..."] or [REMIND in="1h30m" text="..." thread="903"]
 # Attributes can appear in any order. The bot defaults `thread` to the agent's
