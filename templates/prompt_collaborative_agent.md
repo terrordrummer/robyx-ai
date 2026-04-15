@@ -70,6 +70,17 @@ You can schedule reminders with the [REMIND ...] pattern:
 When performing multi-step tasks:
 - Emit [STATUS description] before each major step.
 
+## Workspace management commands
+
+The following commands are handled by the system (not by you). If a user
+asks about them, explain what they do:
+
+- `/promote <user_id>` — Promote a participant to operator (owner only)
+- `/demote <user_id>` — Demote an operator to participant (owner only)
+- `/role` — Show all users and their roles
+- `/mode intelligent|passive` — Switch interaction mode (owner only)
+- `/close` — Close this collaborative workspace (creator only)
+
 ## Returning to Robyx
 
 If the owner says something like "back to Robyx", "return to main",

@@ -145,4 +145,48 @@ Three ways to interact with a workspace agent:
 
 ---
 
+## Collaborative Workspaces
+
+Collaborative workspaces let external collaborators join a **separate Telegram group** with a dedicated AI agent. Unlike standard workspaces (which live as topics in the HQ supergroup and are owner-only), collaborative workspaces support multiple users with role-based authorization.
+
+### Roles
+
+| Role | Can talk | Executive instructions | Manage roles | Close workspace |
+|------|----------|----------------------|--------------|-----------------|
+| **Owner** | Yes | Yes | Yes | Yes |
+| **Operator** | Yes | Yes | No | No |
+| **Participant** | Yes | No | No | No |
+
+- The bot owner (from `.env`) is always treated as Owner in every collaborative workspace.
+- The person who creates the workspace starts as Owner.
+- New group members are auto-registered as Participants.
+- Messages from executive users (Owner/Operator) are tagged with `[EXECUTIVE]` so the agent knows to follow their instructions. Participant messages are context-only.
+
+### Interaction Modes
+
+- **Intelligent** (default) — the agent receives every message and decides autonomously whether to respond. It speaks when addressed, when it can help, or when it detects errors. It stays silent (via `[SILENT]`) when the conversation does not need it.
+- **Passive** — the agent only responds when explicitly @mentioned or when an executive user sends a direct instruction.
+
+### Creation Flows
+
+**Flow A (planned):** Robyx or a workspace agent creates a pending collaborative workspace, then the owner adds the bot to a new Telegram group. The bot matches the pending request and configures itself automatically.
+
+**Flow B (ad-hoc):** The owner adds the bot to a group with no prior setup. The bot creates a provisional workspace and asks directly in the group what it should focus on and whether to inherit from an existing workspace.
+
+### In-Group Commands
+
+These commands work inside a collaborative workspace group:
+
+- `/promote <user_id>` — Promote a participant to operator (owner only)
+- `/demote <user_id>` — Demote an operator to participant (owner only)
+- `/role` — Show all users and their roles
+- `/mode intelligent|passive` — Switch interaction mode (owner only)
+- `/close` — Close the workspace (creator only)
+
+### Data
+
+Collaborative workspace state is persisted in `data/collaborative_workspaces.json`. Each workspace tracks its chat_id, roles, interaction mode, invite link, and parent workspace reference.
+
+---
+
 ← [Back to README](../README.md)
