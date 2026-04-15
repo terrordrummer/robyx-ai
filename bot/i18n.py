@@ -120,6 +120,21 @@ STRINGS = {
     ),
     "update_auto_failed": "Auto-update to v%s failed: %s\nUse `/doupdate` to retry manually.",
 
+    # Collaborative workspaces
+    "collab_promote_usage": "Usage: /promote <user_id>",
+    "collab_demote_usage": "Usage: /demote <user_id>",
+    "collab_mode_usage": "Usage: /mode <intelligent|passive>",
+    "collab_not_owner": "Only the owner can do this.",
+    "collab_user_not_found": "User %s is not in this workspace.",
+    "collab_promoted": "User %s promoted to *%s*.",
+    "collab_demoted": "User %s demoted to *%s*.",
+    "collab_cannot_change_owner": "Cannot change the owner's role.",
+    "collab_already_role": "User %s is already *%s*.",
+    "collab_mode_changed": "Interaction mode changed to *%s*.",
+    "collab_roles_title": "*Workspace roles:*\n",
+    "collab_close_confirm": "Collaborative workspace *%s* closed.",
+    "collab_close_denied": "Only the workspace creator can close it.",
+
     # Time formatting
     "time_now": "now",
     "time_minutes": "%dm ago",

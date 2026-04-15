@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.20.26
+
+### Added (collaborative workspaces)
+- **`bot/collaborative.py`** (new) -- data model for collaborative workspaces: `CollabWorkspace` dataclass with role management (Owner/Operator/Participant), interaction modes (intelligent/passive), and `CollabStore` persistence layer backed by `data/collaborative_workspaces.json`.
+- **`bot/authorization.py`** (new) -- authorization layer: `get_user_role()` resolves roles by chat context, `can_send_executive()`, `can_close_workspace()`, `can_manage_roles()` permission checks.
+- **`templates/prompt_collaborative_agent.md`** (new) -- system prompt for collaborative agents: multi-user awareness with `[UserName (role) [EXECUTIVE]]` sender annotations, intelligent/passive mode behavior, `[SILENT]` suppression pattern, documentation of in-group commands.
+
+### Changed
+- **`bot/handlers.py`** -- `make_handlers` accepts optional `collab_store` parameter. `handle_message` now checks for collaborative workspace context before applying `owner_only`. New `_handle_collaborative_message()` routes messages with role-based auth and message formatting. New `collab_bot_added()` handler implements Flow A (pending match) and Flow B (in-group ad-hoc setup). New lifecycle command handlers: `/promote`, `/demote`, `/role`, `/mode`, `/close` intercepted before AI routing.
+- **`bot/agents.py`** -- added `collab_workspace_id` field to Agent dataclass and serialization.
+- **`bot/ai_invoke.py`** -- added `SILENT_PATTERN` and `TTS_SUMMARY_PATTERN`; collaborative agents use `COLLABORATIVE_AGENT_SYSTEM_PROMPT`.
+- **`bot/bot.py`** -- registered `ChatMemberHandler` for bot-added-to-group events; added `user_name` to `PlatformMessage`; initialized `CollabStore`.
+- **`bot/config.py`** -- added `COLLABORATIVE_AGENT_SYSTEM_PROMPT`.
+- **`bot/messaging/base.py`** -- added `user_name` to `PlatformMessage` and `get_invite_link()` to `Platform`.
+- **`bot/messaging/telegram.py`** -- implemented `get_invite_link()` via `exportChatInviteLink`.
+- **`bot/i18n.py`** -- added 13 strings for collaborative workspace commands.
+- **`docs/architecture.md`** -- added Collaborative Workspaces section (roles, interaction modes, creation flows, in-group commands).
+
+### Tests
+997 passed, 1 skipped. New test files: `tests/test_collaborative.py` (20 tests), `tests/test_authorization.py` (9 tests), `tests/test_collab_handlers.py` (21 tests).
+
+### Migration
+None. `bot/migrations/v0_20_26.py` is a no-op (new feature, no existing data to migrate).
+
 ## 0.20.25
 
 ### Changed (docs)

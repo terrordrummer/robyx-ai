@@ -44,7 +44,7 @@ from updater import (
     apply_update,
     restart_service,
 )
-from collaborative import CollabStore
+from collaborative import CollabStore, CollabWorkspace
 from voice import is_available as voice_available, transcribe_voice
 
 log = logging.getLogger("robyx.handlers")
@@ -949,8 +949,11 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         Authorization is role-based: owner and operators can give executive
         instructions; participants can converse but the agent treats their
         messages as non-executive context.
+
+        Lifecycle commands (/promote, /demote, /role, /mode, /close) are
+        intercepted here before reaching the AI agent.
         """
-        from authorization import get_user_role, can_send_executive
+        from authorization import get_user_role, can_send_executive, can_manage_roles
         from collaborative import Role
 
         role, _ = get_user_role(
@@ -959,10 +962,18 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         )
 
         if role is None:
-            # Auto-register new group members as participants
             collab_ws.set_role(msg.user_id, Role.PARTICIPANT)
             collab_store._save()
             role = Role.PARTICIPANT
+
+        # ── Lifecycle commands (intercepted before AI) ──
+        text = (msg.text or "").strip()
+        if text.startswith("/"):
+            handled = await _handle_collab_command(
+                platform, msg, msg_ref, collab_ws, role,
+            )
+            if handled:
+                return
 
         agent = manager.get(collab_ws.agent_name)
         if not agent:
@@ -984,10 +995,8 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             if not mentioned and not is_executive:
                 return
             if not mentioned:
-                # Executive but no mention in passive mode — still process
                 pass
 
-        # Format message with sender context for the agent
         exec_tag = " [EXECUTIVE]" if is_executive else ""
         formatted_text = "[%s (%s)%s] %s" % (
             user_display, role.value, exec_tag, msg.text,
@@ -1010,6 +1019,161 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             agent, formatted_text, msg.chat_id, platform,
             thread_id=msg.thread_id,
         )
+
+    async def _handle_collab_command(platform, msg, msg_ref, collab_ws, role):
+        """Handle lifecycle commands inside a collaborative workspace group.
+
+        Returns True if the message was a recognized command (handled or
+        rejected), False if it should be passed to the AI agent.
+        """
+        from authorization import can_manage_roles
+        from collaborative import Role
+
+        text = (msg.text or "").strip()
+        parts = text.split(None, 1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd == "/promote":
+            if not can_manage_roles(role):
+                await platform.reply(msg_ref, STRINGS["collab_not_owner"])
+                return True
+            if not arg:
+                await platform.reply(msg_ref, STRINGS["collab_promote_usage"])
+                return True
+            target_id = _parse_user_id(arg)
+            if target_id is None:
+                await platform.reply(msg_ref, STRINGS["collab_promote_usage"])
+                return True
+            return await _collab_promote(platform, msg_ref, collab_ws, target_id)
+
+        if cmd == "/demote":
+            if not can_manage_roles(role):
+                await platform.reply(msg_ref, STRINGS["collab_not_owner"])
+                return True
+            if not arg:
+                await platform.reply(msg_ref, STRINGS["collab_demote_usage"])
+                return True
+            target_id = _parse_user_id(arg)
+            if target_id is None:
+                await platform.reply(msg_ref, STRINGS["collab_demote_usage"])
+                return True
+            return await _collab_demote(platform, msg_ref, collab_ws, target_id)
+
+        if cmd == "/role" or cmd == "/roles":
+            return await _collab_show_roles(platform, msg_ref, collab_ws)
+
+        if cmd == "/mode":
+            if not can_manage_roles(role):
+                await platform.reply(msg_ref, STRINGS["collab_not_owner"])
+                return True
+            if arg not in ("intelligent", "passive"):
+                await platform.reply(msg_ref, STRINGS["collab_mode_usage"])
+                return True
+            collab_store.update_interaction_mode(collab_ws.id, arg)
+            await platform.reply(
+                msg_ref,
+                STRINGS["collab_mode_changed"] % arg,
+                parse_mode="markdown",
+            )
+            return True
+
+        if cmd == "/close":
+            if msg.user_id != collab_ws.created_by and not (
+                _config.OWNER_ID and msg.user_id == _config.OWNER_ID
+            ):
+                await platform.reply(msg_ref, STRINGS["collab_close_denied"])
+                return True
+            collab_store.close(collab_ws.id)
+            await platform.reply(
+                msg_ref,
+                STRINGS["collab_close_confirm"] % collab_ws.display_name,
+                parse_mode="markdown",
+            )
+            try:
+                await platform.send_message(
+                    chat_id=_config.CHAT_ID or 0,
+                    text="Collaborative workspace *%s* has been closed." % collab_ws.display_name,
+                    thread_id=getattr(platform, "control_room_id", None),
+                    parse_mode="markdown",
+                )
+            except Exception as e:
+                log.warning("Failed to notify HQ about collab close: %s", e)
+            return True
+
+        return False
+
+    def _parse_user_id(text: str) -> int | None:
+        text = text.strip().lstrip("@")
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    async def _collab_promote(platform, msg_ref, collab_ws, target_id):
+        from collaborative import Role
+        current = collab_ws.get_role(target_id)
+        if current is None:
+            await platform.reply(
+                msg_ref, STRINGS["collab_user_not_found"] % target_id,
+            )
+            return True
+        if current == Role.OWNER:
+            await platform.reply(msg_ref, STRINGS["collab_cannot_change_owner"])
+            return True
+        if current == Role.OPERATOR:
+            await platform.reply(
+                msg_ref,
+                STRINGS["collab_already_role"] % (target_id, "operator"),
+                parse_mode="markdown",
+            )
+            return True
+        collab_store.update_roles(collab_ws.id, target_id, Role.OPERATOR)
+        await platform.reply(
+            msg_ref,
+            STRINGS["collab_promoted"] % (target_id, "operator"),
+            parse_mode="markdown",
+        )
+        return True
+
+    async def _collab_demote(platform, msg_ref, collab_ws, target_id):
+        from collaborative import Role
+        current = collab_ws.get_role(target_id)
+        if current is None:
+            await platform.reply(
+                msg_ref, STRINGS["collab_user_not_found"] % target_id,
+            )
+            return True
+        if current == Role.OWNER:
+            await platform.reply(msg_ref, STRINGS["collab_cannot_change_owner"])
+            return True
+        if current == Role.PARTICIPANT:
+            await platform.reply(
+                msg_ref,
+                STRINGS["collab_already_role"] % (target_id, "participant"),
+                parse_mode="markdown",
+            )
+            return True
+        collab_store.update_roles(collab_ws.id, target_id, Role.PARTICIPANT)
+        await platform.reply(
+            msg_ref,
+            STRINGS["collab_demoted"] % (target_id, "participant"),
+            parse_mode="markdown",
+        )
+        return True
+
+    async def _collab_show_roles(platform, msg_ref, collab_ws):
+        from collaborative import Role
+        users = collab_ws.list_users()
+        if not users:
+            await platform.reply(msg_ref, "No users registered in this workspace.")
+            return True
+        lines = [STRINGS["collab_roles_title"]]
+        role_order = {Role.OWNER: 0, Role.OPERATOR: 1, Role.PARTICIPANT: 2}
+        for uid, r in sorted(users, key=lambda x: role_order.get(x[1], 99)):
+            lines.append("  %s — *%s*" % (uid, r.value))
+        await platform.reply(msg_ref, "\n".join(lines), parse_mode="markdown")
+        return True
 
     # ── Collaborative workspace: bot added to a new group ──
 
@@ -1087,24 +1251,95 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             )
             return
 
-        # Flow B: no pending request — notify Robyx in HQ
+        # Flow B: no pending request — create a provisional workspace and
+        # ask directly in the group what the user wants to do.
         log.info(
-            "Bot added to unknown group: chat_id=%d title=%r by=%s — notifying HQ",
+            "Bot added to unknown group: chat_id=%d title=%r by=%s — starting in-group setup",
             chat_id, chat_title, added_by_id,
         )
+        import re as _re
+        safe_name = _re.sub(r'[^a-z0-9-]', '-', chat_title.lower().strip()).strip('-') or "collab"
+        safe_name = "collab-%s" % safe_name
+
+        # Avoid name collisions
+        base_name = safe_name
+        counter = 1
+        while manager.get(safe_name):
+            safe_name = "%s-%d" % (base_name, counter)
+            counter += 1
+
+        ws_id = "collab-%s" % uuid.uuid4().hex[:8]
+        ws = CollabWorkspace(
+            id=ws_id,
+            name=safe_name,
+            display_name=chat_title,
+            agent_name=safe_name,
+            chat_id=chat_id,
+            interaction_mode="intelligent",
+            status="setup",
+            created_by=added_by_id or 0,
+            roles={str(added_by_id): "owner"} if added_by_id else {},
+        )
+        collab_store.add(ws)
+
+        # Register a provisional agent so messages in this group are routed
+        agent = manager.add_agent(
+            name=safe_name,
+            work_dir=str(WORKSPACE),
+            description="[Collab] %s (setup)" % chat_title,
+            agent_type="workspace",
+            thread_id=None,
+        )
+        agent.collab_workspace_id = ws_id
+        manager.save_state()
+
+        # Write minimal agent instructions
+        from config import AGENTS_DIR
+        agent_file = AGENTS_DIR / ("%s.md" % safe_name)
+        AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+        agent_file.write_text(
+            "# %s\n\n"
+            "Collaborative workspace in setup phase.\n"
+            "Ask the user what this workspace should focus on and whether "
+            "it should inherit from an existing workspace agent.\n"
+            % chat_title
+        )
+
+        # Generate invite link
+        try:
+            link = await platform.get_invite_link(chat_id)
+            if link:
+                collab_store.update_invite_link(ws_id, link)
+        except Exception as e:
+            log.warning("Failed to generate invite link for collab %s: %s", ws_id, e)
+
+        # Ask in the group
+        try:
+            await platform.send_message(
+                chat_id=chat_id,
+                text="Hi! I've been added to this group. "
+                     "How would you like to set up this workspace?\n\n"
+                     "- Should I inherit from an existing workspace? If so, which one?\n"
+                     "- Or should we start fresh? Tell me what we'll be working on.\n\n"
+                     "Once you tell me, I'll configure everything.",
+                parse_mode="markdown",
+            )
+        except Exception as e:
+            log.error("Failed to send setup message in group %d: %s", chat_id, e)
+
+        # Also notify in HQ
         try:
             from config import CHAT_ID as hq_chat_id
             await platform.send_message(
                 chat_id=hq_chat_id,
-                text="I've been added to a new group: *%s* (chat_id: `%d`).\n\n"
-                     "Would you like to set up a collaborative workspace here? "
-                     "Tell me which workspace to link, or I can create a new one."
+                text="I've been added to group *%s* (chat_id: `%d`). "
+                     "I'm asking there how to set up the workspace."
                      % (chat_title, chat_id),
                 thread_id=platform.control_room_id,
                 parse_mode="markdown",
             )
         except Exception as e:
-            log.error("Failed to notify HQ about new group: %s", e)
+            log.warning("Failed to notify HQ about new group: %s", e)
 
     def _collab_role(role_str):
         from collaborative import Role
