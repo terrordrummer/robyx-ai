@@ -17,6 +17,8 @@ from ai_invoke import (
     CREATE_CONTINUOUS_PATTERN,
     CONTINUOUS_PROGRAM_PATTERN,
     CREATE_SPECIALIST_PATTERN,
+    FOCUS_OFF_PATTERN,
+    FOCUS_PATTERN,
     REMIND_PATTERN,
     RESTART_PATTERN,
     SEND_IMAGE_PATTERN,
@@ -31,6 +33,41 @@ from ai_invoke import (
     parse_remind_when,
     split_message,
 )
+
+
+_EXECUTIVE_MARKERS = (
+    ("FOCUS_OFF", FOCUS_OFF_PATTERN),
+    ("FOCUS", FOCUS_PATTERN),
+    ("RESTART", RESTART_PATTERN),
+    ("CREATE_WORKSPACE", CREATE_WORKSPACE_PATTERN),
+    ("AGENT_INSTRUCTIONS", AGENT_INSTRUCTIONS_PATTERN),
+    ("CLOSE_WORKSPACE", CLOSE_WORKSPACE_PATTERN),
+    ("CREATE_CONTINUOUS", CREATE_CONTINUOUS_PATTERN),
+    ("CONTINUOUS_PROGRAM", CONTINUOUS_PROGRAM_PATTERN),
+    ("CREATE_SPECIALIST", CREATE_SPECIALIST_PATTERN),
+    ("SPECIALIST_INSTRUCTIONS", SPECIALIST_INSTRUCTIONS_PATTERN),
+    ("SEND_IMAGE", SEND_IMAGE_PATTERN),
+    ("REMIND", REMIND_PATTERN),
+)
+
+
+def _strip_executive_markers(response: str, agent_name: str) -> str:
+    """Remove every system-level command marker from ``response``.
+
+    Used when the originating message lacks executive authorization
+    (e.g. PARTICIPANT in a collab workspace). Logs each marker dropped
+    so prompt-injection attempts surface in the bot log.
+    """
+    if not response:
+        return response
+    for label, pattern in _EXECUTIVE_MARKERS:
+        if pattern.search(response):
+            log.warning(
+                "Dropped [%s] marker from non-executive response by [%s]",
+                label, agent_name,
+            )
+            response = pattern.sub("", response)
+    return re.sub(r"\n{3,}", "\n\n", response).strip()
 import config as _config
 from config_updates import apply_env_updates, parse_direct_env_updates
 from config import WORKSPACE
@@ -321,7 +358,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 parse_mode="markdown",
             )
 
-    async def _process_and_send(agent, message, chat_id, platform, thread_id=None):
+    async def _process_and_send(
+        agent, message, chat_id, platform, thread_id=None, *, is_executive=True,
+    ):
         stop_typing = asyncio.Event()
 
         async def _typing_loop():
@@ -345,27 +384,41 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             if response is None:
                 return
 
-            # Handle AI-generated commands
-            response = await handle_focus_commands(response, chat_id, platform, manager, thread_id=thread_id)
-
-            # Check for restart request before other processing
-            needs_restart = bool(RESTART_PATTERN.search(response))
-            response = RESTART_PATTERN.sub("", response).strip()
-
-            if is_robyx:
-                response = await handle_delegations(response, chat_id, platform, manager, backend, thread_id=thread_id)
-                response = await _handle_workspace_commands(response, chat_id, platform, thread_id)
+            # Defense-in-depth: if the originating message was non-executive
+            # (a participant in a collab workspace), strip every tool-marker
+            # that could trigger a state-changing or system-level action.
+            # The agent is *told* not to emit these in non-executive context,
+            # but a prompt-injection attempt could still slip them through —
+            # silently dropping them here closes that gap.
+            if not is_executive:
+                response = _strip_executive_markers(response, agent.name)
+                needs_restart = False
             else:
-                response = await handle_specialist_requests(
-                    response, chat_id, platform, manager, backend, agent, thread_id=thread_id,
+                # Handle AI-generated commands
+                response = await handle_focus_commands(
+                    response, chat_id, platform, manager, thread_id=thread_id,
                 )
 
-            # Outgoing image attachments (only if the agent explicitly emitted
-            # [SEND_IMAGE ...] — the system prompt forbids proactive emission).
-            response = await _handle_media_commands(response, chat_id, platform, thread_id)
+                # Check for restart request before other processing
+                needs_restart = bool(RESTART_PATTERN.search(response))
+                response = RESTART_PATTERN.sub("", response).strip()
 
-            # Schedule any [REMIND ...] requests into the reminder engine.
-            response = _handle_remind_commands(response, agent, chat_id, thread_id)
+                if is_robyx:
+                    response = await handle_delegations(
+                        response, chat_id, platform, manager, backend, thread_id=thread_id,
+                    )
+                    response = await _handle_workspace_commands(response, chat_id, platform, thread_id)
+                else:
+                    response = await handle_specialist_requests(
+                        response, chat_id, platform, manager, backend, agent, thread_id=thread_id,
+                    )
+
+                # Outgoing image attachments (only if the agent explicitly emitted
+                # [SEND_IMAGE ...] — the system prompt forbids proactive emission).
+                response = await _handle_media_commands(response, chat_id, platform, thread_id)
+
+                # Schedule any [REMIND ...] requests into the reminder engine.
+                response = _handle_remind_commands(response, agent, chat_id, thread_id)
 
             # Strip TTS summary blocks — redundant recap not useful on chat.
             response = TTS_SUMMARY_PATTERN.sub("", response).strip()
@@ -956,14 +1009,21 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         from authorization import get_user_role, can_send_executive, can_manage_roles
         from collaborative import Role
 
+        # OWNER_ID is None when unconfigured: pass through as-is so that
+        # get_user_role never matches an unset owner. Membership of the
+        # Telegram group is the only authorization signal we have for
+        # otherwise-unknown users.
+        owner_id = getattr(_config, "OWNER_ID", None)
+
         role, _ = get_user_role(
-            msg.user_id, msg.chat_id, collab_store,
-            owner_id=_config.OWNER_ID if hasattr(_config, "OWNER_ID") else 0,
+            msg.user_id, msg.chat_id, collab_store, owner_id=owner_id,
         )
 
+        # Unknown senders default to PARTICIPANT in-memory only — we trust
+        # the OWNER's manual Telegram-group membership. Roles are NEVER
+        # mutated by the agent: only /promote and /demote (owner-driven)
+        # change persisted roles.
         if role is None:
-            collab_ws.set_role(msg.user_id, Role.PARTICIPANT)
-            collab_store._save()
             role = Role.PARTICIPANT
 
         # ── Lifecycle commands (intercepted before AI) ──
@@ -1017,7 +1077,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
         await _process_and_send(
             agent, formatted_text, msg.chat_id, platform,
-            thread_id=msg.thread_id,
+            thread_id=msg.thread_id, is_executive=is_executive,
         )
 
     async def _handle_collab_command(platform, msg, msg_ref, collab_ws, role):
@@ -1191,23 +1251,19 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         added_by_id = added_by.id if added_by else None
         chat_title = getattr(chat, "title", None) or "Unnamed group"
 
-        # Flow A: check if any agent was expecting to be added to a group
-        pending = [
-            ws for ws in collab_store.list_active()
-            if ws.status == "pending" and ws.chat_id == 0
-        ]
-        # Also check truly pending-status workspaces
-        for ws in list(collab_store._workspaces.values()):
-            if ws.status == "pending" and ws not in pending:
-                pending.append(ws)
+        # Flow A: only match pending workspaces explicitly bound to the
+        # user who added the bot. Without this binding, *any* pending
+        # workspace would attach to *any* group, letting an outsider
+        # hijack one Robyx provisioned for a different chat.
+        pending = (
+            collab_store.list_pending_for_creator(added_by_id)
+            if added_by_id is not None else []
+        )
 
         if pending:
-            # Match the most recent pending workspace
             ws = sorted(pending, key=lambda w: w.created_at, reverse=True)[0]
             collab_store.update_chat_id(ws.id, chat_id)
-
-            if added_by_id:
-                ws.set_role(added_by_id, _collab_role("owner"))
+            collab_store.update_roles(ws.id, added_by_id, _collab_role("owner"))
 
             # Generate invite link
             try:
@@ -1223,7 +1279,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                     chat_id=chat_id,
                     text="*%s* -- collaborative workspace is ready.\n\n"
                          "I'm the agent for this workspace. "
-                         "Owner can give me executive instructions; "
+                         "Owner and operators can give me executive instructions; "
                          "other participants can talk and I'll help when appropriate."
                          % ws.display_name,
                     parse_mode="markdown",

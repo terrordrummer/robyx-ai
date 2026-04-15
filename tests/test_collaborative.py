@@ -173,3 +173,50 @@ class TestCollabStore:
         store.add(ws)
         assert store.update_invite_link("collab-test1", "https://t.me/+xyz") is True
         assert ws.invite_link == "https://t.me/+xyz"
+
+    def test_setup_workspace_routable_by_chat_id(self, tmp_path):
+        # C2: status="setup" must be reachable via get_by_chat_id so that
+        # Flow B (in-group setup) can route the user's first reply.
+        store = CollabStore(tmp_path / "collab.json")
+        ws = _make_ws(status="setup", chat_id=-100777)
+        store.add(ws)
+        assert store.get_by_chat_id(-100777) is ws
+
+    def test_list_pending_for_creator_filters_by_creator(self, tmp_path):
+        # C3: pending lookup must be scoped to expected_creator_id so an
+        # outsider cannot hijack a workspace provisioned for someone else.
+        store = CollabStore(tmp_path / "collab.json")
+        mine = _make_ws(
+            id="c-mine", name="mine", agent_name="mine",
+            status="pending", chat_id=0, expected_creator_id=111,
+        )
+        someone_else = _make_ws(
+            id="c-other", name="other", agent_name="other",
+            status="pending", chat_id=0, expected_creator_id=222,
+        )
+        store.add(mine)
+        store.add(someone_else)
+
+        for_111 = store.list_pending_for_creator(111)
+        assert [w.id for w in for_111] == ["c-mine"]
+        assert store.list_pending_for_creator(999) == []
+
+    def test_expected_creator_id_persists(self, tmp_path):
+        path = tmp_path / "collab.json"
+        store = CollabStore(path)
+        ws = _make_ws(
+            status="pending", chat_id=0, expected_creator_id=555,
+        )
+        store.add(ws)
+        reloaded = CollabStore(path)
+        assert reloaded.get("collab-test1").expected_creator_id == 555
+
+    def test_list_all_returns_every_status(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        a = _make_ws(id="c1", name="a", agent_name="a", status="active")
+        b = _make_ws(id="c2", name="b", agent_name="b", status="setup", chat_id=-100222)
+        c = _make_ws(id="c3", name="c", agent_name="c", status="closed", chat_id=-100333)
+        store.add(a)
+        store.add(b)
+        store.add(c)
+        assert {w.id for w in store.list_all()} == {"c1", "c2", "c3"}

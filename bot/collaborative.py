@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+try:  # POSIX inter-process lock; absent on Windows.
+    import fcntl  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 from config import DATA_DIR
 
@@ -45,6 +52,7 @@ class CollabWorkspace:
     status: str = "active"
     created_at: float = field(default_factory=time.time)
     created_by: int = 0
+    expected_creator_id: int | None = None
     roles: dict[str, str] = field(default_factory=dict)
 
     def get_role(self, user_id: int) -> Role | None:
@@ -93,6 +101,7 @@ class CollabWorkspace:
             "status": self.status,
             "created_at": self.created_at,
             "created_by": self.created_by,
+            "expected_creator_id": self.expected_creator_id,
             "roles": dict(self.roles),
         }
 
@@ -111,8 +120,12 @@ class CollabWorkspace:
             status=d.get("status", "active"),
             created_at=d.get("created_at", 0),
             created_by=d.get("created_by", 0),
+            expected_creator_id=d.get("expected_creator_id"),
             roles=d.get("roles", {}),
         )
+
+
+_ROUTABLE_STATUSES = ("active", "setup")
 
 
 class CollabStore:
@@ -122,7 +135,27 @@ class CollabStore:
         self._path = path or COLLAB_FILE
         self._workspaces: dict[str, CollabWorkspace] = {}
         self._chat_map: dict[int, str] = {}
+        self._lock = threading.Lock()
         self._load()
+
+    @contextlib.contextmanager
+    def _mutex(self):
+        """Intra-process + inter-process exclusive access to the store file."""
+        with self._lock:
+            if fcntl is None:
+                yield
+                return
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = self._path.with_name(self._path.name + ".lock")
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
 
     def _load(self) -> None:
         if not self._path.exists():
@@ -140,37 +173,44 @@ class CollabStore:
     def _rebuild_chat_map(self) -> None:
         self._chat_map = {}
         for ws in self._workspaces.values():
-            if ws.status == "active" and ws.chat_id:
+            if ws.status in _ROUTABLE_STATUSES and ws.chat_id:
                 self._chat_map[ws.chat_id] = ws.id
 
-    def _save(self) -> None:
+    def _write_unlocked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = {ws_id: ws.to_dict() for ws_id, ws in self._workspaces.items()}
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, indent=2))
         os.replace(tmp, self._path)
 
+    def _save(self) -> None:
+        with self._mutex():
+            self._write_unlocked()
+
     def add(self, ws: CollabWorkspace) -> None:
-        self._workspaces[ws.id] = ws
-        self._rebuild_chat_map()
-        self._save()
+        with self._mutex():
+            self._workspaces[ws.id] = ws
+            self._rebuild_chat_map()
+            self._write_unlocked()
 
     def remove(self, ws_id: str) -> bool:
-        if ws_id not in self._workspaces:
-            return False
-        del self._workspaces[ws_id]
-        self._rebuild_chat_map()
-        self._save()
-        return True
+        with self._mutex():
+            if ws_id not in self._workspaces:
+                return False
+            del self._workspaces[ws_id]
+            self._rebuild_chat_map()
+            self._write_unlocked()
+            return True
 
     def close(self, ws_id: str) -> bool:
-        ws = self._workspaces.get(ws_id)
-        if not ws:
-            return False
-        ws.status = "closed"
-        self._rebuild_chat_map()
-        self._save()
-        return True
+        with self._mutex():
+            ws = self._workspaces.get(ws_id)
+            if not ws:
+                return False
+            ws.status = "closed"
+            self._rebuild_chat_map()
+            self._write_unlocked()
+            return True
 
     def get(self, ws_id: str) -> CollabWorkspace | None:
         return self._workspaces.get(ws_id)
@@ -188,6 +228,10 @@ class CollabStore:
     def list_active(self) -> list[CollabWorkspace]:
         return [ws for ws in self._workspaces.values() if ws.status == "active"]
 
+    def list_all(self) -> list[CollabWorkspace]:
+        """Return every workspace, regardless of status."""
+        return list(self._workspaces.values())
+
     def list_pending_for_agent(self, agent_name: str) -> list[CollabWorkspace]:
         return [
             ws for ws in self._workspaces.values()
@@ -195,41 +239,54 @@ class CollabStore:
             and ws.status == "pending"
         ]
 
+    def list_pending_for_creator(self, creator_id: int) -> list[CollabWorkspace]:
+        """Return pending workspaces explicitly bound to this creator id."""
+        return [
+            ws for ws in self._workspaces.values()
+            if ws.status == "pending"
+            and ws.chat_id == 0
+            and ws.expected_creator_id == creator_id
+        ]
+
     def update_chat_id(self, ws_id: str, chat_id: int) -> bool:
-        ws = self._workspaces.get(ws_id)
-        if not ws:
-            return False
-        ws.chat_id = chat_id
-        ws.status = "active"
-        self._rebuild_chat_map()
-        self._save()
-        return True
+        with self._mutex():
+            ws = self._workspaces.get(ws_id)
+            if not ws:
+                return False
+            ws.chat_id = chat_id
+            ws.status = "active"
+            self._rebuild_chat_map()
+            self._write_unlocked()
+            return True
 
     def update_roles(self, ws_id: str, user_id: int, role: Role) -> bool:
-        ws = self._workspaces.get(ws_id)
-        if not ws:
-            return False
-        ws.set_role(user_id, role)
-        self._save()
-        return True
+        with self._mutex():
+            ws = self._workspaces.get(ws_id)
+            if not ws:
+                return False
+            ws.set_role(user_id, role)
+            self._write_unlocked()
+            return True
 
     def update_interaction_mode(self, ws_id: str, mode: str) -> bool:
-        ws = self._workspaces.get(ws_id)
-        if not ws:
-            return False
-        if mode not in ("intelligent", "passive"):
-            return False
-        ws.interaction_mode = mode
-        self._save()
-        return True
+        with self._mutex():
+            ws = self._workspaces.get(ws_id)
+            if not ws:
+                return False
+            if mode not in ("intelligent", "passive"):
+                return False
+            ws.interaction_mode = mode
+            self._write_unlocked()
+            return True
 
     def update_invite_link(self, ws_id: str, link: str) -> bool:
-        ws = self._workspaces.get(ws_id)
-        if not ws:
-            return False
-        ws.invite_link = link
-        self._save()
-        return True
+        with self._mutex():
+            ws = self._workspaces.get(ws_id)
+            if not ws:
+                return False
+            ws.invite_link = link
+            self._write_unlocked()
+            return True
 
     @property
     def chat_ids(self) -> set[int]:

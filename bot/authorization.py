@@ -19,7 +19,7 @@ def get_user_role(
     user_id: int,
     chat_id: Any,
     collab_store: CollabStore,
-    owner_id: int,
+    owner_id: int | None,
 ) -> tuple[Role | None, CollabWorkspace | None]:
     """Resolve a user's role in the context of a specific chat.
 
@@ -29,15 +29,21 @@ def get_user_role(
     - For a known collaborator: ``(their role, ws)``
     - For an unknown user in a collab group: ``(None, ws)``
     - For a non-owner in HQ: ``(None, None)``
+
+    When ``owner_id`` is ``None`` (unconfigured), no user matches the
+    owner check — fail-closed. Roles still resolve via the workspace's
+    explicit ``roles`` map.
     """
     ws = collab_store.get_by_chat_id(chat_id)
 
+    is_owner_match = owner_id is not None and user_id == owner_id
+
     if ws is None:
-        if user_id == owner_id:
+        if is_owner_match:
             return Role.OWNER, None
         return None, None
 
-    if user_id == owner_id:
+    if is_owner_match:
         return Role.OWNER, ws
 
     role = ws.get_role(user_id)
