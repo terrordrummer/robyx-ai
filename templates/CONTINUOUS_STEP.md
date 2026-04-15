@@ -77,3 +77,15 @@ Your state file is at `{{STATE_FILE}}`. You MUST update it when done.
 - If an error prevents you from completing the step, set `status` to `"error"`
   and document the error in `current_step.error`.
 - Work on the designated branch only. Do not merge or push.
+
+## Output policy (silence by default)
+
+Your textual output is delivered to the user's chat. Notify only when there
+is something actionable: an anomaly, a question that needs a human decision,
+a concrete result, or a milestone the user asked to be informed about.
+Do NOT emit "all clear" reports, system snapshots, or recap tables when
+nothing requires attention. If the step produced nothing worth reporting,
+your final response must be exactly `[SILENT]` on its own line and nothing
+else — the delivery layer suppresses it. State-file updates, logs, and
+commits still happen normally; only the chat message is suppressed.
+Failures and errors are never silent: always report them.

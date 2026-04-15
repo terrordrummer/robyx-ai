@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ai_backend import AIBackend
-from ai_invoke import split_message
+from ai_invoke import SILENT_PATTERN, split_message
 
 STATUS_PATTERN = re.compile(r"\[STATUS\s+(.+?)\]")
 
@@ -88,12 +88,25 @@ async def deliver_task_output(
 
     raw_output = output_log.read_text() if output_log.exists() else ""
     parsed_response = backend.parse_response(raw_output, returncode)
-    message = _render_result_message(
-        task,
-        _normalize_backend_text(parsed_response),
-        returncode,
-        raw_output,
-    )
+    parsed_text = _normalize_backend_text(parsed_response)
+
+    if SILENT_PATTERN.search(parsed_text):
+        residual = SILENT_PATTERN.sub("", parsed_text)
+        residual = STATUS_PATTERN.sub("", residual).strip()
+        if not residual:
+            if returncode == 0:
+                logger.info(
+                    "Scheduled task '%s' emitted [SILENT] — suppressing delivery",
+                    task.get("name"),
+                )
+                return True
+            # Failure case: never silent — fall through with empty parsed
+            # text so _render_result_message produces the error message.
+            parsed_text = ""
+        else:
+            parsed_text = residual
+
+    message = _render_result_message(task, parsed_text, returncode, raw_output)
 
     max_len = getattr(platform, "max_message_length", 4000)
     for chunk in split_message(message, max_len=max_len):

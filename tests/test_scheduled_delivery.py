@@ -102,6 +102,108 @@ class TestDeliverTaskOutput:
         assert second.kwargs["parse_mode"] == ""
 
 
+class TestSilentMarker:
+    @pytest.mark.asyncio
+    async def test_silent_marker_suppresses_delivery_on_success(
+        self, tmp_path, mock_platform
+    ):
+        output_log = tmp_path / "output.log"
+        output_log.write_text("[SILENT]")
+
+        backend = MagicMock()
+        backend.parse_response.return_value = {"text": "[SILENT]"}
+
+        task = {
+            "name": "personal-assistant-check",
+            "description": "Personal assistant proactive check",
+            "thread_id": "903",
+        }
+
+        ok = await deliver_task_output(
+            task, output_log, mock_platform, backend, 0, MagicMock(),
+        )
+
+        assert ok is True
+        mock_platform.send_to_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_silent_marker_with_status_lines_still_suppressed(
+        self, tmp_path, mock_platform
+    ):
+        output_log = tmp_path / "output.log"
+        output_log.write_text("[STATUS scanning todos]\n[SILENT]")
+
+        backend = MagicMock()
+        backend.parse_response.return_value = {
+            "text": "[STATUS scanning todos]\n[SILENT]",
+        }
+
+        task = {
+            "name": "personal-assistant-check",
+            "description": "Personal assistant proactive check",
+            "thread_id": "903",
+        }
+
+        ok = await deliver_task_output(
+            task, output_log, mock_platform, backend, 0, MagicMock(),
+        )
+
+        assert ok is True
+        mock_platform.send_to_channel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_silent_marker_does_not_suppress_failures(
+        self, tmp_path, mock_platform
+    ):
+        output_log = tmp_path / "output.log"
+        output_log.write_text("[SILENT]")
+
+        backend = MagicMock()
+        backend.parse_response.return_value = {"text": "[SILENT]"}
+
+        task = {
+            "name": "system-monitor",
+            "description": "System monitor",
+            "thread_id": "903",
+        }
+
+        ok = await deliver_task_output(
+            task, output_log, mock_platform, backend, 1, MagicMock(),
+        )
+
+        assert ok is True
+        mock_platform.send_to_channel.assert_awaited_once()
+        sent_text = mock_platform.send_to_channel.await_args.args[1]
+        assert "Task failed" in sent_text or "exit code" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_real_content_with_silent_substring_still_delivered(
+        self, tmp_path, mock_platform
+    ):
+        output_log = tmp_path / "output.log"
+        output_log.write_text("[SILENT]\nActually I found a problem: disk full")
+
+        backend = MagicMock()
+        backend.parse_response.return_value = {
+            "text": "[SILENT]\nActually I found a problem: disk full",
+        }
+
+        task = {
+            "name": "system-monitor",
+            "description": "System monitor",
+            "thread_id": "903",
+        }
+
+        ok = await deliver_task_output(
+            task, output_log, mock_platform, backend, 0, MagicMock(),
+        )
+
+        assert ok is True
+        mock_platform.send_to_channel.assert_awaited_once()
+        sent_text = mock_platform.send_to_channel.await_args.args[1]
+        assert "disk full" in sent_text
+
+
 class TestStartTaskDeliveryWatch:
     @pytest.mark.asyncio
     async def test_waits_for_process_and_cleans_lock(self, tmp_path):
