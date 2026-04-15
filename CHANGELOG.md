@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.20.24
+
+### Changed (agent prompts)
+- **`templates/prompt_workspace_agent.md`** -- rewrote the "Continuous Tasks" section (now titled "Continuous Tasks (agentic loop)"). Agents now have two activation modes for iterative long-running work:
+  1. **Explicit**: the user writes `/loop` in context -- the agent interprets it as a setup trigger (distinguishing from discussion about the mechanism itself).
+  2. **Deductive**: the agent recognizes conversational signals indicating iterative work (R&D loops, optimization cycles, progressive refinement) and proactively suggests a continuous task instead of executing inline.
+  The section also adds clearer guidance on when to use vs. when NOT to use continuous tasks, a stronger setup interview protocol (challenge vague criteria), and the "when in doubt, suggest it" rule.
+- **`templates/prompt_focused_agent.md`** -- added a "Continuous Tasks (agentic loop)" section so agents in focus mode also recognize iterative work patterns and can suggest/create continuous tasks. Previously focus mode had no awareness of this mechanism.
+
+### Migration
+None. `bot/migrations/v0_20_24.py` is a no-op.
+
 ## 0.20.23
 
 ### Changed (message filtering)
