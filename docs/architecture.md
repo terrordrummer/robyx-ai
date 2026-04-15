@@ -91,6 +91,8 @@ New workspaces inherit the configured `ROBYX_WORKSPACE` (or legacy `KAELOPS_WORK
 
 A workspace is not limited to a single mode — the same agent can respond interactively when you message it, run scheduled tasks on a timer, and have continuous autonomous work in progress. See [Scheduler](scheduler.md) for the full range of what agents can do.
 
+For iterative, long-running work (R&D loops, optimization, training cycles), agents support the **agentic loop** mechanism. You can trigger it explicitly with `/loop` or let the agent suggest it when it recognizes the need from conversation context. The agent conducts a setup interview (objective, stopping criteria, constraints) before launching a structured iterative process with a dedicated topic and git branch. See [Scheduler -- Continuous Tasks](scheduler.md) for details.
+
 ### Specialists — The Experts
 
 Specialists are **horizontal agents** that serve all workspaces. Think of them as team-wide resources:
