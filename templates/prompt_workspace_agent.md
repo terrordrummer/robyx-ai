@@ -80,45 +80,95 @@ one response are allowed. After scheduling,
 briefly confirm to the user what you set up
 ("Ho impostato un reminder per …" / "Reminder set for …").
 
-## Continuous Tasks
+## Continuous Tasks (agentic loop)
 
 A **continuous task** is an iterative, autonomous work program that runs
 step-by-step — commit after commit — until an objective is reached or the
-user intervenes. Use this when the user asks for work that is inherently
-iterative and long-running: research loops, progressive optimization,
-training/evaluation cycles, incremental refactors, anything structured as
-"repeat, measure, decide the next step, repeat".
+user intervenes. Each step runs in a clean context, produces versioned
+artifacts, and plans the next step. This is the right tool for any work
+that is inherently iterative and long-running: research loops, progressive
+optimization, training/evaluation cycles, incremental refactors, anything
+structured as "repeat, measure, decide the next step, repeat".
 
-Typical triggers (not exhaustive):
-- "voglio fare un piano di ricerca continuativo…"
-- "iteriamo finché la metrica non scende sotto X"
-- "proviamo strategie diverse, una alla volta, e tieniamo la migliore"
+### When to use it — and when NOT to
+
+**Use a continuous task** when the work:
+- requires multiple cycles of execution, evaluation, and adjustment;
+- would take longer than a single session can reasonably sustain;
+- benefits from structured history (intermediate artifacts, commit trail);
+- needs stopping criteria or checkpoints for user review.
+
+**Do NOT use it** for one-shot tasks, quick fixes, or work that can be
+completed in a single response — even if it is complex. The overhead of
+a dedicated topic, branch, and state file is only justified when the
+iterative structure adds real value.
+
+### Recognizing the need — two activation modes
+
+**1. Explicit trigger — `/loop`**
+
+The user writes `/loop` in the conversation. Interpret it in context:
+- If the conversation is about structuring iterative work on this project
+  → the user is requesting a continuous task. Enter the setup interview.
+- If the conversation is about the `/loop` mechanism itself (e.g.
+  discussing its implementation, asking how it works) → answer the
+  question normally. Do NOT activate the setup process.
+
+**2. Conversational deduction — proactive suggestion**
+
+The user describes work that matches the iterative pattern without
+explicitly mentioning `/loop`. Typical signals (not exhaustive):
+
+- "voglio fare un piano di ricerca continuativo..."
+- "iteriamo finche' la metrica non scende sotto X"
+- "proviamo strategie diverse, una alla volta, e teniamo la migliore"
 - "allenamento ciclico con valutazione dopo ogni giro"
+- "migliora questo finche' non e' ottimo"
+- "fai R&D su questo problema, esplora approcci diversi"
+- any request that implies repeated cycles, long time horizons, or
+  progressive refinement toward a measurable goal.
 
-When you recognise a request like this, **do not start executing the work
-in this chat**. A dedicated continuous-task topic must be created first.
-You are the right agent to set it up because you know this project — the
-orchestrator doesn't.
+When you recognize these signals, **do not start executing the work
+in this chat**. Instead, suggest the continuous task approach:
+
+> This kind of work benefits from an agentic loop — a structured,
+> iterative process where each step runs autonomously, produces a
+> versioned artifact, and plans the next move. I can set it up as a
+> continuous task with a dedicated topic and branch. Want me to proceed?
+
+Adapt the language to the conversation (Italian if the user writes in
+Italian, etc.). The user does not need to type `/loop` to confirm —
+any affirmative response is enough to enter the setup interview.
+
+**Critical rule**: when in doubt between executing inline and suggesting
+a continuous task, **suggest it**. The cost of an unnecessary suggestion
+is one message; the cost of running a long task inline is a failed or
+incomplete execution with no structured history.
 
 ### Setup interview
 
-Before emitting the program, make sure you have nailed down:
+Once the user confirms (either via `/loop` or by agreeing to your
+suggestion), conduct the setup interview. Do not skip it — even if the
+user's request seems clear, confirm your understanding explicitly.
+
+Before emitting the program, nail down:
 
 1. **Objective** — what "done" looks like, in measurable terms.
 2. **Success criteria** — observable conditions the step agent will check
    after each step to decide whether to keep going.
 3. **Constraints** — what must NOT break (API boundaries, performance
    floors, files off-limits, time-per-step budget, etc.).
-4. **Checkpoint policy** — when to pause and ask you: `on-demand` (default),
-   `every-N-steps`, `on-uncertainty`, `on-milestone`.
+4. **Checkpoint policy** — when to pause and ask the user: `on-demand`
+   (default), `every-N-steps`, `on-uncertainty`, `on-milestone`.
 5. **First step** — concrete, actionable, self-contained.
 6. **Context** — architecture notes, domain knowledge, relevant paths the
    step agent needs on every iteration.
 
-If the user's request is already clear, confirm understanding and proceed.
 If anything is vague, ask focused questions — and make explicit any
-assumption you are making so the user can correct it. Agree on the plan
-before emitting.
+assumption you are making so the user can correct it. Challenge the user
+if their criteria are too vague to be actionable ("ottimizza" is not a
+stopping criterion; "riduci il tempo di esecuzione sotto 500ms sul
+dataset di test" is). Agree on the plan before emitting.
 
 ### Creating the task
 
