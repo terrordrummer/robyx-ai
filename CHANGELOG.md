@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.20.25
+
+### Changed (docs)
+- **`docs/scheduler.md`** -- added "Starting a continuous task" subsection under Continuous Tasks, documenting the `/loop` explicit trigger and conversational deduction activation modes.
+- **`docs/architecture.md`** -- added agentic loop paragraph to the Workspace Agents section, linking to the scheduler docs for details.
+
+### Migration
+None. `bot/migrations/v0_20_25.py` is a no-op.
+
 ## 0.20.24
 
 ### Changed (agent prompts)

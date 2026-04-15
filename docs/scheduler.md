@@ -12,12 +12,21 @@ Robyx has a **unified scheduler** that runs every 60 seconds (configurable via `
 
 **Periodic tasks** — recurring agent invocations on an interval (hourly, daily, etc.). A system monitor that checks server health every 6 hours, a price tracker that runs every 30 minutes — the scheduler keeps firing them until the workspace is closed or paused.
 
-**Continuous tasks** — autonomous, iterative work that the scheduler keeps alive step-by-step until the objective is reached or the user intervenes. Each continuous task gets:
+**Continuous tasks (agentic loop)** — autonomous, iterative work that the scheduler keeps alive step-by-step until the objective is reached or the user intervenes. Each continuous task gets:
 - A **dedicated workspace topic** (prefixed with 🔄)
 - A **git branch** in the target project's repo
 - A **state file** tracking progress, completed steps, and the plan for the next step
 
 The scheduler dispatches one step at a time. Each step: executes, commits its changes, updates the state, and plans the next step. The scheduler picks up the next step on the following cycle. This is how you can say "refactor the auth module into smaller files" and walk away — the agent works through it methodically, one step at a time.
+
+### Starting a continuous task
+
+Two ways:
+
+1. **Explicit** — write `/loop` in a conversation with a workspace agent. The agent interprets the context and enters the setup interview (objective, success criteria, constraints, checkpoint policy, first step).
+2. **Conversational** — describe work that is inherently iterative (R&D loops, optimization cycles, progressive refinement). The agent recognizes the pattern and suggests the agentic loop approach. You confirm, and setup begins.
+
+In both cases the agent conducts a structured interview before creating the task — it never launches a long-running iterative workload inline.
 
 ## Timing precision
 
