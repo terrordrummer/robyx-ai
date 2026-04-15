@@ -20,6 +20,7 @@ from ai_invoke import (
     REMIND_PATTERN,
     RESTART_PATTERN,
     SEND_IMAGE_PATTERN,
+    SILENT_PATTERN,
     SPECIALIST_INSTRUCTIONS_PATTERN,
     TTS_SUMMARY_PATTERN,
     handle_delegations,
@@ -43,6 +44,7 @@ from updater import (
     apply_update,
     restart_service,
 )
+from collaborative import CollabStore
 from voice import is_available as voice_available, transcribe_voice
 
 log = logging.getLogger("robyx.handlers")
@@ -87,7 +89,7 @@ def owner_only(func):
     return wrapper
 
 
-def make_handlers(manager: AgentManager, backend: AIBackend):
+def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: CollabStore | None = None):
     """Return all handler functions bound to a given AgentManager and AI backend."""
 
     @owner_only
@@ -368,6 +370,14 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             # Strip TTS summary blocks — redundant recap not useful on chat.
             response = TTS_SUMMARY_PATTERN.sub("", response).strip()
             response = re.sub(r'\n{3,}', '\n\n', response)
+
+            # Collaborative agent chose not to respond.
+            if SILENT_PATTERN.search(response):
+                cleaned = SILENT_PATTERN.sub("", response).strip()
+                if not cleaned:
+                    log.info("Agent [%s] responded with [SILENT] — suppressing", agent.name)
+                    return
+                response = cleaned
 
             await _send_response(chat_id, platform, agent, response, thread_id=thread_id)
 
@@ -857,10 +867,22 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
 
         await _process_and_send(agent, message, chat_id, platform, thread_id=thread_id)
 
-    @owner_only
     async def handle_message(platform, msg, msg_ref):
         text = msg.text
         if not text:
+            return
+
+        # ── Collaborative workspace messages bypass owner_only ──
+        if collab_store is not None:
+            collab_ws = collab_store.get_by_chat_id(msg.chat_id)
+            if collab_ws:
+                await _handle_collaborative_message(platform, msg, msg_ref, collab_ws)
+                return
+
+        # ── Standard HQ path: owner_only ──
+        if not platform.is_owner(msg.user_id):
+            log.warning("Rejected non-owner message: user=%s", msg.user_id)
+            await platform.reply(msg_ref, STRINGS["unauthorized"])
             return
 
         # Treat bare "help" in main thread as /help command
@@ -908,11 +930,6 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
             msg.user_id, msg.chat_id, msg.thread_id, len(text),
         )
 
-        # Fire the typing indicator as a background task so the handler
-        # doesn't block on Telegram's roundtrip — even with the
-        # persistent httpx client, we want subsequent message processing
-        # to start in parallel. The continuous loop in _process_and_send
-        # keeps refreshing typing every 4s thereafter.
         async def _early_typing():
             try:
                 await platform.send_typing(msg.chat_id, msg.thread_id)
@@ -926,7 +943,174 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
 
         await _route_and_process(platform, msg, msg_ref, text)
 
-    return {
+    async def _handle_collaborative_message(platform, msg, msg_ref, collab_ws):
+        """Route a message from a collaborative workspace group.
+
+        Authorization is role-based: owner and operators can give executive
+        instructions; participants can converse but the agent treats their
+        messages as non-executive context.
+        """
+        from authorization import get_user_role, can_send_executive
+        from collaborative import Role
+
+        role, _ = get_user_role(
+            msg.user_id, msg.chat_id, collab_store,
+            owner_id=_config.OWNER_ID if hasattr(_config, "OWNER_ID") else 0,
+        )
+
+        if role is None:
+            # Auto-register new group members as participants
+            collab_ws.set_role(msg.user_id, Role.PARTICIPANT)
+            collab_store._save()
+            role = Role.PARTICIPANT
+
+        agent = manager.get(collab_ws.agent_name)
+        if not agent:
+            log.warning(
+                "Collaborative workspace %s references unknown agent %s",
+                collab_ws.id, collab_ws.agent_name,
+            )
+            return
+
+        user_display = msg.user_name or str(msg.user_id)
+        is_executive = can_send_executive(role)
+
+        # Passive mode: only respond to explicit @bot invocations
+        if collab_ws.interaction_mode == "passive":
+            bot_username = getattr(platform, "_bot_username", None)
+            mentioned = False
+            if bot_username and ("@%s" % bot_username) in (msg.text or ""):
+                mentioned = True
+            if not mentioned and not is_executive:
+                return
+            if not mentioned:
+                # Executive but no mention in passive mode — still process
+                pass
+
+        # Format message with sender context for the agent
+        exec_tag = " [EXECUTIVE]" if is_executive else ""
+        formatted_text = "[%s (%s)%s] %s" % (
+            user_display, role.value, exec_tag, msg.text,
+        )
+
+        log.info(
+            "Collaborative message: user=%s (%s) chat=%s agent=%s chars=%d",
+            msg.user_id, role.value, msg.chat_id, collab_ws.agent_name, len(msg.text),
+        )
+
+        async def _early_typing():
+            try:
+                await platform.send_typing(msg.chat_id, msg.thread_id)
+            except Exception:
+                pass
+
+        asyncio.create_task(_early_typing())
+
+        await _process_and_send(
+            agent, formatted_text, msg.chat_id, platform,
+            thread_id=msg.thread_id,
+        )
+
+    # ── Collaborative workspace: bot added to a new group ──
+
+    async def collab_bot_added(platform, chat, added_by):
+        """Handle the bot being added to a new Telegram group.
+
+        Two flows:
+        A) An agent was told in advance (status="pending") → match and configure.
+        B) No pending request → notify Robyx in HQ so the user can decide.
+        """
+        if collab_store is None:
+            return
+
+        chat_id = chat.id
+        added_by_id = added_by.id if added_by else None
+        chat_title = getattr(chat, "title", None) or "Unnamed group"
+
+        # Flow A: check if any agent was expecting to be added to a group
+        pending = [
+            ws for ws in collab_store.list_active()
+            if ws.status == "pending" and ws.chat_id == 0
+        ]
+        # Also check truly pending-status workspaces
+        for ws in list(collab_store._workspaces.values()):
+            if ws.status == "pending" and ws not in pending:
+                pending.append(ws)
+
+        if pending:
+            # Match the most recent pending workspace
+            ws = sorted(pending, key=lambda w: w.created_at, reverse=True)[0]
+            collab_store.update_chat_id(ws.id, chat_id)
+
+            if added_by_id:
+                ws.set_role(added_by_id, _collab_role("owner"))
+
+            # Generate invite link
+            try:
+                link = await platform.get_invite_link(chat_id)
+                if link:
+                    collab_store.update_invite_link(ws.id, link)
+            except Exception as e:
+                log.warning("Failed to generate invite link for collab %s: %s", ws.id, e)
+
+            # Send welcome message in the new group
+            try:
+                await platform.send_message(
+                    chat_id=chat_id,
+                    text="*%s* -- collaborative workspace is ready.\n\n"
+                         "I'm the agent for this workspace. "
+                         "Owner can give me executive instructions; "
+                         "other participants can talk and I'll help when appropriate."
+                         % ws.display_name,
+                    parse_mode="markdown",
+                )
+            except Exception as e:
+                log.warning("Failed to send collab welcome: %s", e)
+
+            # Notify in HQ
+            link_text = "\nInvite link: %s" % ws.invite_link if ws.invite_link else ""
+            try:
+                await platform.send_message(
+                    chat_id=_config.CHAT_ID if hasattr(_config, "CHAT_ID") else 0,
+                    text="*Collaborative workspace configured*\n\n"
+                         "Workspace *%s* is now linked to group _%s_ (chat_id: %d).%s"
+                         % (ws.display_name, chat_title, chat_id, link_text),
+                    thread_id=platform.control_room_id,
+                    parse_mode="markdown",
+                )
+            except Exception as e:
+                log.warning("Failed to send collab HQ notification: %s", e)
+
+            log.info(
+                "Collaborative workspace [%s] configured: chat_id=%d title=%r",
+                ws.name, chat_id, chat_title,
+            )
+            return
+
+        # Flow B: no pending request — notify Robyx in HQ
+        log.info(
+            "Bot added to unknown group: chat_id=%d title=%r by=%s — notifying HQ",
+            chat_id, chat_title, added_by_id,
+        )
+        try:
+            from config import CHAT_ID as hq_chat_id
+            await platform.send_message(
+                chat_id=hq_chat_id,
+                text="I've been added to a new group: *%s* (chat_id: `%d`).\n\n"
+                     "Would you like to set up a collaborative workspace here? "
+                     "Tell me which workspace to link, or I can create a new one."
+                     % (chat_title, chat_id),
+                thread_id=platform.control_room_id,
+                parse_mode="markdown",
+            )
+        except Exception as e:
+            log.error("Failed to notify HQ about new group: %s", e)
+
+    def _collab_role(role_str):
+        from collaborative import Role
+        return Role(role_str)
+
+    result = {
         "start": cmd_help,
         "help": cmd_help,
         "workspaces": cmd_workspaces,
@@ -940,3 +1124,8 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
         "voice": handle_voice,
         "message": handle_message,
     }
+
+    if collab_store is not None:
+        result["collab_bot_added"] = collab_bot_added
+
+    return result

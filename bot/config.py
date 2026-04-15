@@ -232,3 +232,4 @@ REMINDER_MAX_AGE_SECONDS = int(
 ROBYX_SYSTEM_PROMPT = _load_prompt("prompt_orchestrator.md")
 WORKSPACE_AGENT_SYSTEM_PROMPT = _load_prompt("prompt_workspace_agent.md")
 FOCUSED_AGENT_SYSTEM_PROMPT = _load_prompt("prompt_focused_agent.md")
+COLLABORATIVE_AGENT_SYSTEM_PROMPT = _load_prompt("prompt_collaborative_agent.md")

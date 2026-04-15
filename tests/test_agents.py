@@ -43,7 +43,7 @@ class TestAgent:
         expected_keys = {
             "name", "work_dir", "description", "agent_type", "model",
             "session_id", "created_at", "last_used", "message_count",
-            "session_started", "thread_id",
+            "session_started", "thread_id", "collab_workspace_id",
         }
         assert set(d.keys()) == expected_keys
 

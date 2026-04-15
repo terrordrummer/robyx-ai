@@ -58,6 +58,7 @@ class PlatformMessage:
     voice_file_id: str | None = None
     command: str | None = None
     args: list[str] = field(default_factory=list)
+    user_name: str | None = None
 
 
 class Platform(abc.ABC):
@@ -162,6 +163,14 @@ class Platform(abc.ABC):
     @abc.abstractmethod
     async def send_to_channel(self, channel_id: Any, text: str, parse_mode: str | None = None) -> bool:
         """Send a message to a specific channel/topic."""
+
+    async def get_invite_link(self, chat_id: Any) -> str | None:
+        """Generate or retrieve an invite link for a chat/group.
+
+        Default: not supported (returns None). Adapters should override
+        for platforms that support invite links.
+        """
+        return None
 
     @abc.abstractmethod
     async def rename_main_channel(self, display_name: str, slug: str) -> bool:

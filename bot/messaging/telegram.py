@@ -234,6 +234,23 @@ class TelegramPlatform(Platform):
             log.error("Error sending to topic %d: %s", channel_id, e)
             return False
 
+    async def get_invite_link(self, chat_id: int) -> str | None:
+        try:
+            client = self._get_client()
+            resp = await client.post(
+                "%s/exportChatInviteLink" % self._api_base,
+                data={"chat_id": chat_id},
+                timeout=15,
+            )
+            result = resp.json()
+            if result.get("ok"):
+                return result["result"]
+            log.warning("exportChatInviteLink failed: %s", result)
+            return None
+        except Exception as e:
+            log.error("Error generating invite link for chat %d: %s", chat_id, e)
+            return None
+
     async def rename_main_channel(self, display_name: str, slug: str) -> bool:
         """Rename the General topic of the forum supergroup.
 
