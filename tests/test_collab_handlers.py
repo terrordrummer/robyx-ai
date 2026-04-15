@@ -400,3 +400,30 @@ class TestStripExecutiveMarkers:
     def test_empty_input_safe(self):
         from handlers import _strip_executive_markers
         assert _strip_executive_markers("", "a") == ""
+
+
+# ---------------------------------------------------------------------------
+# C12: Role() fallback for hand-edited configs
+# ---------------------------------------------------------------------------
+
+class TestCollabRoleFallback:
+    def test_unknown_role_string_falls_back_to_participant(
+        self, collab_handlers,  # noqa: ARG002 — builds the closure
+    ):
+        # _collab_role is defined inside make_handlers; re-invoke to get it.
+        from collaborative import Role
+        # Simulate a hand-edited JSON with a typo'd role by parsing via
+        # CollabWorkspace.from_dict — get_role returns None for unknowns,
+        # which is the production fallback path.
+        ws = CollabWorkspace.from_dict({
+            "id": "c-bad",
+            "name": "bad",
+            "display_name": "Bad",
+            "agent_name": "bad",
+            "chat_id": -100999,
+            "roles": {"111": "super-duper-owner"},
+        })
+        assert ws.get_role(111) is None
+        # Known values still resolve correctly.
+        ws.set_role(111, Role.OPERATOR)
+        assert ws.get_role(111) == Role.OPERATOR

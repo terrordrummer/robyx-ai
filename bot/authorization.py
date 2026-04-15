@@ -55,9 +55,25 @@ def can_send_executive(role: Role | None) -> bool:
     return role in (Role.OWNER, Role.OPERATOR)
 
 
-def can_close_workspace(role: Role | None, user_id: int, ws: CollabWorkspace) -> bool:
-    """Return True if the user can close this collaborative workspace."""
-    return user_id == ws.created_by
+def can_close_workspace(
+    role: Role | None,
+    user_id: int,
+    ws: CollabWorkspace,
+    owner_id: int | None = None,
+) -> bool:
+    """Return True if ``user_id`` may close ``ws``.
+
+    Allowed: the workspace creator, or the bot's global owner (the
+    person who runs the bot). ``role`` is accepted for API symmetry
+    with the other ``can_*`` helpers; the decision is identity-based,
+    not role-based, because in a collab group the OWNER role is
+    scoped to that workspace.
+    """
+    if user_id == ws.created_by:
+        return True
+    if owner_id is not None and user_id == owner_id:
+        return True
+    return False
 
 
 def can_manage_roles(role: Role | None) -> bool:

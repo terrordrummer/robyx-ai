@@ -211,6 +211,26 @@ class TestCollabStore:
         reloaded = CollabStore(path)
         assert reloaded.get("collab-test1").expected_creator_id == 555
 
+    def test_purge_closed_drops_only_closed(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        active = _make_ws(id="c1", name="a", agent_name="a", status="active")
+        closed1 = _make_ws(
+            id="c2", name="b", agent_name="b",
+            status="closed", chat_id=-100222,
+        )
+        closed2 = _make_ws(
+            id="c3", name="c", agent_name="c",
+            status="closed", chat_id=-100333,
+        )
+        store.add(active)
+        store.add(closed1)
+        store.add(closed2)
+
+        assert store.purge_closed() == 2
+        assert {w.id for w in store.list_all()} == {"c1"}
+        # Idempotent.
+        assert store.purge_closed() == 0
+
     def test_list_all_returns_every_status(self, tmp_path):
         store = CollabStore(tmp_path / "collab.json")
         a = _make_ws(id="c1", name="a", agent_name="a", status="active")

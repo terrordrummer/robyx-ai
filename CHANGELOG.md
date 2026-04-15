@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.20.27
+
+### Added
+- **`bot/scheduled_delivery.py`** -- recognise `[SILENT]` in scheduled-task output; suppress the Telegram delivery when the residual text (after stripping `[STATUS ...]`) is empty and the run succeeded. Failures never silent.
+- **`bot/scheduler.py`** -- wrap every one-shot/periodic prompt with an explicit OUTPUT POLICY that instructs the agent to answer `[SILENT]` when nothing actionable happened.
+- **`templates/CONTINUOUS_STEP.md`** -- same silence policy for continuous-step agents (state/log/commits still happen; only the chat message is suppressed).
+- **`bot/collaborative.py`** -- `CollabWorkspace.expected_creator_id` (optional) plus `CollabStore.list_pending_for_creator()`, `list_all()`, `purge_closed()`; file I/O now runs under a `threading.Lock + fcntl.flock` mutex matching the scheduler's queue pattern.
+- **`bot/messaging/base.py`** + **`telegram.py`** -- public `Platform.bot_username` property; telegram adapter returns `bot.username`.
+
+### Fixed (collaborative workspaces)
+- **`bot/authorization.py`** -- `get_user_role()` accepts `owner_id=None` and fail-closes; `can_close_workspace()` accepts optional `owner_id` and is now the single source of truth for the `/close` check.
+- **`bot/handlers.py`** -- `_handle_collaborative_message` no longer auto-promotes unknown senders to `PARTICIPANT` on disk (membership is OWNER-managed via Telegram-group membership). `collab_bot_added` uses `list_pending_for_creator(added_by_id)` so an outsider cannot hijack a pending workspace provisioned for someone else. `_rebuild_chat_map` routes `status="setup"` workspaces, unblocking Flow B. `_process_and_send` takes an `is_executive` flag; non-executive responses go through the new `_strip_executive_markers()` which drops `FOCUS` / `RESTART` / `CREATE_WORKSPACE` / `REMIND` / `SEND_IMAGE` / delegation markers (defense-in-depth against prompt injection). Passive-mode mention detection now reads `platform.bot_username` (public) instead of the removed `_bot_username` private attribute and dropped the dead `if not mentioned: pass` branch. `_collab_role()` tolerates unknown role strings with a warning instead of crashing Flow A.
+- **`bot/collaborative.py`** -- `_rebuild_chat_map` includes `status="setup"`.
+
+### Tests
+1050 passed, 1 skipped. +16 tests: silent-delivery (success, `[STATUS]`+silent, failure-not-suppressed, real-content-passthrough); collab store (setup routing, creator-scoped pending lookup, `expected_creator_id` persistence, `list_all`, `purge_closed`); handlers (no-role-mutation on unknown sender, `owner_id=None` fail-closed, `_strip_executive_markers`, role-string fallback); authorization (global-owner close).
+
+### Migration
+None. `bot/migrations/v0_20_27.py` is a no-op.
+
 ## 0.20.26
 
 ### Added (collaborative workspaces)

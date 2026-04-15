@@ -212,6 +212,25 @@ class CollabStore:
             self._write_unlocked()
             return True
 
+    def purge_closed(self) -> int:
+        """Drop every workspace in ``status="closed"`` from the store.
+
+        Closed workspaces linger in-memory/on-disk so that operators can
+        audit history; call this from a maintenance command when the
+        backlog gets too large. Returns the number of entries removed.
+        """
+        with self._mutex():
+            closed_ids = [
+                ws_id for ws_id, ws in self._workspaces.items()
+                if ws.status == "closed"
+            ]
+            for ws_id in closed_ids:
+                del self._workspaces[ws_id]
+            if closed_ids:
+                self._rebuild_chat_map()
+                self._write_unlocked()
+            return len(closed_ids)
+
     def get(self, ws_id: str) -> CollabWorkspace | None:
         return self._workspaces.get(ws_id)
 
