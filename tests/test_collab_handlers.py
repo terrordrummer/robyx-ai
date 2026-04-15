@@ -327,3 +327,76 @@ class TestCollabNonCommandRouting:
             text = mock_platform.reply.call_args[0][1]
             assert "usage" not in text.lower()
             assert "closed" not in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# C4: agent must not mutate persisted roles
+# ---------------------------------------------------------------------------
+
+class TestCollabRolesImmutability:
+    @pytest.mark.asyncio
+    async def test_unknown_sender_does_not_persist_role(
+        self, collab_handlers, collab_ws, collab_store, mock_platform, msg_ref,
+    ):
+        """An unknown sender in a collab group must NOT be auto-added
+        to the workspace roles. Membership is OWNER-managed externally
+        (Telegram group membership); roles persist only via /promote."""
+        roles_before = dict(collab_ws.roles)
+        store_path_before = collab_store._path.read_text() if collab_store._path.exists() else None
+
+        msg = make_collab_msg(user_id=77777, text="random visitor message")
+        await collab_handlers["message"](mock_platform, msg, msg_ref)
+
+        assert collab_ws.roles == roles_before
+        assert "77777" not in collab_ws.roles
+        if store_path_before is not None:
+            assert collab_store._path.read_text() == store_path_before
+
+
+# ---------------------------------------------------------------------------
+# C1: OWNER_ID=None must not grant OWNER role to anyone
+# ---------------------------------------------------------------------------
+
+class TestOwnerIdUnconfigured:
+    def test_unconfigured_owner_does_not_match(self, tmp_path):
+        from authorization import get_user_role
+        store = CollabStore(tmp_path / "c.json")
+        # Without owner_id, even user_id=0 must not be promoted to OWNER.
+        role, _ = get_user_role(0, -100888, store, owner_id=None)
+        assert role is None
+        role, _ = get_user_role(123, -100888, store, owner_id=None)
+        assert role is None
+
+
+# ---------------------------------------------------------------------------
+# C6: non-executive responses get tool-markers stripped
+# ---------------------------------------------------------------------------
+
+class TestStripExecutiveMarkers:
+    def test_strips_all_markers(self):
+        from handlers import _strip_executive_markers
+        response = (
+            "Sure, on it.\n"
+            "[FOCUS off]\n"
+            "[RESTART]\n"
+            '[CREATE_WORKSPACE name="x" type="oneshot" frequency="hourly" '
+            'model="claude" scheduled_at="2026-01-01T00:00:00+00:00"]\n'
+            '[REMIND in="2m" text="ping"]\n'
+            'Final words.'
+        )
+        cleaned = _strip_executive_markers(response, "test-agent")
+        assert "[FOCUS" not in cleaned
+        assert "[RESTART]" not in cleaned
+        assert "[CREATE_WORKSPACE" not in cleaned
+        assert "[REMIND" not in cleaned
+        assert "Sure, on it." in cleaned
+        assert "Final words." in cleaned
+
+    def test_no_markers_pass_through(self):
+        from handlers import _strip_executive_markers
+        response = "Just a friendly reply."
+        assert _strip_executive_markers(response, "a") == response
+
+    def test_empty_input_safe(self):
+        from handlers import _strip_executive_markers
+        assert _strip_executive_markers("", "a") == ""
