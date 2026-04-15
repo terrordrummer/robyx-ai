@@ -21,6 +21,7 @@ from ai_invoke import (
     RESTART_PATTERN,
     SEND_IMAGE_PATTERN,
     SPECIALIST_INSTRUCTIONS_PATTERN,
+    TTS_SUMMARY_PATTERN,
     handle_delegations,
     handle_focus_commands,
     handle_specialist_requests,
@@ -363,6 +364,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend):
 
             # Schedule any [REMIND ...] requests into the reminder engine.
             response = _handle_remind_commands(response, agent, chat_id, thread_id)
+
+            # Strip TTS summary blocks — redundant recap not useful on chat.
+            response = TTS_SUMMARY_PATTERN.sub("", response).strip()
+            response = re.sub(r'\n{3,}', '\n\n', response)
 
             await _send_response(chat_id, platform, agent, response, thread_id=thread_id)
 
