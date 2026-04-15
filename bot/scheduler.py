@@ -814,11 +814,25 @@ async def _spawn_agent_task(task: dict, backend: AIBackend, platform=None) -> in
         runtime.work_dir,
     )
 
+    silence_policy = (
+        "OUTPUT POLICY (silence by default):\n"
+        "Notify the user only when there is something actionable: an anomaly,\n"
+        "a deadline, an event, a question that needs a human decision, or a\n"
+        "concrete result the user explicitly asked for. Do NOT emit\n"
+        "'all clear' status reports, system snapshots (disk/CPU/memory/lock\n"
+        "files), or recap tables when nothing requires attention. If the run\n"
+        "has nothing actionable to report, your final response must be\n"
+        "exactly `[SILENT]` on its own line and nothing else — the\n"
+        "delivery layer suppresses it.\n"
+        "Failures and errors are never silent: always report them."
+    )
+
     if prompt_override:
         full_prompt = (
             "You are a scheduled sub-agent for task '%s'.\n\n"
             "Your specific task for this run:\n%s\n\n"
             "Context from agent instructions:\n---\n%s\n---\n\n"
+            "%s\n\n"
             "%s\n\n"
             "WHEN DONE (success or failure):\n"
             "1. Append to %s:\n"
@@ -827,12 +841,13 @@ async def _spawn_agent_task(task: dict, backend: AIBackend, platform=None) -> in
             "2. Delete your lock file: rm -f %s\n"
             "3. Always delete the lock file, even on error."
         ) % (task_name, prompt_override, agent_instructions, memory_ctx,
-             LOG_FILE, task_name, lock_file)
+             silence_policy, LOG_FILE, task_name, lock_file)
     else:
         full_prompt = (
             "You are a scheduled sub-agent for task '%s'.\n\n"
             "Execute the following instructions completely and autonomously:\n\n"
             "---\n%s\n---\n\n"
+            "%s\n\n"
             "%s\n\n"
             "WHEN DONE (success or failure):\n"
             "1. Append to %s:\n"
@@ -841,7 +856,7 @@ async def _spawn_agent_task(task: dict, backend: AIBackend, platform=None) -> in
             "2. Delete your lock file: rm -f %s\n"
             "3. Always delete the lock file, even on error."
         ) % (task_name, agent_instructions, memory_ctx,
-             LOG_FILE, task_name, lock_file)
+             silence_policy, LOG_FILE, task_name, lock_file)
 
     cmd = backend.build_spawn_command(
         prompt=full_prompt,
