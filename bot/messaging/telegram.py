@@ -276,3 +276,9 @@ class TelegramPlatform(Platform):
     def set_bot(self, bot):
         """Set the telegram Bot instance (called during app setup)."""
         self._bot = bot
+
+    @property
+    def bot_username(self) -> str | None:
+        if self._bot is None:
+            return None
+        return getattr(self._bot, "username", None)

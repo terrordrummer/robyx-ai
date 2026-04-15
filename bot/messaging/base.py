@@ -80,6 +80,17 @@ class Platform(abc.ABC):
         return 10 * 1024 * 1024
 
     @property
+    def bot_username(self) -> str | None:
+        """Return the bot's at-handle without the leading ``@`` (or None).
+
+        Used by the collaborative-workspace routing to detect explicit
+        mentions (``@robyx_bot``) in passive-mode groups. Adapters that
+        know their username should override and return it; the default
+        returns ``None``, which means "no mention detection".
+        """
+        return None
+
+    @property
     @abc.abstractmethod
     def control_room_id(self) -> Any:
         """Thread/channel ID for the control room (General topic).

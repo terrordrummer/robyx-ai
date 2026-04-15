@@ -81,6 +81,12 @@ class TestPermissionChecks:
         assert can_close_workspace(Role.OWNER, 111, ws) is True
         assert can_close_workspace(Role.OWNER, 222, ws) is False
 
+    def test_can_close_workspace_allows_global_owner(self):
+        ws = _make_ws()
+        assert can_close_workspace(None, 777, ws, owner_id=777) is True
+        assert can_close_workspace(None, 888, ws, owner_id=777) is False
+        assert can_close_workspace(None, 777, ws, owner_id=None) is False
+
     def test_can_manage_roles(self):
         assert can_manage_roles(Role.OWNER) is True
         assert can_manage_roles(Role.OPERATOR) is False

@@ -1046,16 +1046,17 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         user_display = msg.user_name or str(msg.user_id)
         is_executive = can_send_executive(role)
 
-        # Passive mode: only respond to explicit @bot invocations
+        # Passive mode: respond only to explicit @bot mentions or to
+        # messages from executive users (owner/operator). When the
+        # platform adapter can't report its handle, mentions are
+        # undetectable — fall back to executive-only to fail closed.
         if collab_ws.interaction_mode == "passive":
-            bot_username = getattr(platform, "_bot_username", None)
-            mentioned = False
-            if bot_username and ("@%s" % bot_username) in (msg.text or ""):
-                mentioned = True
+            bot_username = platform.bot_username
+            mentioned = bool(
+                bot_username and ("@%s" % bot_username) in (msg.text or "")
+            )
             if not mentioned and not is_executive:
                 return
-            if not mentioned:
-                pass
 
         exec_tag = " [EXECUTIVE]" if is_executive else ""
         formatted_text = "[%s (%s)%s] %s" % (
@@ -1139,8 +1140,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             return True
 
         if cmd == "/close":
-            if msg.user_id != collab_ws.created_by and not (
-                _config.OWNER_ID and msg.user_id == _config.OWNER_ID
+            from authorization import can_close_workspace
+            if not can_close_workspace(
+                role, msg.user_id, collab_ws,
+                owner_id=getattr(_config, "OWNER_ID", None),
             ):
                 await platform.reply(msg_ref, STRINGS["collab_close_denied"])
                 return True
@@ -1398,8 +1401,22 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             log.warning("Failed to notify HQ about new group: %s", e)
 
     def _collab_role(role_str):
+        """Coerce a stored role string to a ``Role`` enum, tolerating typos.
+
+        Returns ``Role.PARTICIPANT`` as a safe fallback when ``role_str``
+        is not a known value — prevents Flow A from crashing on a
+        hand-edited ``collaborative_workspaces.json``. The anomaly is
+        logged so the misconfiguration surfaces.
+        """
         from collaborative import Role
-        return Role(role_str)
+        try:
+            return Role(role_str)
+        except ValueError:
+            log.warning(
+                "Unknown role string %r in collaborative store; falling back to PARTICIPANT",
+                role_str,
+            )
+            return Role.PARTICIPANT
 
     result = {
         "start": cmd_help,
