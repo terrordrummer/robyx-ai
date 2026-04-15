@@ -31,6 +31,7 @@ from logging.handlers import RotatingFileHandler
 from telegram import Update
 from telegram.ext import (
     Application,
+    ChatMemberHandler,
     CommandHandler,
     MessageHandler,
     TypeHandler,
@@ -298,8 +299,12 @@ def main():
         signal.signal(signal.SIGTERM, lambda *a: (save_on_exit(), sys.exit(0)))
     signal.signal(signal.SIGINT, lambda *a: (save_on_exit(), sys.exit(0)))
 
+    # Initialize collaborative workspace store
+    from collaborative import CollabStore
+    collab_store = CollabStore()
+
     # Build handlers
-    h = make_handlers(manager, backend)
+    h = make_handlers(manager, backend, collab_store=collab_store)
 
     if PLATFORM == "slack":
         _run_slack(plat, h, backend, manager)
@@ -333,6 +338,13 @@ def _run_telegram(plat, h, backend, manager):
     app.add_handler(TypeHandler(Update, _log_raw_update), group=-1)
 
     # Wrap handlers to bridge Telegram's (update, context) to our (platform, msg, msg_ref)
+    def _get_user_display_name(user) -> str | None:
+        if user is None:
+            return None
+        parts = [user.first_name or "", user.last_name or ""]
+        name = " ".join(p for p in parts if p).strip()
+        return name or user.username or str(user.id)
+
     def _wrap_command(handler_fn):
         async def wrapper(update, context):
             log.info(
@@ -348,6 +360,7 @@ def _run_telegram(plat, h, backend, manager):
                 text=update.message.text,
                 thread_id=getattr(update.message, "message_thread_id", None),
                 args=context.args or [],
+                user_name=_get_user_display_name(update.effective_user),
             )
             await handler_fn(plat, msg, update.message)
         return wrapper
@@ -366,6 +379,7 @@ def _run_telegram(plat, h, backend, manager):
                 chat_id=update.effective_chat.id,
                 text=update.message.text,
                 thread_id=getattr(update.message, "message_thread_id", None),
+                user_name=_get_user_display_name(update.effective_user),
             )
             await handler_fn(plat, msg, update.message)
         return wrapper
@@ -400,6 +414,25 @@ def _run_telegram(plat, h, backend, manager):
 
     # Register text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _wrap_message(h["message"])))
+
+    # Collaborative workspaces: detect when the bot is added to a new group.
+    if "collab_bot_added" in h:
+        async def _on_my_chat_member(update, context):
+            member_update = update.my_chat_member
+            if member_update is None:
+                return
+            new_status = member_update.new_chat_member.status
+            old_status = member_update.old_chat_member.status
+            chat = member_update.chat
+            added_by = member_update.from_user
+            if new_status in ("member", "administrator") and old_status in ("left", "kicked"):
+                log.info(
+                    "Bot added to group: chat_id=%s title=%r by user=%s",
+                    chat.id, chat.title, added_by.id if added_by else "unknown",
+                )
+                await h["collab_bot_added"](plat, chat, added_by)
+
+        app.add_handler(ChatMemberHandler(_on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
     # Unified scheduler: runs every SCHEDULER_INTERVAL seconds (default 60s).
     # Handles periodic tasks, one-shot tasks, reminders, and continuous tasks.

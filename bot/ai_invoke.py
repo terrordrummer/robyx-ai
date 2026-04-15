@@ -14,6 +14,7 @@ from ai_backend import AIBackend
 from config import (
     AGENTS_DIR,
     AI_TIMEOUT,
+    COLLABORATIVE_AGENT_SYSTEM_PROMPT,
     FOCUSED_AGENT_SYSTEM_PROMPT,
     ROBYX_SYSTEM_PROMPT,
     MAX_AI_RETRIES,
@@ -87,6 +88,9 @@ SEND_IMAGE_PATTERN = re.compile(
 TTS_SUMMARY_PATTERN = re.compile(
     r'\[TTS_SUMMARY\].*?\[/TTS_SUMMARY\]', re.DOTALL
 )
+
+# Collaborative agent silent response: agent chose not to speak.
+SILENT_PATTERN = re.compile(r'\[SILENT\]')
 
 # Schedule a reminder: [REMIND at="2026-04-08T17:32:00+02:00" text="..."]
 # or [REMIND in="2m" text="..."] or [REMIND in="1h30m" text="..." thread="903"]
@@ -335,12 +339,13 @@ async def _invoke_ai_locked(
     system_prompt = None
     if agent.name == "robyx":
         system_prompt = ROBYX_SYSTEM_PROMPT
+    elif agent.collab_workspace_id:
+        system_prompt = COLLABORATIVE_AGENT_SYSTEM_PROMPT
+        system_prompt = system_prompt + _load_agent_instructions(agent)
     elif manager.focused_agent == agent.name:
         system_prompt = FOCUSED_AGENT_SYSTEM_PROMPT
     elif agent.agent_type in ("workspace", "specialist"):
         system_prompt = WORKSPACE_AGENT_SYSTEM_PROMPT
-        # Append the per-agent markdown brief so interactive turns get the
-        # same instructions the scheduled runs already use.
         system_prompt = system_prompt + _load_agent_instructions(agent)
 
     # Inject memory context and management instructions

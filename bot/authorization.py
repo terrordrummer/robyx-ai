@@ -1,0 +1,59 @@
+"""Robyx -- Authorization layer for collaborative workspaces.
+
+Determines what a user can do in a given context (HQ vs collaborative
+group) based on their role. The bot owner is always fully authorized
+everywhere.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from collaborative import CollabStore, CollabWorkspace, Role
+
+log = logging.getLogger("robyx.authorization")
+
+
+def get_user_role(
+    user_id: int,
+    chat_id: Any,
+    collab_store: CollabStore,
+    owner_id: int,
+) -> tuple[Role | None, CollabWorkspace | None]:
+    """Resolve a user's role in the context of a specific chat.
+
+    Returns ``(role, collab_workspace)`` where:
+    - For the bot owner in any collaborative workspace: ``(OWNER, ws)``
+    - For the bot owner in HQ: ``(OWNER, None)``
+    - For a known collaborator: ``(their role, ws)``
+    - For an unknown user in a collab group: ``(None, ws)``
+    - For a non-owner in HQ: ``(None, None)``
+    """
+    ws = collab_store.get_by_chat_id(chat_id)
+
+    if ws is None:
+        if user_id == owner_id:
+            return Role.OWNER, None
+        return None, None
+
+    if user_id == owner_id:
+        return Role.OWNER, ws
+
+    role = ws.get_role(user_id)
+    return role, ws
+
+
+def can_send_executive(role: Role | None) -> bool:
+    """Return True if the user's role allows executive instructions."""
+    return role in (Role.OWNER, Role.OPERATOR)
+
+
+def can_close_workspace(role: Role | None, user_id: int, ws: CollabWorkspace) -> bool:
+    """Return True if the user can close this collaborative workspace."""
+    return user_id == ws.created_by
+
+
+def can_manage_roles(role: Role | None) -> bool:
+    """Return True if the user can promote/demote others."""
+    return role == Role.OWNER

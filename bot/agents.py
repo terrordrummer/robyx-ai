@@ -50,6 +50,7 @@ class Agent:
     message_count: int = 0
     session_started: bool = False
     thread_id: Any = None
+    collab_workspace_id: str | None = None
     busy: bool = False
     interrupted: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
@@ -94,6 +95,7 @@ class Agent:
             "message_count": self.message_count,
             "session_started": self.session_started,
             "thread_id": self.thread_id,
+            "collab_workspace_id": self.collab_workspace_id,
         }
 
     @classmethod
