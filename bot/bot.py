@@ -289,7 +289,13 @@ def main():
     else:
         raise ValueError("Unsupported platform: %s" % PLATFORM)
 
+    _shutdown_done = False
+
     def save_on_exit(*_args):
+        nonlocal _shutdown_done
+        if _shutdown_done:
+            return
+        _shutdown_done = True
         log.info("Shutting down — saving state...")
         manager.save_state()
         PID_FILE.unlink(missing_ok=True)

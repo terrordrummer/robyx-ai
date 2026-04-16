@@ -155,6 +155,12 @@ def _restore_data_dir(snapshot: Path) -> bool:
             # path-traversal attempts; flag suspicious sizes.
             data_dir_resolved = DATA_DIR.resolve()
             for member in tf.getmembers():
+                if member.issym() or member.islnk():
+                    log.error(
+                        "Refusing to restore snapshot %s: symlink/hardlink member %s",
+                        snapshot, member.name,
+                    )
+                    return False
                 if member.name.startswith("/") or ".." in Path(member.name).parts:
                     log.error(
                         "Refusing to restore snapshot %s: unsafe member %s",
@@ -674,6 +680,8 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         pip_path = PROJECT_ROOT / ".venv" / venv_bin / pip_name
         if not pip_path.exists():
             await _rollback_code_to(current)
+            if snapshot is not None:
+                _restore_data_dir(snapshot)
             if has_stash:
                 await _git("stash", "pop", check=False)
             return False, "venv pip not found at %s" % pip_path
@@ -692,6 +700,8 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         except asyncio.TimeoutError:
             deps_proc.kill()
             await _rollback_code_to(current)
+            if snapshot is not None:
+                _restore_data_dir(snapshot)
             if has_stash:
                 await _git("stash", "pop", check=False)
             return False, "pip install timed out after 600s"
@@ -705,6 +715,8 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
 
         if deps_proc.returncode != 0:
             await _rollback_code_to(current)
+            if snapshot is not None:
+                _restore_data_dir(snapshot)
             if has_stash:
                 await _git("stash", "pop", check=False)
             tail_lines = (pip_err_text or pip_out_text).strip().splitlines()[-8:]

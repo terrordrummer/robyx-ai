@@ -244,7 +244,12 @@ def _load_agent_instructions(agent: Agent) -> str:
     if cached and cached[0] == mtime and cached[1] == size:
         return cached[2]
 
-    instructions = path.read_text().strip()
+    try:
+        instructions = path.read_text().strip()
+    except (OSError, UnicodeDecodeError) as e:
+        log.warning("Failed to read agent instructions %s: %s", path, e)
+        _instructions_cache.pop(key, None)
+        return ""
     payload = "\n\n## Agent Instructions\n" + instructions if instructions else ""
     _instructions_cache[key] = (mtime, size, payload)
     return payload
@@ -598,10 +603,14 @@ async def _invoke_ai_locked(
             pass
         agent.busy = False
         agent.interrupted = False
-        if agent.running_proc is not None:
-            import orphan_tracker
-            orphan_tracker.unregister(agent.running_proc.pid)
-        agent.running_proc = None
+        try:
+            if agent.running_proc is not None:
+                import orphan_tracker
+                orphan_tracker.unregister(agent.running_proc.pid)
+        except Exception:
+            log.debug("orphan_tracker cleanup failed", exc_info=True)
+        finally:
+            agent.running_proc = None
 
 
 async def _read_stream(proc, platform, chat_id, effective_thread_id, backend):
