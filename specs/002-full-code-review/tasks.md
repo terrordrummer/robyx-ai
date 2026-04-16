@@ -19,8 +19,8 @@
 
 **Purpose**: Establish review baseline
 
-- [ ] T001 Run full test suite and record baseline: test count, pass count, and total LOC via `pytest tests/ -q` and `find bot -name '*.py' | xargs wc -l`
-- [ ] T002 [P] Create findings report template at `specs/002-full-code-review/findings.md` with columns: ID, Module, Category, Severity, Description, Fix
+- [x] T001 Run full test suite and record baseline: test count, pass count, and total LOC via `pytest tests/ -q` and `find bot -name '*.py' | xargs wc -l`
+- [x] T002 [P] Create findings report template at `specs/002-full-code-review/findings.md` with columns: ID, Module, Category, Severity, Description, Fix
 
 **Checkpoint**: Baseline recorded, findings template ready
 
@@ -34,11 +34,11 @@
 
 ### Group A: Core / High Risk
 
-- [ ] T003 [US1] Review and fix bugs in `bot/handlers.py` — focus on input parsing, command dispatch edge cases, unhandled exceptions in message processing
-- [ ] T004 [US1] Review and fix bugs in `bot/scheduler.py` — focus on timer precision, concurrent task claims, crash recovery, late-fire logic
-- [ ] T005 [US1] Review and fix bugs in `bot/ai_invoke.py` — focus on subprocess lifecycle, timeout handling, output parsing, error propagation
-- [ ] T006 [US1] Review and fix bugs in `bot/bot.py` — focus on startup/shutdown ordering, signal handling, service lifecycle, PID lock
-- [ ] T007 [US1] Review and fix bugs in `bot/updater.py` — focus on snapshot/rollback atomicity, smoke test, version comparison, file operations
+- [x] T003 [US1] Review and fix bugs in `bot/handlers.py` — focus on input parsing, command dispatch edge cases, unhandled exceptions in message processing
+- [x] T004 [US1] Review and fix bugs in `bot/scheduler.py` — focus on timer precision, concurrent task claims, crash recovery, late-fire logic
+- [x] T005 [US1] Review and fix bugs in `bot/ai_invoke.py` — focus on subprocess lifecycle, timeout handling, output parsing, error propagation
+- [x] T006 [US1] Review and fix bugs in `bot/bot.py` — focus on startup/shutdown ordering, signal handling, service lifecycle, PID lock
+- [x] T007 [US1] Review and fix bugs in `bot/updater.py` — focus on snapshot/rollback atomicity, smoke test, version comparison, file operations
 
 ### Group B: Platform Adapters
 

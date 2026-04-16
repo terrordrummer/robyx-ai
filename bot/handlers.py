@@ -287,8 +287,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         body = notes["body"].strip() if notes else "(no release notes)"
 
         if info["status"] == "incompatible":
+            min_compat = notes["min_compatible"] if notes else "unknown"
             text = STRINGS["update_available_incompatible"] % (
-                info["current"], info["version"], notes["min_compatible"],
+                info["current"], info["version"], min_compat,
             )
         elif info["status"] == "breaking":
             text = STRINGS["update_available_breaking"] % (
@@ -629,23 +630,24 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
             from topics import create_continuous_workspace
 
+            parent_agent = manager.get_by_thread(thread_id)
+            if parent_agent:
+                parent_ws_name = parent_agent.name
+            else:
+                log.warning(
+                    "Continuous task %s: thread_id=%s has no mapped "
+                    "workspace; reparenting to 'robyx'",
+                    cont_name, thread_id,
+                )
+                parent_ws_name = "robyx"
+
             rejection_reason = None
             try:
                 result = await create_continuous_workspace(
                     name=cont_name,
                     program=program,
                     work_dir=cont_work_dir,
-                    parent_workspace=(
-                        manager.get_by_thread(thread_id).name
-                        if manager.get_by_thread(thread_id)
-                        else (
-                            log.warning(
-                                "Continuous task %s: thread_id=%s has no mapped "
-                                "workspace; reparenting to 'robyx'",
-                                cont_name, thread_id,
-                            ) or "robyx"
-                        )
-                    ),
+                    parent_workspace=parent_ws_name,
                     model="powerful",
                     manager=manager,
                     platform=platform,

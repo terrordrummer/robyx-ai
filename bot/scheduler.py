@@ -728,7 +728,7 @@ async def _dispatch_reminders(
                 "claim_token": reminder["claim_token"],
                 "status": "pending",
             })
-        except (OSError, RuntimeError) as e:
+        except Exception as e:
             log.error("Failed to send reminder %s: %s", reminder["id"], e)
             results.append({
                 "id": reminder["id"],
