@@ -138,29 +138,6 @@ class TestGetProcessName:
 # ── is_bot_process / is_ai_process (async) ───────────────────────────────
 
 
-class TestIsBotProcess:
-    @pytest.mark.asyncio
-    async def test_python_process_is_bot(self):
-        from process import is_bot_process
-
-        with patch("process.get_process_name", new=AsyncMock(return_value="python3.10")):
-            assert await is_bot_process(1234) is True
-
-    @pytest.mark.asyncio
-    async def test_non_python_is_not_bot(self):
-        from process import is_bot_process
-
-        with patch("process.get_process_name", new=AsyncMock(return_value="nginx")):
-            assert await is_bot_process(1234) is False
-
-    @pytest.mark.asyncio
-    async def test_empty_name_is_not_bot(self):
-        from process import is_bot_process
-
-        with patch("process.get_process_name", new=AsyncMock(return_value="")):
-            assert await is_bot_process(1234) is False
-
-
 class TestIsAiProcess:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("name", ["claude", "codex", "opencode", "python", "node"])

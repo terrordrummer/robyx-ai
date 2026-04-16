@@ -19,17 +19,16 @@ from pathlib import Path
 
 from config import DATA_DIR
 from memory_store import (
-    append_archive_entry,
     get_connection,
     list_archive_topics,
     load_active_snapshot,
     resolve_db_path,
-    save_active_snapshot,
     search_archive as _store_search,
 )
 
 log = logging.getLogger("robyx.memory")
 
+# Legacy constants — kept for backward compatibility with test suite.
 ACTIVE_FILE = "active.md"
 ARCHIVE_DIR = "archive"
 MAX_ACTIVE_WORDS = 5000

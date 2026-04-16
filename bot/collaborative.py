@@ -36,11 +36,6 @@ class Role(enum.Enum):
     PARTICIPANT = "participant"
 
 
-class InteractionMode(enum.Enum):
-    INTELLIGENT = "intelligent"
-    PASSIVE = "passive"
-
-
 @dataclass
 class CollabWorkspace:
     """A collaborative workspace backed by an external Telegram group."""

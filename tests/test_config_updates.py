@@ -5,12 +5,12 @@ from config_updates import apply_env_updates, parse_direct_env_updates
 
 def test_parse_direct_env_updates_accepts_explicit_assignments():
     updates = parse_direct_env_updates(
-        "OPENAI_API_KEY=sk-test\nDISCORD_CONTROL_CHANNEL_ID=123456789\nCLAUDE_PERMISSION_MODE=bypassPermissions",
+        "OPENAI_API_KEY=sk-test\nSCHEDULER_INTERVAL=120\nCLAUDE_PERMISSION_MODE=bypassPermissions",
     )
 
     assert updates == {
         "OPENAI_API_KEY": "sk-test",
-        "DISCORD_CONTROL_CHANNEL_ID": "123456789",
+        "SCHEDULER_INTERVAL": "120",
         "CLAUDE_PERMISSION_MODE": "bypassPermissions",
     }
 

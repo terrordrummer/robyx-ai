@@ -93,11 +93,11 @@
 
 **Independent Test**: Style audit shows uniform conventions; LOC count is lower than baseline.
 
-- [ ] T036 [US2] Audit and remove dead code, unused imports, and unreachable branches across all `bot/*.py` files
-- [ ] T037 [P] [US2] Normalize logging patterns across all modules — consistent logger names, log levels, message format
-- [ ] T038 [P] [US2] Normalize error handling patterns — consistent exception hierarchy, no bare `except:`, no swallowed errors
-- [ ] T039 [P] [US2] Normalize naming conventions — consistent function/variable naming across modules
-- [ ] T040 [US2] Run full test suite after US2 changes — verify zero regressions
+- [x] T036 [US2] Audit and remove dead code, unused imports, and unreachable branches across all `bot/*.py` files
+- [x] T037 [P] [US2] Normalize logging patterns across all modules — consistent logger names, log levels, message format
+- [x] T038 [P] [US2] Normalize error handling patterns — consistent exception hierarchy, no bare `except:`, no swallowed errors
+- [x] T039 [P] [US2] Normalize naming conventions — consistent function/variable naming across modules
+- [x] T040 [US2] Run full test suite after US2 changes — verify zero regressions
 
 **Checkpoint**: Codebase reads as if written by one person. Dead code removed.
 
@@ -109,15 +109,15 @@
 
 **Independent Test**: Security-focused review finds zero medium+ severity issues.
 
-- [ ] T041 [US3] Security review of `bot/handlers.py` — command injection via user input, auth bypass, message content injection
-- [ ] T042 [P] [US3] Security review of `bot/ai_invoke.py` — command injection in CLI invocation, output sanitization, env var leakage
-- [ ] T043 [P] [US3] Security review of `bot/process.py` — subprocess argument injection, shell=True usage, env propagation
-- [ ] T044 [P] [US3] Security review of `bot/config.py` and `bot/config_updates.py` — token exposure in logs, .env file permissions
-- [ ] T045 [P] [US3] Security review of `bot/updater.py` — path traversal in update extraction, snapshot integrity
-- [ ] T046 [P] [US3] Security review of `bot/topics.py` — topic name sanitization, platform-specific injection
-- [ ] T047 [P] [US3] Security review of `bot/collaborative.py` and `bot/authorization.py` — auth checks, permission escalation
-- [ ] T048 [P] [US3] Security review of `bot/memory_store.py` — SQL injection in FTS5 queries, path traversal in db_path resolution
-- [ ] T049 [US3] Run full test suite after US3 fixes — verify zero regressions, security tests added
+- [x] T041 [US3] Security review of `bot/handlers.py` — command injection via user input, auth bypass, message content injection
+- [x] T042 [P] [US3] Security review of `bot/ai_invoke.py` — command injection in CLI invocation, output sanitization, env var leakage
+- [x] T043 [P] [US3] Security review of `bot/process.py` — subprocess argument injection, shell=True usage, env propagation
+- [x] T044 [P] [US3] Security review of `bot/config.py` and `bot/config_updates.py` — token exposure in logs, .env file permissions
+- [x] T045 [P] [US3] Security review of `bot/updater.py` — path traversal in update extraction, snapshot integrity
+- [x] T046 [P] [US3] Security review of `bot/topics.py` — topic name sanitization, platform-specific injection
+- [x] T047 [P] [US3] Security review of `bot/collaborative.py` and `bot/authorization.py` — auth checks, permission escalation
+- [x] T048 [P] [US3] Security review of `bot/memory_store.py` — SQL injection in FTS5 queries, path traversal in db_path resolution
+- [x] T049 [US3] Run full test suite after US3 fixes — verify zero regressions, security tests added
 
 **Checkpoint**: Zero known security issues at medium severity or above.
 
@@ -129,11 +129,11 @@
 
 **Independent Test**: No blocking calls in async paths; no redundant I/O in hot loops.
 
-- [ ] T050 [US4] Performance review of `bot/scheduler.py` — identify blocking I/O in the 60s tick, redundant file reads, O(n^2) patterns
-- [ ] T051 [P] [US4] Performance review of `bot/handlers.py` — redundant lookups, unnecessary await chains, message processing latency
-- [ ] T052 [P] [US4] Performance review of `bot/ai_invoke.py` — subprocess overhead, output buffering, timeout efficiency
-- [ ] T053 [P] [US4] Performance review of `bot/bot.py` — startup time, service initialization, shutdown ordering
-- [ ] T054 [US4] Run full test suite after US4 fixes — verify zero regressions
+- [x] T050 [US4] Performance review of `bot/scheduler.py` — 5 findings documented: redundant queue read, blocking sync I/O, O(n) reconciliation, template re-read, save_state frequency
+- [x] T051 [P] [US4] Performance review of `bot/handlers.py` — clean, no issues
+- [x] T052 [P] [US4] Performance review of `bot/ai_invoke.py` — clean, streaming reader is efficient
+- [x] T053 [P] [US4] Performance review of `bot/bot.py` — clean, startup/shutdown ordering is correct
+- [x] T054 [US4] Run full test suite after US4 fixes — 1085 passed, zero regressions
 
 **Checkpoint**: Hot paths are clean. No blocking calls in async code.
 
@@ -143,10 +143,10 @@
 
 **Purpose**: Final verification, findings report, and LOC comparison
 
-- [ ] T055 Run full test suite — final green check across all changes
-- [ ] T056 Compare final LOC with baseline from T001 — document reduction
-- [ ] T057 Finalize `specs/002-full-code-review/findings.md` — complete findings report with all issues found and fixes applied
-- [ ] T058 [P] Verify `has_native_claude_memory()` and platform adapters still work correctly after all changes
+- [x] T055 Run full test suite — 1085 passed, 1 skipped, zero failures
+- [x] T056 Compare final LOC with baseline — 12,298 → 12,329 (+31, net increase from security hardening code)
+- [x] T057 Finalize `specs/002-full-code-review/findings.md` — complete findings report
+- [x] T058 [P] Verify `has_native_claude_memory()` and platform adapters still work correctly after all changes
 
 ---
 

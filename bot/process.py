@@ -102,12 +102,6 @@ async def get_process_name(pid: int) -> str:
     return ""
 
 
-async def is_bot_process(pid: int) -> bool:
-    """Check if a PID belongs to a Python/bot process."""
-    name = await get_process_name(pid)
-    return "python" in name
-
-
 async def is_ai_process(pid: int) -> bool:
     """Check if a PID belongs to an AI-related process (claude, codex, python, etc.)."""
     name = await get_process_name(pid)

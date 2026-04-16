@@ -620,6 +620,22 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
             cont_name = cont_match.group(1)
             cont_work_dir = cont_match.group(2)
+
+            # Validate work_dir stays under WORKSPACE to prevent path traversal
+            # via prompt injection in AI responses.
+            try:
+                resolved_wd = Path(cont_work_dir).resolve()
+                if not str(resolved_wd).startswith(str(WORKSPACE.resolve())):
+                    log.warning(
+                        "Continuous task %s: work_dir %r escapes WORKSPACE — rejected",
+                        cont_name, cont_work_dir,
+                    )
+                    response += "\n\nFailed to create continuous task: work_dir outside workspace."
+                    return response
+            except (OSError, ValueError):
+                response += "\n\nFailed to create continuous task: invalid work_dir."
+                return response
+
             try:
                 import json as _json
                 program = _json.loads(prog_match.group(1).strip())
