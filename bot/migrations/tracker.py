@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -49,9 +50,33 @@ def load(data_dir: Path) -> dict[str, Any]:
 
 
 def save(data_dir: Path, data: dict[str, Any]) -> None:
+    """Persist the tracker atomically.
+
+    The write goes through ``tmp + fsync + os.replace`` so a SIGKILL or
+    power loss mid-save can never leave ``migrations.json`` partially
+    written. A corrupt tracker would be treated as empty on next boot
+    and every migration in the chain would re-run — safe for idempotent
+    steps, dangerous for ones that assume they've already run once.
+    Closes Pass 2 C2 (crash-matrix.md).
+    """
     path = _file(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    payload = json.dumps(data, indent=2)
+    # Write + fsync the tmp file so its bytes are durable on disk before
+    # we swing the directory entry.
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            # fsync may fail on filesystems that don't support it
+            # (tmpfs, some network mounts) — fall back to the rename
+            # which is still atomic, just not durable against a host
+            # power loss on those filesystems.
+            pass
+    os.replace(tmp, path)
 
 
 def get_chain_state(tracker: dict[str, Any]) -> dict[str, Any]:

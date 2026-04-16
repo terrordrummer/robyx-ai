@@ -274,7 +274,7 @@
 
 ### Group D — Config & support (security lens)
 
-- [ ] T074 [P] [P2-SEC] Security-audit `bot/config.py` + `bot/config_updates.py`: env parse safety, secret-write atomicity, concurrent `.env` write race, hot-reload-during-AI-call guard; tests under `tests/test_config.py`
+- [X] T074 [P] [P2-SEC] Security-audit `bot/config.py` + `bot/config_updates.py`: env parse safety, secret-write atomicity, concurrent `.env` write race, hot-reload-during-AI-call guard; tests under `tests/test_config.py` — closed as no-action: there is no `.env` hot-reload mechanism in the codebase (the bot reads `.env` once via `load_dotenv()` at startup and i18n tells users to restart after edits); trust-boundary X-3 was mis-identified
 - [ ] T075 [P] [P2-SEC] Security-audit `bot/media.py`: Pillow decompression-bomb protection (max pixels, max bytes), path validation for temp writes; tests under `tests/test_media.py`
 - [ ] T076 [P] [P2-SEC] Security-audit `bot/voice.py`: OpenAI API key never logged, temp-file cleanup on exception, file-size cap; tests under `tests/test_voice.py`
 - [ ] T077 [P] [P2-SEC] Security-audit `bot/memory.py` + `bot/memory_store.py`: SQLite parameterization, journal-mode safety, secret-key-in-value leak check; tests under `tests/test_memory.py`
@@ -296,7 +296,7 @@
 
 ### Group A — Core modules (stability lens)
 
-- [ ] T080 [P2-STB] Stability-audit `bot/scheduler.py`: `time.monotonic()` for intervals, tmp+rename on `queue.json` writes, late-fire dedup on restart, retry amplification cap; fix findings, tests under `tests/test_scheduler.py`
+- [~] T080 [P2-STB] Stability-audit `bot/scheduler.py`: `time.monotonic()` for intervals, tmp+rename on `queue.json` writes, late-fire dedup on restart, retry amplification cap; fix findings, tests under `tests/test_scheduler.py` — **deferred** with rationale (see P2-80 in findings.md): scheduler uses `datetime.now()` (not `time.time()`) and most usages are legitimately wall-clock; a correct monotonic split needs its own spec
 - [~] T081 [P2-STB] Stability-audit `bot/bot.py`: lock mechanism is POSIX `fcntl.flock`-style (not PID-file-check race), restart-storm survival; tests under `tests/test_bot.py` — **partial**: P2-20 (TOCTOU PID-lock, High) fixed out-of-band in the security point release; restart-storm survival and `data/*.tmp` cleanup on startup still to do
 - [ ] T082 [P2-STB] Stability-audit `bot/ai_invoke.py`: subprocess stall → kill → orphan-tracker cleanup path under parent-death scenario; tests under `tests/test_ai_invoke.py`
 - [ ] T083 [P2-STB] Stability-audit `bot/updater.py`: disk-full on snapshot, pip failure mid-install, interrupted smoke test rollback; tests under `tests/test_updater.py`
@@ -310,7 +310,7 @@
 
 ### Group F — Migration framework (stability lens)
 
-- [ ] T088 [P] [P2-STB] Stability-audit `bot/migrations/runner.py` + `bot/migrations/tracker.py`: idempotency re-verify (apply twice = no-op), version-advance-only-after-fsync, interrupted-migration recovery; tests under `tests/test_migrations.py`
+- [X] T088 [P] [P2-STB] Stability-audit `bot/migrations/runner.py` + `bot/migrations/tracker.py`: idempotency re-verify (apply twice = no-op), version-advance-only-after-fsync, interrupted-migration recovery; tests under `tests/test_migrations.py` — closed P2-40 (tracker.save now uses tmp + fsync + os.replace); interrupted-migration recovery relies on per-migration idempotency (existing contract, tested per-migration)
 - [ ] T089 [P] [P2-STB] Stability-audit `bot/migrations/base.py` + `bot/migrations/legacy.py`: legacy chain handoff, missing-migration detection; tests under `tests/test_migrations.py`
 - [ ] T090 [P] [P2-STB] Stability-audit latest 5 migration files (`v0_20_25` … `v0_21_0`): each idempotent, each has test covering re-run; tests under `tests/test_migration_v*.py`
 

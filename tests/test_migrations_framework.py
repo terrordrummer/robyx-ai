@@ -104,6 +104,48 @@ class TestTracker:
         reloaded = load(data_dir)
         assert reloaded["_chain_"]["current_version"] == "0.20.12"
 
+    def test_save_is_atomic_tmp_then_replace(self, data_dir, monkeypatch):
+        """Closes C2 (crash-matrix.md): ``save`` must go through a .tmp +
+        os.replace sequence so a SIGKILL mid-write can't corrupt
+        migrations.json. We verify this by failing the replace step and
+        checking that the original file is untouched."""
+        import os as _os
+        from migrations.tracker import load, record_step, save, _file
+
+        # Establish a known-good tracker.
+        tracker = load(data_dir)
+        record_step(tracker, "0.20.11", "0.20.12", "ok")
+        save(data_dir, tracker)
+        good_bytes = _file(data_dir).read_bytes()
+
+        # Mutate in-memory, then sabotage os.replace so the second save
+        # "fails" the way a power loss between tmp-write and rename would.
+        record_step(tracker, "0.20.12", "0.20.13", "ok")
+        real_replace = _os.replace
+
+        def _boom(src, dst):
+            raise OSError("simulated power loss")
+
+        monkeypatch.setattr("migrations.tracker.os.replace", _boom)
+        with pytest.raises(OSError, match="simulated power loss"):
+            save(data_dir, tracker)
+
+        # Original file must still hold the pre-sabotage bytes — a
+        # non-atomic write_text() would have already truncated it.
+        assert _file(data_dir).read_bytes() == good_bytes
+
+        # The .tmp sibling may or may not exist depending on where the
+        # "failure" landed; clean it up if it does.
+        tmp = _file(data_dir).with_suffix(_file(data_dir).suffix + ".tmp")
+        if tmp.exists():
+            tmp.unlink()
+
+        # Recovery: once replace works again, save succeeds and the next
+        # load reflects the newest state.
+        monkeypatch.setattr("migrations.tracker.os.replace", real_replace)
+        save(data_dir, tracker)
+        assert load(data_dir)["_chain_"]["current_version"] == "0.20.13"
+
 
 # ---------------------------------------------------------------------------
 # Runner: discovery + validation
