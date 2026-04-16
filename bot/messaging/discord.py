@@ -153,16 +153,32 @@ class DiscordPlatform(Platform):
         directly as *file_id* and download it via the discord.py HTTP session.
         """
         import aiohttp
+        from urllib.parse import urlparse
+
+        # Validate URL to prevent SSRF via crafted attachment URLs.
+        parsed = urlparse(file_id)
+        hostname = parsed.hostname or ""
+        is_discord = hostname.endswith(".discordapp.com") or hostname.endswith(".discord.com")
+        if parsed.scheme != "https" or not is_discord:
+            raise ValueError("Refusing to download from non-Discord URL: %s" % file_id)
 
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tmp_path = tmp.name
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(file_id) as resp:
-                data = await resp.read()
-
-        with open(tmp_path, "wb") as f:
-            f.write(data)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(file_id) as resp:
+                    resp.raise_for_status()
+                    data = await resp.read()
+            with open(tmp_path, "wb") as f:
+                f.write(data)
+        except Exception:
+            import os
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
         return tmp_path
 

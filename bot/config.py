@@ -215,8 +215,6 @@ STATE_FILE = DATA_DIR / "state.json"
 TASKS_FILE = DATA_DIR / "tasks.md"
 SPECIALISTS_FILE = DATA_DIR / "specialists.md"
 LOG_FILE = PROJECT_ROOT / "bot.log"
-ORCHESTRATOR_MD = PROJECT_ROOT / "ORCHESTRATOR.md"
-SCHEDULER_MD = PROJECT_ROOT / "templates" / "SCHEDULER_AGENT.md"
 AGENTS_DIR = DATA_DIR / "agents"
 SPECIALISTS_DIR = DATA_DIR / "specialists"
 TIMED_QUEUE_FILE = DATA_DIR / "timed_queue.json"  # legacy — kept for migration
@@ -228,7 +226,6 @@ UPDATES_STATE_FILE = DATA_DIR / "updates.json"
 
 # ── Limits ──
 MAX_MESSAGE_LEN = 4000
-STATUS_INTERVAL = 60
 MAX_AI_RETRIES = 3
 AI_TIMEOUT = 7200  # 2 hours max per invocation (long R&D runs need time)
 CLAIM_TIMEOUT_SECONDS = int(

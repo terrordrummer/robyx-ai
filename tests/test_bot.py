@@ -261,7 +261,7 @@ class TestEnsureSingleInstance:
 
         with patch.object(bot, "PID_FILE", pid_file), \
              patch("process.is_pid_alive", return_value=True), \
-             patch("process.is_bot_process", return_value=True):
+             patch("process.is_bot_process_sync", return_value=True):
             with pytest.raises(SystemExit, match="already running"):
                 ensure_single_instance()
 

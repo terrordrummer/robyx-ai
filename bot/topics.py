@@ -508,29 +508,6 @@ def _append_to_specialists(row: str):
 # ── Healing detached workspaces ────────────────────────────────────────────
 
 
-def _update_table_thread_id(path, name: str, column_index: int, thread_id: int | None) -> None:
-    """Rewrite the Thread ID column for *name* in a markdown table file."""
-    if not path.exists():
-        return
-
-    replacement = "-" if thread_id is None else str(thread_id)
-    new_lines: list[str] = []
-    for line in path.read_text().splitlines():
-        stripped = line.strip()
-        if stripped.startswith("|"):
-            cols = [c.strip() for c in stripped.split("|")[1:-1]]
-            if cols and cols[0] == name and len(cols) > column_index:
-                cols[column_index] = replacement
-                line = "| %s |" % " | ".join(cols)
-        new_lines.append(line)
-    path.write_text("\n".join(new_lines) + "\n")
-
-
-def _update_specialist_thread_id(name: str, thread_id: int | None):
-    """Rewrite the Thread ID column for *name* in specialists.md (column index 3)."""
-    _update_table_thread_id(SPECIALISTS_FILE, name, 3, thread_id)
-
-
 async def heal_detached_workspaces(manager: AgentManager, platform=None) -> list[dict]:
     """Re-attach workspaces whose channel was lost between restarts.
 

@@ -7,6 +7,9 @@ import re
 from pathlib import Path
 
 # Keep this aligned with the documented configuration surface.
+# SECURITY: tokens, owner IDs, and chat IDs are excluded — changing these
+# from chat would allow a compromised account to hijack the bot.  They
+# must be edited in .env directly on the server.
 KNOWN_ENV_KEYS = frozenset({
     "OPENAI_API_KEY",
     "AI_BACKEND",
@@ -17,23 +20,9 @@ KNOWN_ENV_KEYS = frozenset({
     "REMINDER_MAX_AGE_SECONDS",
     "ROBYX_PLATFORM",
     "ROBYX_WORKSPACE",
-    "ROBYX_BOT_TOKEN",
-    "ROBYX_CHAT_ID",
-    "ROBYX_OWNER_ID",
     # Legacy names (kael-ops → robyx migration fallback)
     "KAELOPS_PLATFORM",
     "KAELOPS_WORKSPACE",
-    "KAELOPS_BOT_TOKEN",
-    "KAELOPS_CHAT_ID",
-    "KAELOPS_OWNER_ID",
-    "SLACK_BOT_TOKEN",
-    "SLACK_APP_TOKEN",
-    "SLACK_CHANNEL_ID",
-    "SLACK_OWNER_ID",
-    "DISCORD_BOT_TOKEN",
-    "DISCORD_GUILD_ID",
-    "DISCORD_CONTROL_CHANNEL_ID",
-    "DISCORD_OWNER_ID",
 })
 
 _DIRECT_ENV_LINE = re.compile(r"^\s*(?:set\s+)?([A-Z0-9_]+)\s*[:=]\s*(.+?)\s*$")

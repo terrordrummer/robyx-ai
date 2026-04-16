@@ -2,37 +2,66 @@
 
 **Date**: 2026-04-16
 **Baseline**: 1089 tests passed, 12,298 LOC
+**Final**: 1085 tests passed (4 tests for dead code removed), 12,329 LOC
 
-## Findings (All Fixed)
+## Bug Findings (US1) — All Fixed
 
-| ID | Module | Category | Severity | Description | Fix |
-|----|--------|----------|----------|-------------|-----|
-| F01 | updater.py | SEC | High | `extractall` without symlink/hardlink check | Added `issym()`/`islnk()` rejection |
-| F02 | bot.py | BUG | Medium | Double shutdown on signal + atexit | Added `_shutdown_done` guard |
-| F03 | handlers.py | ERR | Medium | `notes["min_compatible"]` when notes is None | Added None guard with fallback |
-| F04 | updater.py | BUG | Medium | Pip failure rollback skips data snapshot restore | Added `_restore_data_dir(snapshot)` to 3 paths |
-| F05 | scheduler.py | ERR | Medium | Reminder send catches only OSError/RuntimeError | Widened to `except Exception` |
-| F06 | ai_invoke.py | BUG | Medium | `read_text()` race after `stat()` on agent file | Wrapped in try/except |
-| F07 | ai_invoke.py | ERR | Low | orphan_tracker in finally could skip cleanup | Wrapped in try/except/finally |
-| F08 | handlers.py | BUG | Medium | Double `get_by_thread` + side-effect log pattern | Extracted to local variable |
-| F09 | telegram.py | BUG | High | `_bot` not initialized — AttributeError before `set_bot()` | Added `self._bot = None` in `__init__` |
-| F10 | topics.py | BUG | High | `platform=None` default causes AttributeError | Added early None guard |
-| F11 | orphan_tracker.py | BUG | High | `kept` dict never populated — `_save({})` clears registry | Added `kept[pid_str] = meta` for recycled PIDs |
-| F12 | telegram.py | BUG | Medium | `send_to_channel` unconditional Markdown | Noted — deferred (behavioral change risk) |
-| F13 | discord.py | ERR+SEC | Medium | `download_voice` no error handling + SSRF | Noted — deferred (needs URL validation design) |
-| F14 | slack.py | ERR | Medium | `reply`/`edit_message` no error handling | Noted — deferred (parity change across all adapters) |
-| F15 | scheduled_delivery.py | ERR | Medium | `read_text()` crash on non-UTF-8 log | Added `errors="replace"` |
-| F16 | topics.py | ERR | Medium | Unguarded file write leaves orphaned channel | Added try/except around `write_text` |
-| F17 | collaborative.py | ERR | Medium | Partial load on malformed JSON | Noted — deferred (needs atomic swap pattern) |
-| F18 | config.py | BUG | Medium | `int()` on env vars with no ValueError guard | Added `_int_env()` helper |
-| F19 | memory.py | BUG | Low | Double-brace placeholder never substituted | Fixed `{{memory_dir}}` → `{memory_dir}` |
-| F20 | voice.py | ERR | Medium | `%` formatting can raise TypeError | Noted — deferred (needs i18n string change) |
-| F21 | topics.py | BUG | Medium | `close_workspace` crashes when platform is None | Added `platform is not None` guard |
+| ID | Module | Sev | Description | Fix |
+|----|--------|-----|-------------|-----|
+| F01 | updater.py | High | `extractall` without symlink/hardlink check | Added `issym()`/`islnk()` rejection |
+| F02 | bot.py | Med | Double shutdown on signal + atexit | `_shutdown_done` guard |
+| F03 | handlers.py | Med | `notes["min_compatible"]` when notes is None | None guard |
+| F04 | updater.py | Med | Pip failure rollback skips data snapshot restore | Added restore to 3 paths |
+| F05 | scheduler.py | Med | Reminder send catches only OSError/RuntimeError | Widened to `except Exception` |
+| F06 | ai_invoke.py | Med | `read_text()` race after `stat()` | try/except with cache eviction |
+| F07 | ai_invoke.py | Low | orphan_tracker in finally could skip cleanup | try/except/finally |
+| F08 | handlers.py | Med | Double `get_by_thread` + side-effect pattern | Local variable |
+| F09 | telegram.py | High | `_bot` not initialized in `__init__` | `self._bot = None` |
+| F10 | topics.py | High | `platform=None` default causes AttributeError | Early None guard |
+| F11 | orphan_tracker.py | High | `kept` dict never populated — clears registry | `kept[pid_str] = meta` |
+| F15 | scheduled_delivery.py | Med | `read_text()` crash on non-UTF-8 | `errors="replace"` |
+| F18 | config.py | Med | `int()` on env vars no ValueError guard | `_int_env()` helper |
+| F19 | memory.py | Low | Double-brace placeholder mismatch | Fixed template |
+| F21 | topics.py | Med | `close_workspace` crashes when platform is None | Guard added |
 
-## Summary
+## Dead Code Removed (US2)
 
-- **21 findings** total across 29 modules
-- **15 fixed** in this pass
-- **6 deferred** (require design decisions or cross-cutting changes)
-- **4 High severity** — all fixed
-- **0 regressions** — 1089 tests pass
+| Item | Module | What |
+|------|--------|------|
+| D1 | process.py | `is_bot_process()` async — never called |
+| D7 | collaborative.py | `InteractionMode` enum — never used |
+| D3-D5 | config.py | `ORCHESTRATOR_MD`, `SCHEDULER_MD`, `STATUS_INTERVAL` — never imported |
+| D10 | topics.py | `_update_table_thread_id()`, `_update_specialist_thread_id()` — never called |
+
+Additional dead items identified but kept (legacy fallback): memory.py legacy functions (save_active, append_archive, load_active, load_archive_index, word_count, is_over_budget).
+
+## Security Findings (US3)
+
+| ID | Module | Sev | Description | Fix |
+|----|--------|-----|-------------|-----|
+| S1 | handlers.py | Med | AI-controlled `work_dir` for continuous tasks not validated | Added WORKSPACE path validation |
+| S2 | config_updates.py | Med | Security-critical keys (BOT_TOKEN, OWNER_ID) changeable via chat | Removed from KNOWN_ENV_KEYS |
+| S3 | discord.py | Med | `download_voice` SSRF — fetches arbitrary URLs | Added domain validation |
+
+**Confirmed clean**: command injection (no shell=True), token logging, privilege escalation, SQL injection, tarball extraction, image path validation.
+
+## Performance Findings (US4) — Documented, Deferred
+
+| ID | Module | Description | Status |
+|----|--------|-------------|--------|
+| P1 | scheduler.py | Redundant queue.json read in continuous task handler | Deferred — design change |
+| P2 | scheduler.py | Blocking sync file I/O in async functions (os.fsync) | Deferred — needs asyncio.to_thread |
+| P3 | scheduler.py | O(n) linear scan in reconciliation | Deferred — build index dict |
+| P4 | agents.py | save_state() called too frequently | Deferred — needs debounce design |
+| P5 | scheduler.py | Template re-read without cache | Deferred — trivial, low priority |
+
+## Deferred Findings (need design decisions)
+
+| ID | Module | Sev | Description |
+|----|--------|-----|-------------|
+| F12 | telegram.py | Med | `send_to_channel` unconditional Markdown — behavioral change risk |
+| F13 | discord.py | Med | `download_voice` error handling incomplete |
+| F14 | slack.py | Med | `reply`/`edit_message` no error handling |
+| F17 | collaborative.py | Med | Partial load on malformed JSON |
+| F20 | voice.py | Med | `%` formatting can raise TypeError |
+| All adapters | Med | `reply`/`edit_message` unprotected while `send_message` uses retry_send |

@@ -724,18 +724,6 @@ class TestUpdateTableThreadId:
         queue = json.loads(queue_file.read_text())
         assert queue[0]["thread_id"] == ""
 
-    def test_specialist_clearing_thread_id_writes_dash(self, tmp_path):
-        path = tmp_path / "data" / "specialists.md"
-        path.write_text(
-            "| Agent | Instructions | Model | Thread ID | Description |\n"
-            "|-------|-------------|-------|-----------|-------------|\n"
-            "| rev | specialists/rev.md | sonnet | 7 | r |\n"
-        )
-        topics._update_specialist_thread_id("rev", None)
-
-        text = path.read_text()
-        assert "| rev | specialists/rev.md | sonnet | - | r |" in text
-
     def test_missing_queue_file_is_a_noop(self, tmp_path):
         topics._update_queue_entry_thread_id("anything", 1)  # must not raise
 
