@@ -44,10 +44,20 @@ def _env(new_key, old_key, default=None):
     return os.environ.get(new_key) or os.environ.get(old_key) or default
 
 
+def _int_env(new_key: str, old_key: str, default: int = 0):
+    """Read an integer env var with legacy fallback.  Non-numeric values → None."""
+    raw = _env(new_key, old_key, str(default))
+    try:
+        return int(raw) or None
+    except (ValueError, TypeError):
+        _log.warning("Non-integer value for %s/%s: %r — using None", new_key, old_key, raw)
+        return None
+
+
 # ── Required ──
 BOT_TOKEN = _env("ROBYX_BOT_TOKEN", "KAELOPS_BOT_TOKEN")
-CHAT_ID = int(_env("ROBYX_CHAT_ID", "KAELOPS_CHAT_ID", "0")) or None
-OWNER_ID = int(_env("ROBYX_OWNER_ID", "KAELOPS_OWNER_ID", "0")) or None
+CHAT_ID = _int_env("ROBYX_CHAT_ID", "KAELOPS_CHAT_ID")
+OWNER_ID = _int_env("ROBYX_OWNER_ID", "KAELOPS_OWNER_ID")
 AI_BACKEND = os.environ.get("AI_BACKEND", "claude")
 AI_CLI_PATH = os.environ.get("AI_CLI_PATH", "")  # auto-detected if empty
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "").strip()
@@ -61,9 +71,9 @@ SLACK_OWNER_ID = os.environ.get("SLACK_OWNER_ID", "")
 
 # ── Discord (used when PLATFORM=discord) ──
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-DISCORD_GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0")) or None
-DISCORD_OWNER_ID = int(os.environ.get("DISCORD_OWNER_ID", "0")) or None
-DISCORD_CONTROL_CHANNEL_ID = int(os.environ.get("DISCORD_CONTROL_CHANNEL_ID", "0")) or None
+DISCORD_GUILD_ID = _int_env("DISCORD_GUILD_ID", "", 0)
+DISCORD_OWNER_ID = _int_env("DISCORD_OWNER_ID", "", 0)
+DISCORD_CONTROL_CHANNEL_ID = _int_env("DISCORD_CONTROL_CHANNEL_ID", "", 0)
 
 # ── Optional ──
 WORKSPACE = Path(_env("ROBYX_WORKSPACE", "KAELOPS_WORKSPACE", os.path.expanduser("~/Workspace")))

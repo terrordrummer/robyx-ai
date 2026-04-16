@@ -42,46 +42,46 @@
 
 ### Group B: Platform Adapters
 
-- [ ] T008 [P] [US1] Review and fix bugs in `bot/messaging/telegram.py` — focus on rate limiting, message splitting, error recovery
-- [ ] T009 [P] [US1] Review and fix bugs in `bot/messaging/discord.py` — focus on thread management, permissions, reconnection
-- [ ] T010 [P] [US1] Review and fix bugs in `bot/messaging/slack.py` — focus on socket mode, event dedup, error recovery
-- [ ] T011 [P] [US1] Review and fix bugs in `bot/messaging/base.py` — focus on ABC completeness, PlatformMessage contract
+- [x] T008 [P] [US1] Review and fix bugs in `bot/messaging/telegram.py` — focus on rate limiting, message splitting, error recovery
+- [x] T009 [P] [US1] Review and fix bugs in `bot/messaging/discord.py` — focus on thread management, permissions, reconnection
+- [x] T010 [P] [US1] Review and fix bugs in `bot/messaging/slack.py` — focus on socket mode, event dedup, error recovery
+- [x] T011 [P] [US1] Review and fix bugs in `bot/messaging/base.py` — focus on ABC completeness, PlatformMessage contract
 
 ### Group C: Agent & Task Management
 
-- [ ] T012 [P] [US1] Review and fix bugs in `bot/agents.py` — focus on session state, concurrent access, agent creation/deletion
-- [ ] T013 [P] [US1] Review and fix bugs in `bot/continuous.py` — focus on state file I/O, interruption handling, step execution
-- [ ] T014 [P] [US1] Review and fix bugs in `bot/task_runtime.py` — focus on context resolution, missing agent handling
-- [ ] T015 [P] [US1] Review and fix bugs in `bot/scheduled_delivery.py` — focus on output routing, silent delivery, error propagation
-- [ ] T016 [P] [US1] Review and fix bugs in `bot/topics.py` — focus on topic creation, naming collisions, platform-specific behavior
-- [ ] T017 [P] [US1] Review and fix bugs in `bot/collaborative.py` — focus on auth routing, workspace sharing, edge cases
+- [x] T012 [P] [US1] Review and fix bugs in `bot/agents.py` — focus on session state, concurrent access, agent creation/deletion
+- [x] T013 [P] [US1] Review and fix bugs in `bot/continuous.py` — focus on state file I/O, interruption handling, step execution
+- [x] T014 [P] [US1] Review and fix bugs in `bot/task_runtime.py` — focus on context resolution, missing agent handling
+- [x] T015 [P] [US1] Review and fix bugs in `bot/scheduled_delivery.py` — focus on output routing, silent delivery, error propagation
+- [x] T016 [P] [US1] Review and fix bugs in `bot/topics.py` — focus on topic creation, naming collisions, platform-specific behavior
+- [x] T017 [P] [US1] Review and fix bugs in `bot/collaborative.py` — focus on auth routing, workspace sharing, edge cases
 
 ### Group D: Configuration & Support
 
-- [ ] T018 [P] [US1] Review and fix bugs in `bot/ai_backend.py` — focus on backend detection, model resolution, path handling
-- [ ] T019 [P] [US1] Review and fix bugs in `bot/config.py` — focus on env var parsing, type coercion, missing values
-- [ ] T020 [P] [US1] Review and fix bugs in `bot/config_updates.py` — focus on .env file mutation, concurrent writes
-- [ ] T021 [P] [US1] Review and fix bugs in `bot/memory.py` — focus on SQLite fallback, legacy compat paths
-- [ ] T022 [P] [US1] Review and fix bugs in `bot/memory_store.py` — focus on connection management, error handling
-- [ ] T023 [P] [US1] Review and fix bugs in `bot/model_preferences.py` — focus on YAML parsing, missing keys
-- [ ] T024 [P] [US1] Review and fix bugs in `bot/media.py` — focus on image compression, file handle leaks
-- [ ] T025 [P] [US1] Review and fix bugs in `bot/voice.py` — focus on API call error handling
+- [x] T018 [P] [US1] Review and fix bugs in `bot/ai_backend.py` — focus on backend detection, model resolution, path handling
+- [x] T019 [P] [US1] Review and fix bugs in `bot/config.py` — focus on env var parsing, type coercion, missing values
+- [x] T020 [P] [US1] Review and fix bugs in `bot/config_updates.py` — focus on .env file mutation, concurrent writes
+- [x] T021 [P] [US1] Review and fix bugs in `bot/memory.py` — focus on SQLite fallback, legacy compat paths
+- [x] T022 [P] [US1] Review and fix bugs in `bot/memory_store.py` — focus on connection management, error handling
+- [x] T023 [P] [US1] Review and fix bugs in `bot/model_preferences.py` — focus on YAML parsing, missing keys
+- [x] T024 [P] [US1] Review and fix bugs in `bot/media.py` — focus on image compression, file handle leaks
+- [x] T025 [P] [US1] Review and fix bugs in `bot/voice.py` — focus on API call error handling
 
 ### Group E: Infrastructure
 
-- [ ] T026 [P] [US1] Review and fix bugs in `bot/_bootstrap.py` — focus on import safety, dependency detection
-- [ ] T027 [P] [US1] Review and fix bugs in `bot/process.py` — focus on subprocess lifecycle, signal propagation, zombie processes
-- [ ] T028 [P] [US1] Review and fix bugs in `bot/authorization.py` — focus on permission checks, bypass risks
-- [ ] T029 [P] [US1] Review and fix bugs in `bot/i18n.py` — focus on string formatting, missing keys, format specifier safety
-- [ ] T030 [P] [US1] Review and fix bugs in `bot/session_lifecycle.py` — focus on invalidation logic, timing
-- [ ] T031 [P] [US1] Review and fix bugs in `bot/orphan_tracker.py` — focus on orphan detection, cleanup, file I/O
+- [x] T026 [P] [US1] Review and fix bugs in `bot/_bootstrap.py` — focus on import safety, dependency detection
+- [x] T027 [P] [US1] Review and fix bugs in `bot/process.py` — focus on subprocess lifecycle, signal propagation, zombie processes
+- [x] T028 [P] [US1] Review and fix bugs in `bot/authorization.py` — focus on permission checks, bypass risks
+- [x] T029 [P] [US1] Review and fix bugs in `bot/i18n.py` — focus on string formatting, missing keys, format specifier safety
+- [x] T030 [P] [US1] Review and fix bugs in `bot/session_lifecycle.py` — focus on invalidation logic, timing
+- [x] T031 [P] [US1] Review and fix bugs in `bot/orphan_tracker.py` — focus on orphan detection, cleanup, file I/O
 
 ### Group F: Migration Framework
 
-- [ ] T032 [P] [US1] Review and fix bugs in `bot/migrations/runner.py` — focus on chain ordering, error recovery
-- [ ] T033 [P] [US1] Review and fix bugs in `bot/migrations/tracker.py` — focus on JSON persistence, corruption handling
-- [ ] T034 [P] [US1] Review and fix bugs in `bot/migrations/legacy.py` — focus on legacy compat, edge cases
-- [ ] T035 [US1] Run full test suite after US1 fixes — verify zero regressions, all new tests pass
+- [x] T032 [P] [US1] Review and fix bugs in `bot/migrations/runner.py` — focus on chain ordering, error recovery
+- [x] T033 [P] [US1] Review and fix bugs in `bot/migrations/tracker.py` — focus on JSON persistence, corruption handling
+- [x] T034 [P] [US1] Review and fix bugs in `bot/migrations/legacy.py` — focus on legacy compat, edge cases
+- [x] T035 [US1] Run full test suite after US1 fixes — verify zero regressions, all new tests pass
 
 **Checkpoint**: All modules reviewed for bugs. Every fix has a test. Full suite green.
 

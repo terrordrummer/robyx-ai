@@ -96,6 +96,7 @@ def cleanup_on_startup() -> list[int]:
                 log.info(
                     "Orphan cleanup: PID %d recycled as '%s', skipping", pid, name,
                 )
+                kept[pid_str] = meta
                 continue
             try:
                 if sys.platform == "win32":

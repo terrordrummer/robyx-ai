@@ -246,7 +246,7 @@ def build_memory_context(agent_name: str, agent_type: str, work_dir: str) -> str
 MEMORY_INSTRUCTIONS = """
 ## Memory Management
 
-You have a persistent memory at `{{memory_dir}}`.
+You have a persistent memory at `{memory_dir}`.
 
 ### How memory works
 - Your working memory is loaded into your context at the start of every
