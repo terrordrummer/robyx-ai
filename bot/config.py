@@ -227,7 +227,18 @@ UPDATES_STATE_FILE = DATA_DIR / "updates.json"
 # ── Limits ──
 MAX_MESSAGE_LEN = 4000
 MAX_AI_RETRIES = 3
-AI_TIMEOUT = 7200  # 2 hours max per invocation (long R&D runs need time)
+AI_IDLE_TIMEOUT = int(
+    os.environ.get("AI_IDLE_TIMEOUT", "600")
+)  # streaming-path liveness: max seconds without any output from the AI
+#  subprocess before we treat it as hung and kill. A responsive agent that
+#  keeps emitting stream-json lines stays alive indefinitely (up to
+#  AI_TIMEOUT). Default 10 min covers long tool calls (e.g. heavy pytest
+#  runs) while still catching real hangs.
+AI_TIMEOUT = int(
+    os.environ.get("AI_TIMEOUT", "7200")
+)  # hard wall-clock cap per invocation. Safety net for runaway processes
+#  and the only timeout applied to the non-streaming path where we have no
+#  intermediate visibility. Default 2 h.
 CLAIM_TIMEOUT_SECONDS = int(
     os.environ.get("CLAIM_TIMEOUT_SECONDS", "600")
 )  # stale-claim reset timeout. Previously 300s; raised to reduce the window

@@ -25,6 +25,8 @@ All env vars use the `ROBYX_` prefix. Legacy `KAELOPS_` prefixes are still accep
 | `CLAIM_TIMEOUT_SECONDS` | — | Stale-claim reset timeout for reminders and scheduled tasks (default: `600` = 10 min). A slower delivery watcher now has more room before the scheduler decides the claim is stuck. |
 | `SMOKE_TEST_TIMEOUT_SECONDS` | — | Post-update smoke-test timeout (default: `60`). Raise on slow machines / cold caches to avoid false-positive rollbacks. |
 | `VOICE_TIMEOUT_SECONDS` | — | Voice (Whisper) transcription HTTP timeout (default: `60`). |
+| `AI_IDLE_TIMEOUT` | — | Max seconds the AI subprocess may stay silent (no stream-json output) before Robyx considers it hung and kills it (default: `600` = 10 min). A responsive agent that keeps emitting lines stays alive indefinitely up to `AI_TIMEOUT`. Only applies to the streaming path (Claude Code, OpenCode). |
+| `AI_TIMEOUT` | — | Hard wall-clock cap per AI invocation in seconds (default: `7200` = 2 h). Safety net for runaway processes and the sole timeout on the non-streaming path. On streaming backends, prefer tuning `AI_IDLE_TIMEOUT` — this is rarely hit when the agent is actually producing output. |
 
 ## Telegram
 

@@ -43,6 +43,7 @@ from agents import Agent, AgentManager
 from ai_backend import AIBackend
 from config import (
     AGENTS_DIR,
+    AI_IDLE_TIMEOUT,
     AI_TIMEOUT,
     COLLABORATIVE_AGENT_SYSTEM_PROMPT,
     FOCUSED_AGENT_SYSTEM_PROMPT,
@@ -52,6 +53,18 @@ from config import (
     SPECIALISTS_DIR,
     WORKSPACE_AGENT_SYSTEM_PROMPT,
 )
+
+
+class AIIdleTimeout(Exception):
+    """Raised by the streaming path when the AI subprocess stops producing
+    output (``kind="idle"``, idle-based timeout) or exceeds the hard wall-clock
+    cap (``kind="hard_cap"``). Kept separate from ``asyncio.TimeoutError`` so
+    the non-streaming path keeps its existing wall-clock behaviour."""
+
+    def __init__(self, kind: str, elapsed: int) -> None:
+        super().__init__("AI idle timeout (%s, %ds)" % (kind, elapsed))
+        self.kind = kind
+        self.elapsed = elapsed
 from i18n import STRINGS
 from memory import build_memory_context, get_memory_instructions
 from model_preferences import resolve_model_preference
@@ -616,6 +629,18 @@ async def _invoke_ai_locked(
         manager.save_state()
         return text
 
+    except AIIdleTimeout as exc:
+        log.error(
+            "AI %s timeout for [%s] after %ds",
+            exc.kind, agent.name, exc.elapsed,
+        )
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        if exc.kind == "idle":
+            return STRINGS["ai_idle_timeout"] % exc.elapsed
+        return STRINGS["ai_timeout"] % exc.elapsed
     except asyncio.TimeoutError:
         log.error("AI timeout for [%s]", agent.name)
         try:
@@ -666,19 +691,25 @@ async def _read_stream(proc, platform, chat_id, effective_thread_id, backend):
         except Exception as e:
             log.warning("Failed to send status update: %s", e)
 
+    # Liveness is idle-based: as long as the subprocess keeps emitting
+    # stream-json lines we consider it alive and reset the timer at every
+    # readline. The hard deadline is a safety net for truly runaway
+    # processes — the typical long R&D run should never hit it because it
+    # keeps producing output.
     deadline = asyncio.get_event_loop().time() + AI_TIMEOUT
 
     while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
+        now = asyncio.get_event_loop().time()
+        if now >= deadline:
             proc.kill()
-            raise asyncio.TimeoutError()
+            raise AIIdleTimeout("hard_cap", elapsed=AI_TIMEOUT)
 
+        idle_budget = min(AI_IDLE_TIMEOUT, deadline - now)
         try:
-            line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=idle_budget)
         except asyncio.TimeoutError:
             proc.kill()
-            raise
+            raise AIIdleTimeout("idle", elapsed=AI_IDLE_TIMEOUT)
 
         if not line:
             break
