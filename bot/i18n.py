@@ -134,6 +134,11 @@ STRINGS = {
     "collab_roles_title": "*Workspace roles:*\n",
     "collab_close_confirm": "Collaborative workspace *%s* closed.",
     "collab_close_denied": "Only the workspace creator can close it.",
+    "collab_no_users": "No users registered in this workspace.",
+
+    # Commands (usage and progress)
+    "reset_usage": "Usage: /reset <name>",
+    "update_checking_manual": "Checking for pending update...",
 
     # Time formatting
     "time_now": "now",

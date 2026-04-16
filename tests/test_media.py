@@ -101,3 +101,89 @@ class TestPrepareImageForUpload:
         path.write_bytes(b"not a real image" * 10_000)
         with pytest.raises(MediaError, match="Cannot open image"):
             prepare_image_for_upload(str(path), 1024)
+
+
+class TestDecompressionBombDefence:
+    """Pass 2 T075 — belt-and-braces against images that expand into huge
+    pixmaps when decoded, either because the on-disk file is pathologically
+    big or because the pixel count would exhaust memory."""
+
+    def test_oversized_file_rejected_before_open(self, tmp_path, monkeypatch):
+        """A file bigger than _MAX_IMAGE_FILE_BYTES is rejected at the
+        stat() gate — Pillow is never invoked, so a crafted 'ZIP bomb as
+        PNG' can't OOM us on decode."""
+        import media
+
+        # Shrink the cap for the test so we can simulate an oversized file
+        # with a reasonably small payload.
+        monkeypatch.setattr(media, "_MAX_IMAGE_FILE_BYTES", 1024)
+
+        path = tmp_path / "big.bin"
+        path.write_bytes(b"x" * 2048)  # 2 KB → above the 1 KB cap
+
+        # Sentinel to prove Image.open was NOT called. Any touch raises.
+        def _boom(*args, **kwargs):
+            raise AssertionError("Image.open must not run when size cap is exceeded")
+
+        monkeypatch.setattr(media.Image, "open", _boom)
+
+        with pytest.raises(MediaError, match="exceeds.*safety cap"):
+            prepare_image_for_upload(str(path), 100)
+
+    def test_decompression_bomb_pixel_count_rejected(self, tmp_path, monkeypatch):
+        """A legitimate small file that decodes to more pixels than the
+        pixel cap must raise, NOT emit a warning and allocate. Simulated
+        by lowering MAX_IMAGE_PIXELS to something tiny; a 500×500 image
+        then exceeds the ``2 × MAX_IMAGE_PIXELS`` threshold that triggers
+        ``DecompressionBombError``."""
+        import media
+
+        # 500×500 = 250 000 pixels. Setting MAX to 100 pixels makes the
+        # image 2500× over the limit, past the DecompressionBombError
+        # trip-wire (2× MAX).
+        monkeypatch.setattr(media.Image, "MAX_IMAGE_PIXELS", 100)
+
+        # Generate a file that's small on disk but "big" in pixels.
+        img = Image.new("RGB", (500, 500), color=(200, 200, 200))
+        path = tmp_path / "bomb.png"
+        img.save(path, "PNG")
+
+        # Force the file above the per-caller ``max_bytes`` so we enter
+        # the decode branch instead of returning early.
+        with pytest.raises(MediaError, match="Cannot open image"):
+            prepare_image_for_upload(str(path), max_bytes=1)
+
+    def test_decompression_bomb_warning_promoted_to_error(self, tmp_path, monkeypatch):
+        """A pixel count in the (MAX, 2×MAX) 'warning zone' must raise —
+        Pillow's default behaviour is merely to emit a warning, which our
+        ``warnings.simplefilter('error', DecompressionBombWarning)``
+        promotes to an exception."""
+        import media
+
+        # 500×500 = 250 000 pixels. Setting MAX to 200 000 puts us in
+        # (MAX, 2×MAX) = (200 000, 400 000) → warning territory.
+        monkeypatch.setattr(media.Image, "MAX_IMAGE_PIXELS", 200_000)
+
+        img = Image.new("RGB", (500, 500), color=(100, 100, 100))
+        path = tmp_path / "warn.png"
+        img.save(path, "PNG")
+
+        with pytest.raises(MediaError, match="Cannot open image"):
+            prepare_image_for_upload(str(path), max_bytes=1)
+
+    def test_pixel_cap_does_not_reject_legitimate_photo(self, tmp_path, monkeypatch):
+        """Belt-and-braces doesn't regress the common case: a normal
+        500×500 photo under a generous pixel cap still compresses fine."""
+        import media
+
+        # 500×500 = 250 000 pixels. 10M cap leaves plenty of headroom.
+        monkeypatch.setattr(media.Image, "MAX_IMAGE_PIXELS", 10_000_000)
+
+        img = Image.new("RGB", (500, 500), color=(50, 150, 200))
+        path = tmp_path / "ok.png"
+        img.save(path, "PNG")
+
+        result = prepare_image_for_upload(str(path), max_bytes=500)
+        assert Path(result).exists()
+        if result != str(path):
+            os.unlink(result)
