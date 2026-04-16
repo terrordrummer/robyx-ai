@@ -160,7 +160,7 @@
 - [x] T042 [P] Run full test suite (`pytest tests/`) — 1089 passed, 0 failed, 1 skipped
 - [x] T043 Verified `has_native_claude_memory()` still works correctly — 6 dedicated tests pass
 - [x] T044 [P] All new and modified public functions in `bot/memory.py` and `bot/memory_store.py` have docstrings
-- [ ] T045 Run quickstart.md verification scenarios manually (active memory round-trip, archive search, migration, crash safety)
+- [x] T045 Run quickstart.md verification scenarios manually (active memory round-trip, archive search, migration, crash safety)
 
 ---
 
