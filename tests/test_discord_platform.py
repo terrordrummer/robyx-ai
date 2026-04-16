@@ -1,6 +1,7 @@
 """Tests for bot/messaging/discord.py — Discord platform adapter."""
 
 import asyncio
+import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 import pytest
@@ -290,35 +291,145 @@ class TestSendTyping:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _make_aiohttp_mock(chunks: list[bytes], content_length: str | None = None):
+    """Build a mock ``aiohttp`` module whose ClientSession().get() yields
+    a response with the given chunked body and optional Content-Length."""
+
+    class _ChunkIter:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._chunks:
+                raise StopAsyncIteration
+            return self._chunks.pop(0)
+
+    class _Content:
+        def __init__(self, chunks):
+            self._chunks = chunks
+
+        def iter_chunked(self, size):
+            return _ChunkIter(self._chunks)
+
+    mock_resp = AsyncMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.headers = {"Content-Length": content_length} if content_length else {}
+    mock_resp.content = _Content(chunks)
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    mock_session = AsyncMock()
+    mock_session.get = MagicMock(return_value=mock_resp)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+
+    mock_aiohttp = MagicMock()
+    mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+    return mock_aiohttp, mock_session
+
+
 class TestDownloadVoice:
     @pytest.mark.asyncio
     async def test_download_voice(self, platform):
-        """Downloads from URL and returns a temp file path."""
-        fake_audio = b"fake-ogg-data"
+        """Downloads from URL and returns a temp file path (streamed)."""
+        import os
 
-        mock_resp = AsyncMock()
-        mock_resp.read = AsyncMock(return_value=fake_audio)
-        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
-        mock_resp.__aexit__ = AsyncMock(return_value=False)
-
-        mock_session = AsyncMock()
-        mock_session.get = MagicMock(return_value=mock_resp)
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        mock_aiohttp = MagicMock()
-        mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
-
+        mock_aiohttp, _ = _make_aiohttp_mock([b"fake-", b"ogg-", b"data"])
         with patch.dict("sys.modules", {"aiohttp": mock_aiohttp}):
             path = await platform.download_voice("https://cdn.discord.com/attachments/voice.ogg")
 
         assert path.endswith(".ogg")
-        # Verify file was written
         with open(path, "rb") as f:
-            assert f.read() == fake_audio
-
-        import os
+            assert f.read() == b"fake-ogg-data"
         os.unlink(path)
+
+    @pytest.mark.asyncio
+    async def test_download_voice_rejects_non_discord_host(self, platform):
+        """SSRF guard — any host outside the Discord allow-list is refused
+        BEFORE a network request is made."""
+        mock_aiohttp, mock_session = _make_aiohttp_mock([b""])
+        with patch.dict("sys.modules", {"aiohttp": mock_aiohttp}):
+            with pytest.raises(ValueError, match="non-Discord"):
+                await platform.download_voice("https://attacker.example.com/evil.ogg")
+            mock_session.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_voice_rejects_non_https(self, platform):
+        mock_aiohttp, mock_session = _make_aiohttp_mock([b""])
+        with patch.dict("sys.modules", {"aiohttp": mock_aiohttp}):
+            with pytest.raises(ValueError, match="non-HTTPS"):
+                await platform.download_voice("http://cdn.discord.com/voice.ogg")
+            mock_session.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_voice_rejects_oversize_content_length(self, platform):
+        """If Content-Length declares > 25 MB, we bail before reading any
+        bytes. Prevents memory exhaustion from a hostile upload."""
+        import os
+
+        too_big = str(26 * 1024 * 1024)
+        mock_aiohttp, _ = _make_aiohttp_mock([b"x"], content_length=too_big)
+
+        tmp_before = set(os.listdir(tempfile.gettempdir()))
+        with patch.dict("sys.modules", {"aiohttp": mock_aiohttp}):
+            with pytest.raises(ValueError, match="cap"):
+                await platform.download_voice("https://cdn.discord.com/huge.ogg")
+        tmp_after = set(os.listdir(tempfile.gettempdir()))
+        # The NamedTemporaryFile was unlinked on failure
+        leaked = [f for f in (tmp_after - tmp_before) if f.endswith(".ogg")]
+        assert leaked == []
+
+    @pytest.mark.asyncio
+    async def test_download_voice_rejects_oversize_streamed(self, platform):
+        """Server lies about Content-Length (or omits it) but the body is
+        actually huge. The streaming loop's running-total guard catches it
+        before the file fills the disk."""
+        # One 1 MB chunk × 30 ⇒ 30 MB total, no Content-Length.
+        chunks = [b"x" * (1024 * 1024) for _ in range(30)]
+        mock_aiohttp, _ = _make_aiohttp_mock(chunks, content_length=None)
+
+        with patch.dict("sys.modules", {"aiohttp": mock_aiohttp}):
+            with pytest.raises(ValueError, match="cap"):
+                await platform.download_voice("https://cdn.discord.com/bomb.ogg")
+
+
+class TestValidateDiscordUrl:
+    """Direct unit tests for the URL guard shared by every download path."""
+
+    def test_accepts_discord_com(self):
+        from messaging.discord import _validate_discord_url
+        _validate_discord_url("https://discord.com/file.ogg")
+
+    def test_accepts_discordapp_com(self):
+        from messaging.discord import _validate_discord_url
+        _validate_discord_url("https://cdn.discordapp.com/attachments/voice.ogg")
+
+    def test_accepts_discordapp_net(self):
+        """Discord's media CDN uses the .net TLD."""
+        from messaging.discord import _validate_discord_url
+        _validate_discord_url("https://media.discordapp.net/attachments/img.png")
+
+    def test_accepts_subdomain(self):
+        from messaging.discord import _validate_discord_url
+        _validate_discord_url("https://cdn.ptb.discord.com/file.ogg")
+
+    def test_rejects_http(self):
+        from messaging.discord import _validate_discord_url
+        with pytest.raises(ValueError, match="non-HTTPS"):
+            _validate_discord_url("http://cdn.discordapp.com/voice.ogg")
+
+    def test_rejects_lookalike(self):
+        from messaging.discord import _validate_discord_url
+        with pytest.raises(ValueError, match="non-Discord"):
+            _validate_discord_url("https://discord.com.attacker.example/file.ogg")
+
+    def test_rejects_non_discord_host(self):
+        from messaging.discord import _validate_discord_url
+        with pytest.raises(ValueError, match="non-Discord"):
+            _validate_discord_url("https://evil.example/file.ogg")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

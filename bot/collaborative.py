@@ -171,7 +171,34 @@ class CollabStore:
         if not self._path.exists():
             return
         try:
-            data = json.loads(self._path.read_text())
+            raw = self._path.read_text()
+        except (OSError, UnicodeDecodeError) as e:
+            # Non-UTF-8 bytes are treated the same as a malformed file:
+            # quarantine and start empty. Otherwise the next write would
+            # silently overwrite the original bytes.
+            from agents import _quarantine_corrupt_file
+            _quarantine_corrupt_file(self._path, reason="Decode error: %s" % e)
+            log.error(
+                "Failed to read collaborative workspaces from %s: %s — "
+                "file quarantined, starting with empty registry",
+                self._path, e,
+            )
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            # Without quarantine, the next write overwrites the corrupt
+            # file and loses every workspace registration silently.
+            # Closes Pass 1 F17 (deferred).
+            from agents import _quarantine_corrupt_file
+            _quarantine_corrupt_file(self._path, reason="JSONDecodeError: %s" % e)
+            log.error(
+                "Collaborative workspaces file %s is corrupt — quarantined. "
+                "Re-add the bot to each collaborative group to rebuild state.",
+                self._path,
+            )
+            return
+        try:
             for ws_id, ws_data in data.items():
                 ws = CollabWorkspace.from_dict(ws_data)
                 self._workspaces[ws.id] = ws
@@ -179,7 +206,7 @@ class CollabStore:
             log.info("Loaded %d collaborative workspaces", len(self._workspaces))
         except Exception as e:
             log.error(
-                "Failed to load collaborative workspaces from %s: %s — "
+                "Failed to parse collaborative workspaces from %s: %s — "
                 "collaborative routing is DEGRADED until this is fixed",
                 self._path, e,
             )

@@ -126,6 +126,36 @@ class TestCollabStore:
         assert ws2.chat_id == -1001234567890
         assert ws2.get_role(111) == Role.OWNER
 
+    def test_corrupt_json_is_quarantined(self, tmp_path):
+        """Closes Pass 1 F17 (deferred): a malformed collab file used to
+        be silently overwritten by the next write, losing every
+        collaborative workspace registration. Now the corrupt file is
+        renamed to ``*.corrupt-<UTC>`` and the store starts empty."""
+        path = tmp_path / "collab.json"
+        path.write_text("{not valid json!!")
+
+        store = CollabStore(path)
+        # Store loaded nothing because the file was corrupt.
+        assert store.list_all() == []
+        # Original file is gone (renamed), replaced by a .corrupt-* sibling.
+        assert not path.exists(), (
+            "corrupt file should be quarantined, not present — otherwise "
+            "the next write overwrites the original"
+        )
+        siblings = list(tmp_path.glob("collab.json.corrupt-*"))
+        assert len(siblings) == 1
+        assert siblings[0].read_text() == "{not valid json!!"
+
+    def test_unreadable_file_degrades_gracefully(self, tmp_path):
+        """If the file is present but we can't decode it (e.g. written in
+        a non-UTF-8 encoding from a botched edit), the store starts empty
+        and logs the failure without crashing."""
+        path = tmp_path / "collab.json"
+        path.write_bytes(b"\xff\xfe\x00garbage-not-utf-8")
+
+        store = CollabStore(path)
+        assert store.list_all() == []
+
     def test_update_roles(self, tmp_path):
         store = CollabStore(tmp_path / "collab.json")
         ws = _make_ws()

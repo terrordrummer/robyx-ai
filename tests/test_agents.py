@@ -153,7 +153,9 @@ class TestAgentManagerInit:
         assert list(mgr.agents.keys()) == ["robyx"]
 
     def test_load_state_corrupt_json(self, tmp_path):
-        """Corrupt JSON -> manager starts with only robyx (logs warning)."""
+        """Corrupt JSON -> manager starts with only robyx, AND the
+        corrupt file is quarantined so the next save_state() doesn't
+        silently overwrite it. Closes the 'lose data forever' bug."""
         from agents import AgentManager
         import agents as _agents_mod
 
@@ -161,8 +163,18 @@ class TestAgentManagerInit:
         _agents_mod.STATE_FILE.write_text("{not valid json!!")
         mgr = AgentManager()
         assert "robyx" in mgr.agents
-        # Should only have robyx (corrupt state is discarded)
+        # Should only have robyx (corrupt state is discarded).
         assert len(mgr.agents) == 1
+        # Original state.json is gone (renamed), replaced by a .corrupt-*
+        # sibling that preserves the bad bytes for forensics.
+        parent = _agents_mod.STATE_FILE.parent
+        siblings = list(parent.glob(_agents_mod.STATE_FILE.name + ".corrupt-*"))
+        assert len(siblings) == 1, "expected exactly one quarantined file"
+        assert siblings[0].read_text() == "{not valid json!!"
+        assert not _agents_mod.STATE_FILE.exists(), (
+            "state file should be quarantined, not present — otherwise "
+            "the next save_state() would overwrite the original"
+        )
 
     def test_load_state_restores_robyx_session(self, tmp_path):
         """robyx session fields are restored from state, not recreated."""
