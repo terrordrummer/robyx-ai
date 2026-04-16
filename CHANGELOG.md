@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.21.1
+
+Pass 2 security + stability slice. Code-only release on top of v0.21.0;
+three Medium-severity findings closed plus one long-standing deferred
+item from Pass 1.
+
+### Fixed (security)
+- **`bot/messaging/discord.py`** — `download_voice()` previously loaded
+  the entire attachment body into memory. A hostile redirect or
+  crafted event could OOM the process. Now streams with
+  `iter_chunked(64 KB)` and enforces a 25 MB cap via both
+  `Content-Length` short-circuit and running-total guard. Partial
+  temp file is cleaned up on any failure. **Finding P2-11.**
+- **`bot/messaging/discord.py`** — the Discord hostname allow-list
+  added in Pass 1 (S3) was inline in `download_voice` only. Factored
+  into `_validate_discord_url()`, applied to every HTTP fetch path,
+  allow-list expanded to include `discordapp.net` (Discord media CDN).
+  **Finding P2-12.**
+
+### Fixed (stability)
+- **`bot/agents.py` + `bot/collaborative.py`** — corrupt `state.json`
+  or `collaborative_workspaces.json` used to be caught by a broad
+  `except` that logged a warning and continued with empty in-memory
+  state. The next write then silently overwrote the corrupt file,
+  losing the original bytes forever. Both load paths now catch
+  `JSONDecodeError` and `UnicodeDecodeError` separately and quarantine
+  the corrupt file (rename to `*.corrupt-<UTC-timestamp>`) before
+  falling back to empty state. Operators can recover the bytes for
+  manual inspection; the next save creates a fresh file. **Finding
+  P2-30, also closes Pass 1 F17.**
+
+### Closed (no action)
+- **`bot/messaging/slack.py`** — Pass 2 follow-up items (dedup store
+  sizing, token scrubbing in error paths) re-analysed: dedup is
+  library-internal (`slack-bolt`), and `_bot_token` never appears in
+  any log/error path. No gap remains. **Task T072.**
+
+### Docs
+- `docs/data-directory.md` — added note about `*.corrupt-<timestamp>`
+  sibling files that may appear when on-disk corruption is detected.
+
+### Tests
+1109 passed, 1 skipped (+13 from 0.21.0).
+
+### Migration
+`bot/migrations/v0_21_1.py` — no-op (code-only release).
+
 ## 0.21.0
 
 SQLite-backed memory engine + second-pass security hardening. Three
