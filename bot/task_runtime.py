@@ -122,9 +122,15 @@ def resolve_task_runtime_context(task: dict) -> TaskRuntimeContext:
 
     fallback_work_dir = str(_config.WORKSPACE)
     if agent_name:
-        log.info(
+        # Promoted from INFO to WARNING: if an agent referenced by a
+        # scheduled task no longer exists in state.json, the task runs
+        # against ROBYX_WORKSPACE instead of the agent's original cwd.
+        # That usually indicates a deleted agent with lingering queue
+        # entries — operator should see it without grepping the log.
+        log.warning(
             "No stored agent runtime context for scheduled task '%s'; "
-            "falling back to ROBYX_WORKSPACE=%s",
+            "falling back to ROBYX_WORKSPACE=%s (agent likely deleted — "
+            "consider cancelling its queue entries)",
             agent_name,
             fallback_work_dir,
         )

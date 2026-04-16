@@ -137,6 +137,7 @@ def start_task_delivery_watch(
         return None
 
     async def _watch() -> None:
+        returncode = 1
         try:
             returncode = await proc.wait()
             await deliver_task_output(

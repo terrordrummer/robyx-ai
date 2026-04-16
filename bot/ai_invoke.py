@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import re
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -199,10 +200,13 @@ def _normalize_backend_response(parsed_response):
     return parsed_response or "", None
 
 
-# mtime-keyed cache: invalidates automatically when the on-disk brief
-# changes (edits from chat commands, manual edits, `/reset`, migration,
-# etc.) without needing a separate pub-sub hook. Keyed by absolute path.
-_instructions_cache: dict[str, tuple[float, str]] = {}
+# (mtime, size)-keyed cache: invalidates automatically when the on-disk
+# brief changes (edits from chat commands, manual edits, `/reset`,
+# migration, etc.) without needing a separate pub-sub hook. Keyed by
+# absolute path. Using both mtime and size catches the edge case where a
+# brief is deleted and recreated fast enough that the filesystem hands
+# back the same mtime.
+_instructions_cache: dict[str, tuple[float, int, str]] = {}
 
 
 def _load_agent_instructions(agent: Agent) -> str:
@@ -229,18 +233,20 @@ def _load_agent_instructions(agent: Agent) -> str:
         return ""
 
     try:
-        mtime = path.stat().st_mtime
+        stat = path.stat()
+        mtime = stat.st_mtime
+        size = stat.st_size
     except OSError:
         return ""
 
     key = str(path)
     cached = _instructions_cache.get(key)
-    if cached and cached[0] == mtime:
-        return cached[1]
+    if cached and cached[0] == mtime and cached[1] == size:
+        return cached[2]
 
     instructions = path.read_text().strip()
     payload = "\n\n## Agent Instructions\n" + instructions if instructions else ""
-    _instructions_cache[key] = (mtime, payload)
+    _instructions_cache[key] = (mtime, size, payload)
     return payload
 
 
@@ -413,6 +419,10 @@ async def _invoke_ai_locked(
     # delivered, so this function no longer needs its own keep-alive.
 
     try:
+        # start_new_session=True places the CLI in its own process group so
+        # interrupt() can signal the whole tree via os.killpg — otherwise
+        # grandchildren (a node worker spawned by the CLI, etc.) are left
+        # behind when the immediate child receives SIGTERM.
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE if stdin_payload is not None else asyncio.subprocess.DEVNULL,
@@ -420,6 +430,7 @@ async def _invoke_ai_locked(
             stderr=asyncio.subprocess.PIPE,
             cwd=agent.work_dir,
             limit=1024 * 1024,
+            start_new_session=sys.platform != "win32",
         )
         agent.running_proc = proc
         import orphan_tracker

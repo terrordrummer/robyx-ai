@@ -59,18 +59,43 @@ class Agent:
     async def interrupt(self) -> bool:
         """Interrupt the running subprocess. SIGTERM with 5s grace, then SIGKILL.
 
+        On POSIX, signals are sent to the whole process group (because the
+        subprocess was spawned with ``start_new_session=True``), so a CLI
+        that spawned node/python workers takes its grandchildren with it
+        instead of leaving them as re-parented orphans.
+
         Returns True if a process was actually interrupted.
         """
+        import os
+        import signal as _signal
+        import sys as _sys
         proc = self.running_proc
         if proc is None:
             return False
         self.interrupted = True
+
+        def _signal_group_or_proc(sig) -> None:
+            if _sys.platform == "win32":
+                if sig == _signal.SIGTERM:
+                    proc.terminate()
+                else:
+                    proc.kill()
+                return
+            try:
+                pgid = os.getpgid(proc.pid)
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, OSError):
+                try:
+                    os.kill(proc.pid, sig)
+                except ProcessLookupError:
+                    pass
+
         try:
-            proc.terminate()  # SIGTERM
+            _signal_group_or_proc(_signal.SIGTERM)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5.0)
             except asyncio.TimeoutError:
-                proc.kill()  # SIGKILL
+                _signal_group_or_proc(_signal.SIGKILL)
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=2.0)
                 except asyncio.TimeoutError:

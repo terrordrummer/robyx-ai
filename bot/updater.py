@@ -11,6 +11,7 @@ Migration steps are shell commands listed under a ## Migration heading.
 import asyncio
 import json
 import logging
+import os
 import platform
 import re
 import shutil
@@ -149,6 +150,26 @@ def _restore_data_dir(snapshot: Path) -> bool:
         return False
     try:
         with tarfile.open(str(snapshot), "r:gz") as tf:
+            # Validate members before extraction to avoid half-restoring a
+            # corrupt archive on top of DATA_DIR. Reject absolute paths and
+            # path-traversal attempts; flag suspicious sizes.
+            data_dir_resolved = DATA_DIR.resolve()
+            for member in tf.getmembers():
+                if member.name.startswith("/") or ".." in Path(member.name).parts:
+                    log.error(
+                        "Refusing to restore snapshot %s: unsafe member %s",
+                        snapshot, member.name,
+                    )
+                    return False
+                target = (DATA_DIR / member.name).resolve()
+                try:
+                    target.relative_to(data_dir_resolved)
+                except ValueError:
+                    log.error(
+                        "Refusing to restore snapshot %s: member %s escapes data dir",
+                        snapshot, member.name,
+                    )
+                    return False
             tf.extractall(str(DATA_DIR))
     except (OSError, tarfile.TarError) as e:
         log.error("Restore from %s failed: %s", snapshot, e)
@@ -186,11 +207,14 @@ async def _post_update_smoke_test() -> tuple[bool, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+    smoke_timeout = int(os.environ.get("SMOKE_TEST_TIMEOUT_SECONDS", "60"))
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=smoke_timeout,
+        )
     except asyncio.TimeoutError:
         proc.kill()
-        return False, "smoke test timed out after 60s"
+        return False, "smoke test timed out after %ds" % smoke_timeout
 
     if proc.returncode != 0:
         err = (stderr.decode(errors="replace") or stdout.decode(errors="replace")).strip()

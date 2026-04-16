@@ -101,16 +101,33 @@ def cleanup_on_startup() -> list[int]:
                 if sys.platform == "win32":
                     import subprocess
                     subprocess.run(
-                        ["taskkill", "/F", "/PID", str(pid)],
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
                         capture_output=True, timeout=5,
                     )
                 else:
-                    os.kill(pid, signal.SIGKILL)
-                killed.append(pid)
-                log.warning(
-                    "Orphan cleanup: killed PID %d ('%s', owner=%s)",
-                    pid, name, meta.get("owner", "?"),
-                )
+                    # Prefer signalling the whole process group; fall back
+                    # to single-PID if that fails. ``start_new_session=True``
+                    # at spawn time gives each CLI its own group.
+                    try:
+                        pgid = os.getpgid(pid)
+                        os.killpg(pgid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        os.kill(pid, signal.SIGKILL)
+                # Verify the process actually died — SELinux or unusual
+                # permissions can silently cause SIGKILL to fail.
+                import time as _time
+                _time.sleep(0.1)
+                if is_pid_alive(pid):
+                    log.warning(
+                        "Orphan cleanup: SIGKILL sent to PID %d but it is "
+                        "still alive — giving up", pid,
+                    )
+                else:
+                    killed.append(pid)
+                    log.warning(
+                        "Orphan cleanup: killed PID %d ('%s', owner=%s)",
+                        pid, name, meta.get("owner", "?"),
+                    )
             except (OSError, ProcessLookupError) as exc:
                 log.info("Orphan cleanup: PID %d already gone: %s", pid, exc)
 

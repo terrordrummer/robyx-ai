@@ -221,11 +221,16 @@ MAX_MESSAGE_LEN = 4000
 STATUS_INTERVAL = 60
 MAX_AI_RETRIES = 3
 AI_TIMEOUT = 7200  # 2 hours max per invocation (long R&D runs need time)
-CLAIM_TIMEOUT_SECONDS = 300  # stale claim reset for reminders and timed tasks
+CLAIM_TIMEOUT_SECONDS = int(
+    os.environ.get("CLAIM_TIMEOUT_SECONDS", "600")
+)  # stale-claim reset timeout. Previously 300s; raised to reduce the window
+#  in which a slow delivery watcher plus a reset can cause token-mismatch
+#  double-dispatch (see review H2).
 MAX_REMINDER_ATTEMPTS = 10  # max delivery attempts before marking a reminder failed
 REMINDER_MAX_AGE_SECONDS = int(
-    os.environ.get("REMINDER_MAX_AGE_SECONDS", "86400")
-)  # reject reminders whose fire_at is older than 24 h (default)
+    os.environ.get("REMINDER_MAX_AGE_SECONDS", "604800")
+)  # reject reminders whose fire_at is older than this (default: 7 days).
+#  A bot offline for 2–3 days used to drop legitimate reminders at 24 h.
 
 # ── System Prompts ──
 

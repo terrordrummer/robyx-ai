@@ -45,10 +45,13 @@ def load_state(path: Path) -> dict | None:
 
 
 def save_state(path: Path, state: dict) -> None:
-    """Atomically persist a continuous task state (write-then-rename)."""
+    """Atomically persist a continuous task state (write-then-rename, fsynced)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False))
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
 
 

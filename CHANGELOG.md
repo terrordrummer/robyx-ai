@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.20.28
+
+Review-driven hardening. A deep code review surfaced ~100 findings across
+runtime, scheduler, collaborative workspaces, process management, and
+media; ~35 confirmed-real items landed here. False positives were ruled
+out during verification.
+
+### Fixed (critical)
+- **`bot/bot.py`** -- `_background_update_loop` was calling
+  `check_for_updates()` without `await`, so on Slack/Discord the
+  auto-update loop silently never ran. One-line fix.
+- **`bot/handlers.py`** -- fire-and-forget `asyncio.create_task(_early_typing())`
+  calls replaced with a new `_spawn_tracked()` helper that keeps a
+  strong reference until completion and routes exceptions to the logger.
+- **`bot/collaborative.py`** -- `CollabStore._mutex` now uses `msvcrt`
+  as a Windows fallback when `fcntl` is unavailable; the inter-process
+  lock is no longer a silent no-op on Windows.
+- **`bot/handlers.py` (`collab_bot_added` Flow B)** -- register the
+  provisional agent and write its brief **before** publishing the
+  workspace to the routing store; roll back the agent if the brief
+  write fails.
+
+### Fixed (security)
+- **`bot/handlers.py`** -- `[SEND_IMAGE path="..."]` paths are validated
+  against an allowlist (agent `work_dir`, `data/`, system tempdir, `/tmp`
+  on POSIX). Prompt-injection attempts like `[SEND_IMAGE path="/etc/passwd"]`
+  are refused with a user-visible error and a `WARNING` log line.
+
+### Fixed (concurrency / lifecycle)
+- **`bot/ai_invoke.py`**, **`bot/scheduler.py`** -- CLI subprocesses
+  now spawn with `start_new_session=True` (POSIX), so
+  `Agent.interrupt()` can signal the whole process group via
+  `os.killpg`. Grandchildren (e.g. a `node` worker spawned by a CLI)
+  are reaped with their parent.
+- **`bot/agents.py`** -- `Agent.interrupt()` sends signals to the
+  process group with per-PID fallback.
+- **`bot/orphan_tracker.py`** -- tree-kill on Windows
+  (`taskkill /T /F`), post-SIGKILL liveness re-check.
+
+### Fixed (collaborative hardening)
+- **`bot/collaborative.py`** -- `update_chat_id()` refuses to promote
+  a workspace to `"active"` unless it is currently `"pending"` with
+  `chat_id=0`, with optional `expected_creator_id` match.
+- **`bot/collaborative.py`** -- `_load()` failures now log at ERROR.
+- **`bot/handlers.py`** -- unknown-sender default and continuous-task
+  `"robyx"` reparent both logged at INFO/WARNING for operator visibility.
+
+### Fixed (data integrity)
+- **`bot/scheduler.py` (`_save_queue_unlocked`)** and
+  **`bot/continuous.py` (`save_state`)** -- `flush()` + `os.fsync()`
+  before `os.replace`.
+- **`bot/updater.py` (`_restore_data_dir`)** -- reject tar members
+  with absolute paths or `..` before `extractall`.
+- **`bot/scheduler.py`** -- legacy `timed_queue.json` migration
+  revalidates `scheduled_at`; corrupt entries skipped with WARNING.
+- **`bot/scheduled_delivery.py`** -- `returncode` initialised to 1
+  before `proc.wait()`.
+- **`bot/ai_invoke.py`** -- instruction cache keyed by `(mtime, size)`.
+- **`bot/scheduler.py`** -- `append_log()` guarded by a dedicated lock.
+
+### Changed (defaults)
+- `CLAIM_TIMEOUT_SECONDS`: 300 → **600** (env-configurable).
+- `REMINDER_MAX_AGE_SECONDS`: 86400 → **604800** (24 h → 7 d).
+- `SMOKE_TEST_TIMEOUT_SECONDS`: new env var (default 60 s).
+- `VOICE_TIMEOUT_SECONDS`: new env var (default 60 s).
+- `bot/task_runtime.py` -- missing-agent fallback log promoted from
+  INFO to WARNING.
+
+### Docs
+- `docs/configuration.md`, `docs/scheduler.md`, `docs/media.md`,
+  `.env.example` updated with the new env vars, defaults, path
+  allowlist note, process-group interrupt note, and periodic-recovery
+  invariant.
+
+### Tests
+1050 passed, 1 skipped. Hardening is additive; no existing contracts
+broken.
+
+### Migration
+None. `bot/migrations/v0_20_28.py` is a no-op. New env vars have safe
+defaults; values explicitly set in `.env` take precedence.
+
 ## 0.20.27
 
 ### Added
