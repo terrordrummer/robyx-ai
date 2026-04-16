@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.21.0
+
+SQLite-backed memory engine + second-pass security hardening. Three
+streams of work bundled into one release: the new memory engine (from
+the 001 branch), Pass 1 of the full code review, and two High-severity
+security fixes from Pass 2.
+
+### Added
+- **SQLite memory engine** — per-agent `data/memory/<name>.db` with
+  FTS5 full-text search and WAL journaling. Replaces the pre-0.21.0
+  markdown files (`active.md` + `archive/` subdirectories). Automatic
+  one-shot migration runs on first boot via
+  `bot/migrations/v0_21_0.py`; original files are renamed to
+  `*.md.bak`. Projects with native Claude Code memory (`CLAUDE.md` /
+  `.claude/`) are untouched.
+- **Pass 2 review artefacts** under `specs/002-full-code-review/` —
+  conversation contract, trust boundaries, crash matrix, and string
+  inventory. These are reference documents used by the ongoing
+  Phase 9/10/11/12 work on branch `002-full-code-review`.
+
+### Fixed (security)
+- **`bot/messaging/slack.py`** — `download_voice` forwarded the Slack
+  bot token across 3xx redirects via `follow_redirects=True` with no
+  host allow-list on `file_id`. A crafted event or hostile redirect
+  could exfiltrate the bearer token to an attacker-controlled host.
+  Added `_validate_slack_file_url()` guard (HTTPS + Slack CDN
+  allow-list) and switched to manual redirect following with
+  re-validation before every replay. **Finding P2-10 (High).**
+
+### Fixed (stability)
+- **`bot/bot.py`** — `ensure_single_instance()` used a TOCTOU pattern
+  (`if PID_FILE.exists(): read else write`). Two processes starting
+  within the race window could both pass the check. Replaced with a
+  POSIX `fcntl.LOCK_EX | LOCK_NB` advisory lock on a sidecar
+  `bot.pid.lock` file, held for the lifetime of the process. The
+  kernel releases the lock on exit (even SIGKILL), so stale PID files
+  never keep the lock stuck. Windows falls back to the legacy check.
+  **Finding P2-20 (High).**
+
+### Fixed (code-review Pass 1, summary)
+Pass 1 of the full code review produced 29 findings across 29 modules.
+All shipped in this release. Full table in
+`specs/002-full-code-review/findings.md`. Highlights:
+- `updater.py` tarball extraction rejects symlinks/hardlinks (F01, High).
+- `orphan_tracker.py` no longer clears its registry on save (F11, High).
+- `handlers.py` validates continuous-task `work_dir` against
+  `WORKSPACE` (S1, Security).
+- `config_updates.py` refuses to let chat mutate `BOT_TOKEN` /
+  `OWNER_ID` (S2, Security).
+- `discord.py` `download_voice` rejects non-Discord URLs (S3, Security).
+- 15 additional bug fixes across `scheduler`, `ai_invoke`, `bot`,
+  `telegram`, `topics`, `memory`, `config`, `scheduled_delivery`.
+- Dead code removed: ~60 LOC across `process.py`, `config.py`,
+  `topics.py`, `collaborative.py`.
+
+### Docs
+- `docs/memory.md` — rewritten for the SQLite engine.
+- `docs/data-directory.md` — added `memory/*.db`, `bot.pid`, and
+  `bot.pid.lock` entries; updated memory row to reflect the new
+  per-file (rather than per-directory) deletion semantics.
+
+### Tests
+1096 passed, 1 skipped (+11 from 0.20.28).
+
+### Migration
+`bot/migrations/v0_21_0.py` converts markdown-based memory to SQLite.
+Idempotent — a second run is a no-op. No other migrations required.
+
 ## 0.20.28
 
 Review-driven hardening. A deep code review surfaced ~100 findings across
