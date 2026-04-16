@@ -276,13 +276,22 @@ class TestSendTyping:
 # download_voice
 # ---------------------------------------------------------------------------
 
+def _mock_slack_response(content: bytes = b"audio", is_redirect: bool = False, location: str = ""):
+    """Build a mocked httpx response with the sync attributes the new
+    validator path reads (``is_redirect``, ``headers``, ``url``)."""
+    resp = MagicMock()
+    resp.content = content
+    resp.is_redirect = is_redirect
+    resp.headers = {"location": location} if location else {}
+    resp.url = "https://files.slack.com/original"
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
 class TestDownloadVoice:
     @pytest.mark.asyncio
     async def test_download_voice_saves_file(self, slack_platform):
-        fake_content = b"audio-data-here"
-        mock_response = AsyncMock()
-        mock_response.content = fake_content
-        mock_response.raise_for_status = MagicMock()
+        mock_response = _mock_slack_response(content=b"audio-data-here")
 
         with patch("messaging.slack.httpx.AsyncClient") as MockClient:
             client_instance = AsyncMock()
@@ -300,9 +309,7 @@ class TestDownloadVoice:
     @pytest.mark.asyncio
     async def test_download_voice_uses_url_as_file_id(self, slack_platform):
         """file_id for Slack is the url_private_download URL."""
-        mock_response = AsyncMock()
-        mock_response.content = b"data"
-        mock_response.raise_for_status = MagicMock()
+        mock_response = _mock_slack_response(content=b"data")
 
         with patch("messaging.slack.httpx.AsyncClient") as MockClient:
             client_instance = AsyncMock()
@@ -315,6 +322,94 @@ class TestDownloadVoice:
 
         client_instance.get.assert_awaited_once()
         assert client_instance.get.call_args[0][0] == url
+
+    @pytest.mark.asyncio
+    async def test_download_voice_rejects_non_slack_host(self, slack_platform):
+        """SSRF guard: a crafted file_id pointing at an attacker host must
+        be refused BEFORE any HTTP request is made — otherwise the bot
+        token leaks to the attacker's server."""
+        with patch("messaging.slack.httpx.AsyncClient") as MockClient:
+            with pytest.raises(ValueError, match="non-Slack host"):
+                await slack_platform.download_voice("https://attacker.example.com/steal")
+
+            MockClient.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_voice_rejects_non_https(self, slack_platform):
+        """Bearer token must never travel over plaintext HTTP."""
+        with patch("messaging.slack.httpx.AsyncClient") as MockClient:
+            with pytest.raises(ValueError, match="non-HTTPS"):
+                await slack_platform.download_voice("http://files.slack.com/voice.ogg")
+
+            MockClient.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_download_voice_rejects_cross_host_redirect(self, slack_platform):
+        """A 302 Location pointing outside the Slack allow-list is rejected
+        before the bearer token is replayed to the redirect target."""
+        redirect_resp = _mock_slack_response(is_redirect=True, location="https://attacker.example.com/pickup")
+
+        with patch("messaging.slack.httpx.AsyncClient") as MockClient:
+            client_instance = AsyncMock()
+            client_instance.get.return_value = redirect_resp
+            MockClient.return_value.__aenter__ = AsyncMock(return_value=client_instance)
+            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            with pytest.raises(ValueError, match="non-Slack host"):
+                await slack_platform.download_voice("https://files.slack.com/initial.ogg")
+
+            # Exactly one request was made (the initial) — the redirect was
+            # validated and rejected before any cross-host fetch.
+            assert client_instance.get.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_download_voice_follows_in_allowlist_redirect(self, slack_platform):
+        """A 302 to another Slack-hosted URL is followed — the token is
+        safe because the target is still in the allow-list."""
+        redirect_resp = _mock_slack_response(is_redirect=True, location="https://files.slack-edge.com/final.ogg")
+        final_resp = _mock_slack_response(content=b"final-audio")
+
+        with patch("messaging.slack.httpx.AsyncClient") as MockClient:
+            client_instance = AsyncMock()
+            client_instance.get.side_effect = [redirect_resp, final_resp]
+            MockClient.return_value.__aenter__ = AsyncMock(return_value=client_instance)
+            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            path = await slack_platform.download_voice("https://files.slack.com/initial.ogg")
+
+        assert path.endswith(".ogg")
+        assert client_instance.get.await_count == 2
+
+
+class TestValidateSlackFileUrl:
+    """Direct tests of the URL guard used by download_voice."""
+
+    def test_accepts_files_slack_com(self):
+        from messaging.slack import _validate_slack_file_url
+        _validate_slack_file_url("https://files.slack.com/audio.ogg")
+
+    def test_accepts_files_slack_edge_com(self):
+        from messaging.slack import _validate_slack_file_url
+        _validate_slack_file_url("https://files.slack-edge.com/audio.ogg")
+
+    def test_accepts_subdomain(self):
+        from messaging.slack import _validate_slack_file_url
+        _validate_slack_file_url("https://cdn.files.slack.com/audio.ogg")
+
+    def test_rejects_http(self):
+        from messaging.slack import _validate_slack_file_url
+        with pytest.raises(ValueError, match="non-HTTPS"):
+            _validate_slack_file_url("http://files.slack.com/audio.ogg")
+
+    def test_rejects_lookalike_host(self):
+        from messaging.slack import _validate_slack_file_url
+        with pytest.raises(ValueError, match="non-Slack"):
+            _validate_slack_file_url("https://files.slack.com.attacker.example/audio.ogg")
+
+    def test_rejects_empty_host(self):
+        from messaging.slack import _validate_slack_file_url
+        with pytest.raises(ValueError):
+            _validate_slack_file_url("https:///audio.ogg")
 
 
 # ---------------------------------------------------------------------------

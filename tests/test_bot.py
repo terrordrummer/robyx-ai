@@ -237,8 +237,23 @@ class TestMain:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@pytest.fixture
+def _reset_pid_lock():
+    """Reset the module-level lock fd before/after each test to avoid
+    leaking file descriptors across tests."""
+    import os as _os
+    bot._PID_LOCK_FD = None
+    yield
+    if bot._PID_LOCK_FD is not None:
+        try:
+            _os.close(bot._PID_LOCK_FD)
+        except OSError:
+            pass
+        bot._PID_LOCK_FD = None
+
+
 class TestEnsureSingleInstance:
-    def test_no_pid_file_writes_current_pid(self, tmp_path):
+    def test_no_pid_file_writes_current_pid(self, tmp_path, _reset_pid_lock):
         pid_file = tmp_path / "bot.pid"
         with patch.object(bot, "PID_FILE", pid_file):
             ensure_single_instance()
@@ -246,7 +261,9 @@ class TestEnsureSingleInstance:
         assert pid_file.exists()
         assert int(pid_file.read_text().strip()) == os.getpid()
 
-    def test_stale_pid_dead_process(self, tmp_path):
+    def test_stale_pid_dead_process(self, tmp_path, _reset_pid_lock):
+        """A PID file left behind by a crashed process is overwritten —
+        the kernel-held flock is gone so we acquire cleanly."""
         pid_file = tmp_path / "bot.pid"
         pid_file.write_text("99999999")  # almost certainly dead
 
@@ -255,32 +272,50 @@ class TestEnsureSingleInstance:
 
         assert int(pid_file.read_text().strip()) == os.getpid()
 
-    def test_active_bot_exits(self, tmp_path):
+    def test_active_bot_exits(self, tmp_path, _reset_pid_lock):
+        """When another process holds the lockfile, we exit with the
+        owner's PID in the message. Simulated by mocking flock to raise."""
         pid_file = tmp_path / "bot.pid"
-        pid_file.write_text(str(os.getpid()))
+        pid_file.write_text("4242")
+
+        import fcntl as _fcntl
+
+        def _raise_blocking(fd, op):
+            raise BlockingIOError("lock held")
 
         with patch.object(bot, "PID_FILE", pid_file), \
-             patch("process.is_pid_alive", return_value=True), \
-             patch("process.is_bot_process_sync", return_value=True):
+             patch.object(_fcntl, "flock", side_effect=_raise_blocking):
+            with pytest.raises(SystemExit, match="already running.*4242"):
+                ensure_single_instance()
+
+    def test_active_bot_exits_without_pid_file(self, tmp_path, _reset_pid_lock):
+        """Lock held but PID file missing or unreadable — still exit, with
+        a generic message."""
+        pid_file = tmp_path / "bot.pid"
+        # no pid file written
+        import fcntl as _fcntl
+
+        def _raise_blocking(fd, op):
+            raise BlockingIOError("lock held")
+
+        with patch.object(bot, "PID_FILE", pid_file), \
+             patch.object(_fcntl, "flock", side_effect=_raise_blocking):
             with pytest.raises(SystemExit, match="already running"):
                 ensure_single_instance()
 
-    def test_pid_reused_by_non_python(self, tmp_path):
-        """``ensure_single_instance`` runs before the event loop exists, so
-        it uses the ``*_sync`` process helpers. v0.20.6 split the async/sync
-        code paths — this test must mock the sync variants."""
+    def test_lock_fd_retained_for_process_lifetime(self, tmp_path, _reset_pid_lock):
+        """After successful acquisition, the lock fd is stored globally so
+        the kernel keeps the lock until the process exits."""
         pid_file = tmp_path / "bot.pid"
-        pid_file.write_text(str(os.getpid()))
+        with patch.object(bot, "PID_FILE", pid_file):
+            ensure_single_instance()
 
-        with patch.object(bot, "PID_FILE", pid_file), \
-             patch("process.is_pid_alive", return_value=True), \
-             patch("process.is_bot_process_sync", return_value=False), \
-             patch("process.get_process_name_sync", return_value="vim"):
-            ensure_single_instance()  # should NOT exit
+        assert bot._PID_LOCK_FD is not None
+        assert isinstance(bot._PID_LOCK_FD, int)
 
-        assert int(pid_file.read_text().strip()) == os.getpid()
-
-    def test_corrupt_pid_file(self, tmp_path):
+    def test_corrupt_pid_file(self, tmp_path, _reset_pid_lock):
+        """Garbage in the existing PID file doesn't block startup when the
+        lock is free."""
         pid_file = tmp_path / "bot.pid"
         pid_file.write_text("not-a-number")
 
@@ -289,23 +324,36 @@ class TestEnsureSingleInstance:
 
         assert int(pid_file.read_text().strip()) == os.getpid()
 
-    def test_pid_alive_but_check_fails(self, tmp_path):
-        """Process alive but is_bot_process can't determine -> treated as stale."""
-        pid_file = tmp_path / "bot.pid"
-        pid_file.write_text(str(os.getpid()))
-
-        with patch.object(bot, "PID_FILE", pid_file), \
-             patch("process.is_pid_alive", return_value=False):
-            ensure_single_instance()  # should treat as stale
-
-        assert int(pid_file.read_text().strip()) == os.getpid()
-
-    def test_creates_parent_dir(self, tmp_path):
+    def test_creates_parent_dir(self, tmp_path, _reset_pid_lock):
         pid_file = tmp_path / "subdir" / "bot.pid"
         with patch.object(bot, "PID_FILE", pid_file):
             ensure_single_instance()
 
         assert pid_file.exists()
+
+    def test_non_posix_fallback_uses_process_checks(self, tmp_path, _reset_pid_lock, monkeypatch):
+        """When fcntl is unavailable (Windows), fall back to the legacy
+        PID-file inspection path — still correct in its constrained use
+        case even though it carries a TOCTOU race window."""
+        pid_file = tmp_path / "bot.pid"
+        pid_file.write_text(str(os.getpid()))
+
+        # Force the import inside ensure_single_instance to fail.
+        import builtins
+        real_import = builtins.__import__
+
+        def _fake_import(name, *a, **kw):
+            if name == "fcntl":
+                raise ImportError("no fcntl on this platform")
+            return real_import(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+        with patch.object(bot, "PID_FILE", pid_file), \
+             patch("process.is_pid_alive", return_value=True), \
+             patch("process.is_bot_process_sync", return_value=True):
+            with pytest.raises(SystemExit, match="already running"):
+                ensure_single_instance()
 
     def test_cleanup_removes_pid_file(self, tmp_path):
         pid_file = tmp_path / "bot.pid"
