@@ -89,6 +89,9 @@ async def create_workspace(
         )
 
     # 1. Create channel/topic
+    if platform is None:
+        log.error("Cannot create workspace '%s': no platform available", name)
+        return None
     thread_id = await platform.create_channel(display_name)
     if not thread_id:
         return None
@@ -99,7 +102,11 @@ async def create_workspace(
 
     # Inject config into instructions
     full_instructions = "# %s\n\n%s\n" % (display_name, instructions.strip())
-    agent_file.write_text(full_instructions)
+    try:
+        agent_file.write_text(full_instructions)
+    except OSError as exc:
+        log.error("Failed to write agent file %s: %s", agent_file, exc)
+        return None
     log.info("Wrote agent instructions: %s", agent_file)
 
     # 3. Register the task in the unified queue
@@ -166,7 +173,7 @@ async def close_workspace(name: str, manager: AgentManager, platform=None) -> bo
         return False
 
     # Close channel/topic
-    if agent.thread_id:
+    if agent.thread_id and platform is not None:
         await platform.send_to_channel(agent.thread_id, "Workspace *%s* closed." % name)
         await platform.close_channel(agent.thread_id)
 

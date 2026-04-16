@@ -86,7 +86,7 @@ async def deliver_task_output(
         )
         return False
 
-    raw_output = output_log.read_text() if output_log.exists() else ""
+    raw_output = output_log.read_text(errors="replace") if output_log.exists() else ""
     parsed_response = backend.parse_response(raw_output, returncode)
     parsed_text = _normalize_backend_text(parsed_response)
 

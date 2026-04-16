@@ -21,6 +21,7 @@ class TelegramPlatform(Platform):
         self._chat_id = chat_id
         self._owner_id = owner_id
         self._api_base = "https://api.telegram.org/bot%s" % bot_token
+        self._bot = None  # Set via set_bot() when PTB Application is ready
         # Persistent httpx client. Creating a fresh AsyncClient per call
         # (the pre-0.20.16 behaviour) was the root cause of the
         # "typing indicator doesn't show immediately in Headquarters"
