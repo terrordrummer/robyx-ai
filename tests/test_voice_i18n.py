@@ -161,7 +161,7 @@ EXPECTED_KEYS = [
     "focus_active", "focus_none", "focus_on", "focus_off", "focus_off_was",
     "workspaces_title", "no_workspaces", "workspace_created", "workspace_closed",
     "specialists_title", "no_specialists", "specialist_created",
-    "ai_timeout", "ai_empty", "ai_no_response", "ai_error",
+    "ai_timeout", "ai_idle_timeout", "ai_empty", "ai_no_response", "ai_error",
     "rate_limited", "network_error", "permission_denied", "session_expired",
     "scheduler_dispatched", "scheduler_skipped", "scheduler_idle",
     "delegation_sent", "delegation_agent_missing", "delegation_result",

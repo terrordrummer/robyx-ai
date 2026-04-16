@@ -44,6 +44,7 @@ STRINGS = {
 
     # AI invocation
     "ai_timeout": "[Timeout: no response within %ds]",
+    "ai_idle_timeout": "[Timeout: no output from agent for %ds]",
     "ai_empty": "[Empty response]",
     "ai_no_response": "[No response from AI]",
     "ai_error": "AI Error: %s",

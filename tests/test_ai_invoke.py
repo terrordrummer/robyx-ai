@@ -8,6 +8,7 @@ import pytest
 
 from ai_invoke import (
     AGENT_INSTRUCTIONS_PATTERN,
+    AIIdleTimeout,
     CLOSE_WORKSPACE_PATTERN,
     CREATE_SPECIALIST_PATTERN,
     CREATE_WORKSPACE_PATTERN,
@@ -334,8 +335,9 @@ class TestReadStream:
         mock_proc.stderr.read = AsyncMock(return_value=b"")
         backend = MagicMock()
 
-        with pytest.raises(asyncio.TimeoutError):
+        with pytest.raises(AIIdleTimeout) as exc_info:
             await _read_stream(mock_proc, mock_bot, 123, 1, backend)
+        assert exc_info.value.kind == "idle"
 
     @pytest.mark.asyncio
     async def test_skips_malformed_json(self, mock_bot):
@@ -1102,8 +1104,8 @@ class TestReadStreamEdgeCases:
         assert result == "final"
 
     @pytest.mark.asyncio
-    async def test_timeout_in_read_stream(self, mock_bot):
-        """Lines 268-270: remaining <= 0 kills proc and raises TimeoutError."""
+    async def test_hard_cap_in_read_stream(self, mock_bot):
+        """AI_TIMEOUT=0 trips the hard-cap branch and raises AIIdleTimeout(kind='hard_cap')."""
         mock_proc = AsyncMock()
         mock_proc.stdout = AsyncMock()
         mock_proc.kill = MagicMock()
@@ -1114,11 +1116,49 @@ class TestReadStreamEdgeCases:
 
         backend = MagicMock()
 
-        # Patch the event loop time so remaining is immediately <= 0
         with patch("ai_invoke.AI_TIMEOUT", 0):
-            with pytest.raises(asyncio.TimeoutError):
+            with pytest.raises(AIIdleTimeout) as exc_info:
                 await _read_stream(mock_proc, mock_bot, 123, 1, backend)
+        assert exc_info.value.kind == "hard_cap"
         mock_proc.kill.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_in_read_stream(self, mock_bot):
+        """AI_IDLE_TIMEOUT=0 with a subprocess that never emits trips idle branch."""
+        mock_proc = AsyncMock()
+        mock_proc.stdout = AsyncMock()
+        mock_proc.stdout.readline = AsyncMock(side_effect=asyncio.TimeoutError)
+        mock_proc.kill = MagicMock()
+        mock_proc.wait = AsyncMock()
+        mock_proc.returncode = 0
+        mock_proc.stderr = AsyncMock()
+        mock_proc.stderr.read = AsyncMock(return_value=b"")
+
+        backend = MagicMock()
+
+        with patch("ai_invoke.AI_IDLE_TIMEOUT", 0):
+            with pytest.raises(AIIdleTimeout) as exc_info:
+                await _read_stream(mock_proc, mock_bot, 123, 1, backend)
+        assert exc_info.value.kind == "idle"
+        mock_proc.kill.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_streaming_survives_past_old_cap(self, mock_bot):
+        """A subprocess emitting lines promptly completes normally even when
+        AI_TIMEOUT would previously have tripped: idle resets on every line."""
+        mock_proc = _make_mock_proc([
+            b'{"type":"system","subtype":"init"}\n',
+            b'{"type":"assistant","message":{"content":[{"type":"text","text":"still going"}]}}\n',
+            b'{"type":"result","subtype":"success","result":"final"}\n',
+            b"",
+        ])
+        backend = MagicMock()
+        # Generous hard cap, tiny idle budget — readline returns immediately so
+        # idle never trips.
+        with patch("ai_invoke.AI_IDLE_TIMEOUT", 30), \
+             patch("ai_invoke.AI_TIMEOUT", 30):
+            result = await _read_stream(mock_proc, mock_bot, 123, 1, backend)
+        assert result == "final"
 
     @pytest.mark.asyncio
     async def test_empty_line_skipped(self, mock_bot):
