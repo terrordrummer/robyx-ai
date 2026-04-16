@@ -72,6 +72,10 @@ log = logging.getLogger("robyx")
 
 PID_FILE = DATA_DIR / "bot.pid"
 
+# Holds the file descriptor that owns the single-instance lock for the life
+# of the process. Closing the fd (or the process exiting) releases the lock.
+_PID_LOCK_FD: int | None = None
+
 # ── Telegram polling tuning ────────────────────────────────────────────────
 #
 # Default PTB long-polling can hang for minutes after a macOS sleep/wake
@@ -106,23 +110,54 @@ def telegram_polling_kwargs() -> dict:
 
 
 def ensure_single_instance():
-    """Verify no other bot instance is running. Write PID file for current process."""
-    from process import is_pid_alive, is_bot_process_sync, get_process_name_sync
+    """Verify no other bot instance is running. Write PID file for current process.
 
-    if PID_FILE.exists():
-        try:
-            pid = int(PID_FILE.read_text().strip())
-            if is_pid_alive(pid):
-                if is_bot_process_sync(pid):
-                    sys.exit("Robyx already running (PID %d)" % pid)
-                proc_name = get_process_name_sync(pid)
-                log.warning("Stale PID file: PID %d is now '%s'. Overwriting.", pid, proc_name)
-            else:
-                log.warning("Stale PID file found. Overwriting.")
-        except ValueError:
-            log.warning("Corrupt PID file found. Overwriting.")
+    Uses a POSIX ``fcntl.LOCK_EX | LOCK_NB`` advisory lock on a sidecar
+    lockfile. The kernel releases the lock automatically when the owning
+    process exits, so stale PID files never leave the lockfile held.
+
+    On platforms without ``fcntl`` (Windows), falls back to the legacy
+    PID-file inspection (TOCTOU-susceptible but the Windows service
+    manager makes concurrent starts unlikely in practice).
+    """
+    global _PID_LOCK_FD
 
     PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import fcntl  # POSIX only
+    except ImportError:
+        fcntl = None
+
+    if fcntl is not None:
+        lock_path = PID_FILE.with_suffix(PID_FILE.suffix + ".lock")
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            try:
+                owner_pid = int(PID_FILE.read_text().strip())
+                sys.exit("Robyx already running (PID %d)" % owner_pid)
+            except (OSError, ValueError):
+                sys.exit("Robyx already running (another instance holds the lock)")
+        _PID_LOCK_FD = fd
+    else:
+        from process import is_pid_alive, is_bot_process_sync, get_process_name_sync
+
+        if PID_FILE.exists():
+            try:
+                pid = int(PID_FILE.read_text().strip())
+                if is_pid_alive(pid):
+                    if is_bot_process_sync(pid):
+                        sys.exit("Robyx already running (PID %d)" % pid)
+                    proc_name = get_process_name_sync(pid)
+                    log.warning("Stale PID file: PID %d is now '%s'. Overwriting.", pid, proc_name)
+                else:
+                    log.warning("Stale PID file found. Overwriting.")
+            except ValueError:
+                log.warning("Corrupt PID file found. Overwriting.")
+
     PID_FILE.write_text(str(os.getpid()))
 
 

@@ -13,6 +13,31 @@ from messaging.base import Platform, retry_send
 
 log = logging.getLogger("robyx.platform.slack")
 
+# Slack-hosted file origins. The bot token MUST NOT be sent to any other host.
+_SLACK_FILE_HOSTS = (
+    "files.slack.com",
+    "files.slack-edge.com",
+    "slack-files.com",
+)
+
+
+def _validate_slack_file_url(url: str) -> None:
+    """Raise ``ValueError`` unless ``url`` is an HTTPS Slack-hosted file URL.
+
+    Guards :meth:`SlackPlatform.download_voice` against token exfiltration
+    via crafted event payloads or 3xx redirects to attacker-controlled hosts.
+    Slack file URLs are always HTTPS and always under one of the well-known
+    Slack CDN hostnames; any deviation is a red flag.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("Refusing non-HTTPS Slack file URL")
+    hostname = (parsed.hostname or "").lower()
+    if not any(hostname == h or hostname.endswith("." + h) for h in _SLACK_FILE_HOSTS):
+        raise ValueError("Refusing download from non-Slack host: %s" % hostname)
+
 
 def _channel_slug(name: str) -> str:
     """Return a Slack-safe public channel name."""
@@ -174,10 +199,33 @@ class SlackPlatform(Platform):
 
         ``file_id`` is the ``url_private_download`` URL of the file.
         The bot token is used as a Bearer token for authentication.
+
+        Security: the URL is validated against an allow-list of Slack-hosted
+        hostnames before each request, and 3xx redirects are followed
+        manually so that the bearer token is never sent to a non-Slack host
+        (httpx's ``follow_redirects=True`` would forward Authorization
+        verbatim on cross-host redirects, enabling token exfiltration via
+        a crafted Location header).
         """
+        _validate_slack_file_url(file_id)
         headers = {"Authorization": "Bearer %s" % self._bot_token}
-        async with httpx.AsyncClient(timeout=60) as http:
-            resp = await http.get(file_id, headers=headers, follow_redirects=True)
+        current_url = file_id
+        max_hops = 5
+        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as http:
+            while True:
+                resp = await http.get(current_url, headers=headers)
+                if resp.is_redirect and max_hops > 0:
+                    location = resp.headers.get("location", "")
+                    if not location:
+                        break
+                    if location.startswith("/") or not location.startswith("http"):
+                        from urllib.parse import urljoin
+                        location = urljoin(str(resp.url), location)
+                    _validate_slack_file_url(location)
+                    current_url = location
+                    max_hops -= 1
+                    continue
+                break
             resp.raise_for_status()
             with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
                 tmp.write(resp.content)
