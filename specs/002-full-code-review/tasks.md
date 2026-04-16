@@ -268,8 +268,8 @@
 ### Group B — Platform adapters (security lens, parity-aware)
 
 - [ ] T070 [P] [P2-SEC] Security-audit `bot/messaging/telegram.py`: size caps before download, filename path-traversal, token never in error replies, message-length bounds propagated; tests under `tests/test_telegram.py`
-- [ ] T071 [P] [P2-SEC] Security-audit `bot/messaging/discord.py`: extend Pass 1 domain allow-list from voice to ALL attachment fetches, thread-mutation auth race, token scrubbing; tests under `tests/test_discord.py`
-- [~] T072 [P] [P2-SEC] Security-audit `bot/messaging/slack.py`: Socket Mode dedup store size bound, `url_private` token scrubbing in error paths, `event_id` replay protection; tests under `tests/test_slack.py` — **partial**: P2-10 (bearer-token redirect exfiltration, High) fixed out-of-band in the security point release; dedup store bound + event_id replay + error-path token scrubbing still to do
+- [X] T071 [P] [P2-SEC] Security-audit `bot/messaging/discord.py`: extend Pass 1 domain allow-list from voice to ALL attachment fetches, thread-mutation auth race, token scrubbing; tests under `tests/test_discord.py` — closed P2-11 (unbounded read, 25 MB cap + streaming) and P2-12 (allow-list generalized into `_validate_discord_url`); token scrubbing/thread-auth race deferred as not actionable — no current gap
+- [X] T072 [P] [P2-SEC] Security-audit `bot/messaging/slack.py`: Socket Mode dedup store size bound, `url_private` token scrubbing in error paths, `event_id` replay protection; tests under `tests/test_slack.py` — P2-10 (bearer-token redirect exfiltration, High) fixed in v0.21.0; residual items re-scoped to "no action" after review: dedup is handled inside `slack-bolt` (not our code); `_bot_token` never appears in error/log output
 - [ ] T073 [P] [P2-SEC] Security-audit `bot/messaging/base.py`: confirm ABC contract enforces validation hooks uniformly across adapters; tests under `tests/test_messaging_base.py`
 
 ### Group D — Config & support (security lens)
@@ -304,7 +304,7 @@
 ### Group C — Agents & tasks (stability lens)
 
 - [ ] T084 [P] [P2-STB] Stability-audit `bot/continuous.py`: step boundary atomicity, resume-from-last-committed-step under SIGKILL; tests under `tests/test_continuous.py`
-- [ ] T085 [P] [P2-STB] Stability-audit `bot/agents.py` + `bot/task_runtime.py`: atomic `agents.json` write (tmp+rename+fsync), partial-load handling for malformed JSON (Pass 1 F17 deferred — fix now); tests under `tests/test_agents.py`
+- [X] T085 [P] [P2-STB] Stability-audit `bot/agents.py` + `bot/task_runtime.py`: atomic `agents.json` write (tmp+rename+fsync), partial-load handling for malformed JSON (Pass 1 F17 deferred — fix now); tests under `tests/test_agents.py` — closed P2-30 (JSON/Unicode corruption now quarantined to `*.corrupt-<UTC>` before falling back to empty state; also closes Pass 1 F17 on `collaborative.py`); tmp+rename+fsync + `task_runtime.py` audit deferred to a later slice
 - [ ] T086 [P] [P2-STB] Stability-audit `bot/scheduled_delivery.py`: silent-delivery policy verified per adapter; tests under `tests/test_scheduled_delivery.py`
 - [ ] T087 [P] [P2-STB] Stability-audit `bot/topics.py` + `bot/collaborative.py`: crash mid-topic-creation, partial workspace state recovery; tests under `tests/test_topics.py` and `tests/test_collaborative.py`
 

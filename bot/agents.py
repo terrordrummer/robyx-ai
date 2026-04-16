@@ -152,7 +152,32 @@ class AgentManager:
         if not STATE_FILE.exists():
             return
         try:
-            data = json.loads(STATE_FILE.read_text())
+            raw = STATE_FILE.read_text()
+        except (OSError, UnicodeDecodeError) as e:
+            # Non-UTF-8 bytes are treated as corruption: quarantine and
+            # start with an empty registry so the next save doesn't
+            # silently overwrite whatever is on disk.
+            _quarantine_corrupt_file(STATE_FILE, reason="Decode error: %s" % e)
+            log.error(
+                "State file %s is unreadable (%s) — quarantined. "
+                "Starting with empty agent registry.",
+                STATE_FILE, e,
+            )
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            # Corrupt state would be silently overwritten on the next
+            # save_state() — losing the user's agent registry forever.
+            # Quarantine the file so an operator can inspect it.
+            _quarantine_corrupt_file(STATE_FILE, reason="JSONDecodeError: %s" % e)
+            log.error(
+                "State file %s is corrupt — quarantined. "
+                "Starting with empty agent registry; recreate workspaces via chat.",
+                STATE_FILE,
+            )
+            return
+        try:
             dirty = False
             for name, agent_data in data.get("agents", {}).items():
                 if name == "robyx":
@@ -396,6 +421,32 @@ class AgentManager:
         if not lines:
             return STRINGS["no_agents"]
         return "\n".join(lines)
+
+
+def _quarantine_corrupt_file(path, reason: str) -> None:
+    """Rename ``path`` to ``path.corrupt-<UTC-timestamp>`` so a subsequent
+    write can create a fresh file without destroying forensic evidence.
+
+    Called from load paths in :class:`AgentManager` and
+    :class:`bot.collaborative.CollabStore` (where the same risk exists).
+    Best-effort: if the rename itself fails we leave the file in place
+    rather than raise — losing visibility of the corruption is a worse
+    outcome than a second-chance load that still fails.
+    """
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    quarantine = path.with_suffix(path.suffix + ".corrupt-" + ts)
+    try:
+        os.replace(path, quarantine)
+        log.warning(
+            "Quarantined corrupt file %s → %s (reason: %s)",
+            path, quarantine, reason,
+        )
+    except OSError as e:
+        log.error(
+            "Failed to quarantine corrupt file %s: %s — leaving in place",
+            path, e,
+        )
 
 
 def format_age(timestamp: float) -> str:

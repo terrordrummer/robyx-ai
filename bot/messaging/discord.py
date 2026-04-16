@@ -3,12 +3,44 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from typing import Any
 
 from messaging.base import Platform, retry_send
 
 log = logging.getLogger("robyx.platform.discord")
+
+# Discord-hosted domains. Any attachment URL the bot downloads MUST live
+# under one of these; otherwise a crafted Location header or hostile
+# event payload could point the bot at an attacker-controlled host.
+_DISCORD_HOSTS = (
+    "discord.com",
+    "discordapp.com",
+    "discordapp.net",   # media CDN
+)
+
+# Upper bound for single-attachment downloads. Voice memos are typically
+# well under 1 MB; documents and images are capped by Discord at 25 MB
+# for non-Nitro users. A 25 MB cap rejects a hostile redirect to a huge
+# payload before memory is exhausted.
+_MAX_DISCORD_DOWNLOAD_BYTES = 25 * 1024 * 1024
+
+
+def _validate_discord_url(url: str) -> None:
+    """Raise ``ValueError`` unless ``url`` is an HTTPS Discord-hosted URL.
+
+    Applied to every HTTP fetch the adapter performs, not only voice
+    downloads — so any future download path inherits the same guard.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("Refusing non-HTTPS Discord URL")
+    hostname = (parsed.hostname or "").lower()
+    if not any(hostname == h or hostname.endswith("." + h) for h in _DISCORD_HOSTS):
+        raise ValueError("Refusing download from non-Discord host: %s" % hostname)
 
 
 class DiscordPlatform(Platform):
@@ -150,17 +182,21 @@ class DiscordPlatform(Platform):
         For Discord, file_id is formatted as ``<message_id>:<attachment_index>``
         by the event handler, but the actual download is done by passing the
         attachment URL.  To keep things simple, we accept the attachment URL
-        directly as *file_id* and download it via the discord.py HTTP session.
+        directly as *file_id* and download it via aiohttp.
+
+        Security:
+
+        * ``_validate_discord_url`` enforces HTTPS + a Discord-host
+          allow-list before any network request (finding Pass 1 S3,
+          generalized in Pass 2 DC-4).
+        * The response body is **streamed** with a hard
+          ``_MAX_DISCORD_DOWNLOAD_BYTES`` ceiling rather than loaded into
+          memory in one shot, so a hostile redirect to a huge payload
+          cannot exhaust the process heap (Pass 2 DC-3).
         """
         import aiohttp
-        from urllib.parse import urlparse
 
-        # Validate URL to prevent SSRF via crafted attachment URLs.
-        parsed = urlparse(file_id)
-        hostname = parsed.hostname or ""
-        is_discord = hostname.endswith(".discordapp.com") or hostname.endswith(".discord.com")
-        if parsed.scheme != "https" or not is_discord:
-            raise ValueError("Refusing to download from non-Discord URL: %s" % file_id)
+        _validate_discord_url(file_id)
 
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tmp_path = tmp.name
@@ -169,11 +205,36 @@ class DiscordPlatform(Platform):
             async with aiohttp.ClientSession() as session:
                 async with session.get(file_id) as resp:
                     resp.raise_for_status()
-                    data = await resp.read()
-            with open(tmp_path, "wb") as f:
-                f.write(data)
+
+                    # Reject up-front if the Content-Length advertises more
+                    # than our cap — avoids reading any bytes at all. A
+                    # malformed header (non-integer) is treated as absent;
+                    # the streaming guard below catches it.
+                    content_length = resp.headers.get("Content-Length")
+                    declared = None
+                    if content_length is not None:
+                        try:
+                            declared = int(content_length)
+                        except ValueError:
+                            declared = None
+                    if declared is not None and declared > _MAX_DISCORD_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            "Discord attachment exceeds %d-byte cap"
+                            % _MAX_DISCORD_DOWNLOAD_BYTES
+                        )
+
+                    # Stream; abort if running total exceeds the cap.
+                    total = 0
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            total += len(chunk)
+                            if total > _MAX_DISCORD_DOWNLOAD_BYTES:
+                                raise ValueError(
+                                    "Discord attachment exceeds %d-byte cap"
+                                    % _MAX_DISCORD_DOWNLOAD_BYTES
+                                )
+                            f.write(chunk)
         except Exception:
-            import os
             try:
                 os.unlink(tmp_path)
             except OSError:
