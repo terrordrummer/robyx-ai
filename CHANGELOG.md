@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.21.2
+
+Small point release. One Medium-severity stability fix plus two Pass 2
+tasks re-scoped after code audit (documented for transparency).
+
+### Fixed (stability)
+- **`bot/migrations/tracker.py`** — `save()` previously used plain
+  `path.write_text(json.dumps(...))` with no temp file, no `fsync`,
+  no atomic rename. SIGKILL or power loss mid-write could corrupt
+  `migrations.json`; `load()` then treats it as empty and re-runs
+  every migration in the chain (safe only if every step is strictly
+  idempotent). Rewritten to `tmp + fsync + os.replace`. A regression
+  test simulates a failing `os.replace` and verifies the original
+  file is byte-identical afterward. **Finding P2-40.**
+
+### Re-scoped (no code change)
+- **Task T074** — Trust-boundary X-3 assumed a `.env` hot-reload
+  mechanism that does not exist in the codebase. `config_updates.py`
+  is a writer only; the bot reads `.env` once at startup and the
+  user-facing i18n tells users to restart after edits. Finding
+  retracted.
+- **Task T080** — Crash-matrix C6 flagged wall-clock usage in
+  `bot/scheduler.py`. On audit, most usages are legitimately
+  wall-clock (serialised timestamps, absolute deadlines, recurring
+  advancement). A correct fix requires threading monotonic
+  references through in-memory state for interval-only computations
+  while keeping wall-clock for serialisation — spec-scale work.
+  **Deferred with rationale as finding P2-80** for a future feature
+  branch.
+
+### Tests
+1110 passed, 1 skipped (+1 from 0.21.1).
+
+### Migration
+`bot/migrations/v0_21_2.py` — no-op (code-only release).
+
 ## 0.21.1
 
 Pass 2 security + stability slice. Code-only release on top of v0.21.0;
