@@ -21,7 +21,10 @@ All env vars use the `ROBYX_` prefix. Legacy `KAELOPS_` prefixes are still accep
 | `OPENAI_API_KEY` | — | For voice message transcription (Whisper) |
 | `SCHEDULER_INTERVAL` | — | Scheduler check interval in seconds (default: `60`) |
 | `UPDATE_CHECK_INTERVAL` | — | Auto-update check interval in seconds (default: `3600`) |
-| `REMINDER_MAX_AGE_SECONDS` | — | Reminders whose `fire_at` is older than this limit are marked `failed` with `failure_reason="expired"` instead of retrying forever (default: `86400` = 24 h). |
+| `REMINDER_MAX_AGE_SECONDS` | — | Reminders whose `fire_at` is older than this limit are marked `failed` with `failure_reason="expired"` instead of retrying forever (default: `604800` = 7 d, raised from 24 h in v0.20.28). |
+| `CLAIM_TIMEOUT_SECONDS` | — | Stale-claim reset timeout for reminders and scheduled tasks (default: `600` = 10 min). A slower delivery watcher now has more room before the scheduler decides the claim is stuck. |
+| `SMOKE_TEST_TIMEOUT_SECONDS` | — | Post-update smoke-test timeout (default: `60`). Raise on slow machines / cold caches to avoid false-positive rollbacks. |
+| `VOICE_TIMEOUT_SECONDS` | — | Voice (Whisper) transcription HTTP timeout (default: `60`). |
 
 ## Telegram
 

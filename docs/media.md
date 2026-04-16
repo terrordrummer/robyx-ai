@@ -20,6 +20,8 @@ Under the hood the agent emits a `[SEND_IMAGE path="..." caption="..."]` tag in 
 
 **Strict rule enforced in the agent system prompt**: agents only emit `[SEND_IMAGE]` when the user has explicitly asked to see, send, or share an image. They never attach images proactively, as a bonus, or because the conversation merely touched on an image.
 
+**Path allowlist (v0.20.28).** Paths supplied in `[SEND_IMAGE path="..."]` are validated before any filesystem access and must resolve under one of: the agent's own `work_dir`, the bot's `data/` directory, the system temp directory, or — on POSIX — `/tmp`. Requests pointing anywhere else (`/etc/passwd`, a sibling user's home, etc.) are refused with a short error appended to the reply and a warning in `bot.log`. This protects against a prompt-injection attempt coaxing an agent into exfiltrating unrelated files.
+
 ---
 
 ← [Back to README](../README.md)

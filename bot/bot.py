@@ -767,7 +767,7 @@ async def _background_update_loop(
     while True:
         log.info("Update check: running")
         try:
-            info = check_for_updates()
+            info = await check_for_updates()
             if info:
                 notes = info["release_notes"]
                 body = notes["body"].strip() if notes else "(no release notes)"

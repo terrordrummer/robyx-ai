@@ -7,6 +7,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from agents import AgentManager, format_age
 from ai_backend import AIBackend
@@ -85,6 +86,35 @@ from collaborative import CollabStore, CollabWorkspace
 from voice import is_available as voice_available, transcribe_voice
 
 log = logging.getLogger("robyx.handlers")
+
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_tracked(coro, *, name: str | None = None) -> asyncio.Task:
+    """Spawn a background asyncio task with exception logging and GC protection.
+
+    Plain ``asyncio.create_task`` returns a task that can be garbage-collected
+    while still pending (emitting a runtime warning), and silently swallows
+    exceptions into asyncio's default handler. This helper keeps a strong
+    reference until completion and routes exceptions to our logger.
+    """
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            log.error(
+                "Background task %s raised: %s",
+                t.get_name(), exc, exc_info=exc,
+            )
+
+    task.add_done_callback(_on_done)
+    return task
 
 
 async def _safe_send(platform, chat_id, text, thread_id=None):
@@ -415,7 +445,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
                 # Outgoing image attachments (only if the agent explicitly emitted
                 # [SEND_IMAGE ...] — the system prompt forbids proactive emission).
-                response = await _handle_media_commands(response, chat_id, platform, thread_id)
+                response = await _handle_media_commands(
+                    response, chat_id, platform, thread_id,
+                    agent_work_dir=agent.work_dir,
+                )
 
                 # Schedule any [REMIND ...] requests into the reminder engine.
                 response = _handle_remind_commands(response, agent, chat_id, thread_id)
@@ -602,7 +635,17 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                     name=cont_name,
                     program=program,
                     work_dir=cont_work_dir,
-                    parent_workspace=manager.get_by_thread(thread_id).name if manager.get_by_thread(thread_id) else "robyx",
+                    parent_workspace=(
+                        manager.get_by_thread(thread_id).name
+                        if manager.get_by_thread(thread_id)
+                        else (
+                            log.warning(
+                                "Continuous task %s: thread_id=%s has no mapped "
+                                "workspace; reparenting to 'robyx'",
+                                cont_name, thread_id,
+                            ) or "robyx"
+                        )
+                    ),
                     model="powerful",
                     manager=manager,
                     platform=platform,
@@ -626,7 +669,47 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
         return response
 
-    async def _handle_media_commands(response, chat_id, platform, thread_id):
+    def _validate_image_path(raw_path: str, agent_work_dir: str | None) -> bool:
+        """Return True iff ``raw_path`` resolves under an allowed root.
+
+        Allowed roots: the agent's ``work_dir`` (its own workspace), the bot's
+        ``DATA_DIR``, the system tempdir, and — on POSIX — ``/tmp`` (which on
+        macOS lives at ``/private/tmp`` and resolves there). Any other path —
+        absolute or escaping via ``..`` — is rejected. This prevents a
+        prompt-injection ``[SEND_IMAGE path="/etc/passwd"]`` from exfiltrating
+        arbitrary files.
+        """
+        import tempfile as _tempfile
+        from config import DATA_DIR as _DATA_DIR
+        try:
+            resolved = Path(raw_path).expanduser().resolve()
+        except (OSError, ValueError):
+            return False
+        roots: list[Path] = [
+            _DATA_DIR.resolve(),
+            Path(_tempfile.gettempdir()).resolve(),
+        ]
+        if os.name == "posix":
+            try:
+                roots.append(Path("/tmp").resolve())
+            except (OSError, ValueError):
+                pass
+        if agent_work_dir:
+            try:
+                roots.append(Path(agent_work_dir).resolve())
+            except (OSError, ValueError):
+                pass
+        for root in roots:
+            try:
+                resolved.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    async def _handle_media_commands(
+        response, chat_id, platform, thread_id, *, agent_work_dir: str | None = None,
+    ):
         """Parse and execute [SEND_IMAGE path="..." caption="..."] patterns.
 
         For each match: strip it from the response text, ask the platform
@@ -634,6 +717,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         media.prepare_image_for_upload). On failure, append a short textual
         notice to the response so the user is never left wondering whether
         the image actually arrived.
+
+        Image paths are validated against an allowlist of roots before any
+        filesystem access (agent work_dir, DATA_DIR, tmpdir) — agent-supplied
+        paths cannot escape the sandbox.
 
         Multiple images in one response are sent in order.
         """
@@ -647,6 +734,14 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         for match in matches:
             path = match.group(1)
             caption = (match.group(2) or "").strip() or None
+            if not _validate_image_path(path, agent_work_dir):
+                log.warning(
+                    "SEND_IMAGE rejected: path %r is outside allowed roots", path,
+                )
+                errors.append(
+                    "Refused to send image `%s` (path outside allowed roots)." % path
+                )
+                continue
             log.info("SEND_IMAGE: path=%s caption=%r", path, caption)
             try:
                 result = await platform.send_photo(
@@ -992,7 +1087,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                     msg.chat_id, msg.thread_id, e,
                 )
 
-        asyncio.create_task(_early_typing())
+        _spawn_tracked(_early_typing(), name="early_typing")
 
         await _route_and_process(platform, msg, msg_ref, text)
 
@@ -1025,6 +1120,11 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         # change persisted roles.
         if role is None:
             role = Role.PARTICIPANT
+            log.info(
+                "Collaborative [%s]: unknown sender defaulted to PARTICIPANT "
+                "(user=%s chat=%s)",
+                collab_ws.agent_name, msg.user_id, msg.chat_id,
+            )
 
         # ── Lifecycle commands (intercepted before AI) ──
         text = (msg.text or "").strip()
@@ -1074,7 +1174,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             except Exception:
                 pass
 
-        asyncio.create_task(_early_typing())
+        _spawn_tracked(_early_typing(), name="early_typing_collab")
 
         await _process_and_send(
             agent, formatted_text, msg.chat_id, platform,
@@ -1265,7 +1365,14 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
         if pending:
             ws = sorted(pending, key=lambda w: w.created_at, reverse=True)[0]
-            collab_store.update_chat_id(ws.id, chat_id)
+            if not collab_store.update_chat_id(
+                ws.id, chat_id, expected_creator_id=added_by_id,
+            ):
+                log.warning(
+                    "Could not bind pending workspace %s to chat %s (creator=%s)",
+                    ws.id, chat_id, added_by_id,
+                )
+                return
             collab_store.update_roles(ws.id, added_by_id, _collab_role("owner"))
 
             # Generate invite link
@@ -1339,9 +1446,11 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             created_by=added_by_id or 0,
             roles={str(added_by_id): "owner"} if added_by_id else {},
         )
-        collab_store.add(ws)
 
-        # Register a provisional agent so messages in this group are routed
+        # Register the agent first, write its instructions, then publish the
+        # workspace to the routing store. This order closes the race where a
+        # message arriving between store.add() and manager.add_agent() would
+        # fail to find a registered agent.
         agent = manager.add_agent(
             name=safe_name,
             work_dir=str(WORKSPACE),
@@ -1350,19 +1459,33 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             thread_id=None,
         )
         agent.collab_workspace_id = ws_id
-        manager.save_state()
 
-        # Write minimal agent instructions
         from config import AGENTS_DIR
         agent_file = AGENTS_DIR / ("%s.md" % safe_name)
-        AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-        agent_file.write_text(
-            "# %s\n\n"
-            "Collaborative workspace in setup phase.\n"
-            "Ask the user what this workspace should focus on and whether "
-            "it should inherit from an existing workspace agent.\n"
-            % chat_title
-        )
+        try:
+            AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            agent_file.write_text(
+                "# %s\n\n"
+                "Collaborative workspace in setup phase.\n"
+                "Ask the user what this workspace should focus on and whether "
+                "it should inherit from an existing workspace agent.\n"
+                % chat_title
+            )
+        except OSError as e:
+            log.error(
+                "Failed to write agent file for collab workspace %s: %s — "
+                "rolling back agent registration",
+                ws_id, e,
+            )
+            # Roll back the provisional agent so the manager state is clean.
+            try:
+                manager.remove_agent(safe_name)
+            except Exception:
+                log.exception("Rollback remove_agent(%s) also failed", safe_name)
+            return
+
+        collab_store.add(ws)
+        manager.save_state()
 
         # Generate invite link
         try:

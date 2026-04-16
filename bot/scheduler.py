@@ -135,7 +135,10 @@ _queue_size_warned = False
 def _save_queue_unlocked(entries: list[dict]) -> None:
     QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = QUEUE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(entries, indent=2, ensure_ascii=False))
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, QUEUE_FILE)
 
     global _queue_size_warned
@@ -515,7 +518,13 @@ def _claim_due_entries() -> tuple[list[dict], list[dict]]:
 
 
 def _next_run_after(run_at: datetime, interval_seconds: int) -> datetime:
-    """Advance run_at by full intervals until it is strictly in the future."""
+    """Advance ``run_at`` by full intervals until it is strictly in the future.
+
+    Invariant: a periodic task with N missed intervals fires **once** on
+    recovery (the scheduler dispatches the currently-due instance), and its
+    ``next_run`` is then advanced past ``now``. N-1 missed instances are
+    intentionally skipped to avoid a thundering-herd on resume.
+    """
     now = datetime.now(timezone.utc)
     delta = timedelta(seconds=interval_seconds)
     while run_at <= now:
@@ -1124,11 +1133,15 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
 # ── Log helper ───────────────────────────────────────────────────────────────
 
 
+_append_log_lock = threading.Lock()
+
+
 def append_log(entry: str) -> None:
-    """Append a timestamped entry to bot.log."""
+    """Append a timestamped entry to bot.log (thread-safe)."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-    with open(LOG_FILE, "a") as f:
-        f.write("[%s] %s\n" % (now, entry))
+    with _append_log_lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (now, entry))
 
 
 # ── Query helpers ────────────────────────────────────────────────────────────
@@ -1325,6 +1338,23 @@ def migrate_to_unified_queue() -> int:
                         if migrated_entry.get("status") == "dispatching":
                             migrated_entry["status"] = "pending"
                             _clear_claim(migrated_entry)
+                        # Validate scheduled_at for one-shot entries before
+                        # the scheduler ingests them — a corrupt legacy
+                        # entry otherwise stays wedged in queue.json.
+                        if migrated_entry.get("type") == "one-shot":
+                            try:
+                                migrated_entry["scheduled_at"] = (
+                                    validate_one_shot_scheduled_at(
+                                        migrated_entry.get("scheduled_at"),
+                                        label="migrated one-shot",
+                                    )
+                                )
+                            except ValueError as v_exc:
+                                log.warning(
+                                    "Skipping corrupt timed entry %s: %s",
+                                    entry.get("name"), v_exc,
+                                )
+                                continue
                         unified.append(migrated_entry)
                         log.info(
                             "Migrated timed task '%s' (%s)",

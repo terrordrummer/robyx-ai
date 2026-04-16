@@ -18,6 +18,11 @@ try:  # POSIX inter-process lock; absent on Windows.
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
+try:  # Windows inter-process lock fallback.
+    import msvcrt  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    msvcrt = None  # type: ignore[assignment]
+
 from config import DATA_DIR
 
 log = logging.getLogger("robyx.collaborative")
@@ -142,18 +147,28 @@ class CollabStore:
     def _mutex(self):
         """Intra-process + inter-process exclusive access to the store file."""
         with self._lock:
-            if fcntl is None:
+            if fcntl is None and msvcrt is None:
                 yield
                 return
             self._path.parent.mkdir(parents=True, exist_ok=True)
             lock_path = self._path.with_name(self._path.name + ".lock")
             fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                else:  # Windows
+                    # Lock a single byte at offset 0. LK_LOCK blocks until free.
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
                 yield
             finally:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    else:
+                        try:
+                            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                        except OSError:
+                            pass
                 finally:
                     os.close(fd)
 
@@ -168,7 +183,11 @@ class CollabStore:
             self._rebuild_chat_map()
             log.info("Loaded %d collaborative workspaces", len(self._workspaces))
         except Exception as e:
-            log.warning("Failed to load collaborative workspaces: %s", e)
+            log.error(
+                "Failed to load collaborative workspaces from %s: %s — "
+                "collaborative routing is DEGRADED until this is fixed",
+                self._path, e,
+            )
 
     def _rebuild_chat_map(self) -> None:
         self._chat_map = {}
@@ -267,10 +286,41 @@ class CollabStore:
             and ws.expected_creator_id == creator_id
         ]
 
-    def update_chat_id(self, ws_id: str, chat_id: int) -> bool:
+    def update_chat_id(
+        self,
+        ws_id: str,
+        chat_id: int,
+        *,
+        expected_creator_id: int | None = None,
+    ) -> bool:
+        """Bind a pending workspace to a chat_id and promote it to active.
+
+        Refuses to promote a workspace unless it is currently ``pending`` and
+        still unlinked (``chat_id == 0``). When ``expected_creator_id`` is
+        provided, it must match the workspace's bound creator — this prevents
+        a Flow-A race where an outsider adds the bot to a group and hijacks
+        another user's pending workspace.
+        """
         with self._mutex():
             ws = self._workspaces.get(ws_id)
             if not ws:
+                return False
+            if ws.status != "pending" or ws.chat_id != 0:
+                log.warning(
+                    "Refusing update_chat_id for %s: status=%s chat_id=%s",
+                    ws_id, ws.status, ws.chat_id,
+                )
+                return False
+            if (
+                expected_creator_id is not None
+                and ws.expected_creator_id is not None
+                and ws.expected_creator_id != expected_creator_id
+            ):
+                log.warning(
+                    "Refusing update_chat_id for %s: creator mismatch "
+                    "(expected=%s got=%s)",
+                    ws_id, ws.expected_creator_id, expected_creator_id,
+                )
                 return False
             ws.chat_id = chat_id
             ws.status = "active"

@@ -1,11 +1,14 @@
 """Robyx — Voice transcription via OpenAI Whisper (optional)."""
 
 import logging
+import os
 
 import httpx
 
 from config import OPENAI_API_KEY
 from i18n import STRINGS
+
+VOICE_TIMEOUT = int(os.environ.get("VOICE_TIMEOUT_SECONDS", "60"))
 
 log = logging.getLogger("robyx.voice")
 
@@ -21,7 +24,7 @@ async def transcribe_voice(file_path: str) -> tuple[str | None, str | None]:
         return None, STRINGS["voice_no_key"]
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=VOICE_TIMEOUT) as client:
             with open(file_path, "rb") as f:
                 response = await client.post(
                     "https://api.openai.com/v1/audio/transcriptions",
