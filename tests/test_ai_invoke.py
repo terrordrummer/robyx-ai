@@ -1510,3 +1510,72 @@ class TestParseRemindWhen:
     def test_in_over_90_days_rejected(self):
         with pytest.raises(ValueError, match="90 days"):
             parse_remind_when(at=None, in_="91d")
+
+
+class TestScrubbedChildEnv:
+    """Pass 2 T066 — the AI CLI subprocess must NOT inherit Robyx-specific
+    bot secrets. Trust-boundary X-1: a crash dump or prompt-injected agent
+    that reads ``os.environ`` should see only what the CLI actually needs
+    (provider API keys, PATH, HOME, proxy vars, user-set env)."""
+
+    def test_strips_telegram_bot_token(self, monkeypatch):
+        from ai_invoke import _scrubbed_child_env
+
+        monkeypatch.setenv("ROBYX_BOT_TOKEN", "xxxxxxxxxxxxxxxxxxxxxxx")
+        scrubbed = _scrubbed_child_env()
+        assert "ROBYX_BOT_TOKEN" not in scrubbed
+
+    def test_strips_legacy_kaelops_token(self, monkeypatch):
+        from ai_invoke import _scrubbed_child_env
+
+        monkeypatch.setenv("KAELOPS_BOT_TOKEN", "legacy-token")
+        scrubbed = _scrubbed_child_env()
+        assert "KAELOPS_BOT_TOKEN" not in scrubbed
+
+    def test_strips_discord_token(self, monkeypatch):
+        from ai_invoke import _scrubbed_child_env
+
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-secret")
+        scrubbed = _scrubbed_child_env()
+        assert "DISCORD_BOT_TOKEN" not in scrubbed
+
+    def test_strips_slack_tokens(self, monkeypatch):
+        from ai_invoke import _scrubbed_child_env
+
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-yyy")
+        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-zzz")
+        scrubbed = _scrubbed_child_env()
+        assert "SLACK_BOT_TOKEN" not in scrubbed
+        assert "SLACK_APP_TOKEN" not in scrubbed
+
+    def test_preserves_provider_api_keys(self, monkeypatch):
+        """The AI CLI still needs these — scrubbing them would break
+        every agent that talks to OpenAI, Anthropic, etc."""
+        from ai_invoke import _scrubbed_child_env
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-key")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-anthropic-key")
+        scrubbed = _scrubbed_child_env()
+        assert scrubbed.get("OPENAI_API_KEY") == "sk-openai-key"
+        assert scrubbed.get("ANTHROPIC_API_KEY") == "sk-ant-anthropic-key"
+
+    def test_preserves_path_and_home(self, monkeypatch):
+        """Basic environment a subprocess can't run without."""
+        from ai_invoke import _scrubbed_child_env
+
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("HOME", "/Users/test")
+        scrubbed = _scrubbed_child_env()
+        assert scrubbed.get("PATH") == "/usr/bin:/bin"
+        assert scrubbed.get("HOME") == "/Users/test"
+
+    def test_returns_a_copy_not_reference(self, monkeypatch):
+        """Mutating the returned dict must not affect the parent env."""
+        import os
+
+        from ai_invoke import _scrubbed_child_env
+
+        monkeypatch.setenv("MY_VAR", "parent-value")
+        scrubbed = _scrubbed_child_env()
+        scrubbed["MY_VAR"] = "mutated"
+        assert os.environ["MY_VAR"] == "parent-value"

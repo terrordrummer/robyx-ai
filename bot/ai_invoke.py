@@ -4,11 +4,40 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import re
 import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+
+# Robyx-specific secrets that MUST NOT be inherited by the AI CLI
+# subprocess (Pass 2 T066 / trust-boundary X-1). The AI CLI tools we
+# spawn (Claude Code, Codex, OpenCode) don't need any of these — they
+# authenticate against their own providers — so scrubbing them closes
+# the door on a hostile CLI that dumps env in a stack trace, or on a
+# prompt-injected agent that tries to read them via a file/env read.
+#
+# We use a denylist (not an allowlist) because the process also needs
+# to inherit PATH, HOME, LANG, HTTP(S)_PROXY, and any
+# project-specific env the user expects the CLI to see (OPENAI_API_KEY
+# for Codex / voice, ANTHROPIC_API_KEY for Claude, etc.).
+_SCRUBBED_ENV_KEYS = frozenset({
+    # Telegram
+    "ROBYX_BOT_TOKEN",
+    "KAELOPS_BOT_TOKEN",  # legacy alias
+    # Discord
+    "DISCORD_BOT_TOKEN",
+    # Slack
+    "SLACK_BOT_TOKEN",
+    "SLACK_APP_TOKEN",
+})
+
+
+def _scrubbed_child_env() -> dict[str, str]:
+    """Return a copy of ``os.environ`` with Robyx-specific bot secrets
+    removed. Used as the ``env=`` argument when spawning the AI CLI."""
+    return {k: v for k, v in os.environ.items() if k not in _SCRUBBED_ENV_KEYS}
 
 from agents import Agent, AgentManager
 from ai_backend import AIBackend
@@ -436,6 +465,7 @@ async def _invoke_ai_locked(
             cwd=agent.work_dir,
             limit=1024 * 1024,
             start_new_session=sys.platform != "win32",
+            env=_scrubbed_child_env(),
         )
         agent.running_proc = proc
         import orphan_tracker
