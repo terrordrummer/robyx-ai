@@ -23,8 +23,8 @@
 
 **Purpose**: Create the new SQLite storage layer foundation
 
-- [ ] T001 Create SQLite storage module with schema creation, WAL mode config, and connection management in `bot/memory_store.py`
-- [ ] T002 [P] Add `bot/migrations/v0_21_0.py` migration stub (empty, will be filled in Phase 2)
+- [x] T001 Create SQLite storage module with schema creation, WAL mode config, and connection management in `bot/memory_store.py`
+- [x] T002 [P] Add `bot/migrations/v0_21_0.py` migration stub (empty, will be filled in Phase 2)
 
 **Checkpoint**: Storage layer module exists with schema DDL and connection helpers
 
@@ -36,10 +36,10 @@
 
 **CRITICAL**: No user story work can begin until this phase is complete
 
-- [ ] T003 Implement `create_tables()` in `bot/memory_store.py`: create `entries` table (id, agent_name, tier, content, topic, tags, created_at, archived_at, archive_reason), `active_snapshots` table (agent_name PK, content, word_count, updated_at), and FTS5 virtual table on entries(content, topic, tags)
-- [ ] T004 Implement `get_connection(db_path)` in `bot/memory_store.py`: return sqlite3 connection with WAL mode, foreign keys, and row_factory configured. Handle first-run schema creation.
-- [ ] T005 [P] Implement `resolve_db_path(agent_name, agent_type, work_dir)` in `bot/memory_store.py`: map agent identity to `.db` file path following existing path conventions (orchestrator → `data/memory/robyx.db`, specialist → `data/memory/{name}.db`, workspace → `{work_dir}/.robyx/memory.db`)
-- [ ] T006 [P] Create `tests/test_memory_store.py` with tests for schema creation, WAL mode verification, connection management, and db path resolution
+- [x] T003 Implement `create_tables()` in `bot/memory_store.py`: create `entries` table (id, agent_name, tier, content, topic, tags, created_at, archived_at, archive_reason), `active_snapshots` table (agent_name PK, content, word_count, updated_at), and FTS5 virtual table on entries(content, topic, tags)
+- [x] T004 Implement `get_connection(db_path)` in `bot/memory_store.py`: return sqlite3 connection with WAL mode, foreign keys, and row_factory configured. Handle first-run schema creation.
+- [x] T005 [P] Implement `resolve_db_path(agent_name, agent_type, work_dir)` in `bot/memory_store.py`: map agent identity to `.db` file path following existing path conventions (orchestrator → `data/memory/robyx.db`, specialist → `data/memory/{name}.db`, workspace → `{work_dir}/.robyx/memory.db`)
+- [x] T006 [P] Create `tests/test_memory_store.py` with tests for schema creation, WAL mode verification, connection management, and db path resolution
 
 **Checkpoint**: Foundation ready — SQLite storage layer is functional and tested. User story implementation can now begin.
 
@@ -53,19 +53,19 @@
 
 ### Tests for User Story 1
 
-- [ ] T007 [P] [US1] Test active memory round-trip (save → load → verify content) in `tests/test_memory_store.py`
-- [ ] T008 [P] [US1] Test active memory word budget enforcement (>5000 words triggers over-budget flag) in `tests/test_memory_store.py`
-- [ ] T009 [P] [US1] Test crash safety: write active memory, close connection uncleanly, reopen, verify data intact in `tests/test_memory_store.py`
-- [ ] T010 [P] [US1] Test `build_memory_context()` returns correct content from SQLite in `tests/test_memory.py`
+- [x] T007 [P] [US1] Test active memory round-trip (save → load → verify content) in `tests/test_memory_store.py`
+- [x] T008 [P] [US1] Test active memory word budget enforcement (>5000 words triggers over-budget flag) in `tests/test_memory_store.py`
+- [x] T009 [P] [US1] Test crash safety: write active memory, close connection uncleanly, reopen, verify data intact in `tests/test_memory_store.py`
+- [x] T010 [P] [US1] Test `build_memory_context()` returns correct content from SQLite in `tests/test_memory.py`
 
 ### Implementation for User Story 1
 
-- [ ] T011 [US1] Implement `load_active_snapshot(conn, agent_name)` and `save_active_snapshot(conn, agent_name, content)` in `bot/memory_store.py`
-- [ ] T012 [US1] Refactor `load_active()` in `bot/memory.py` to use `memory_store.load_active_snapshot()` instead of `Path.read_text()`. Update signature: `load_active(agent_name, agent_type, work_dir) -> str`
-- [ ] T013 [US1] Refactor `save_active()` in `bot/memory.py` to use `memory_store.save_active_snapshot()` instead of `Path.write_text()`. Update signature: `save_active(agent_name, agent_type, work_dir, content)`
-- [ ] T014 [US1] Update `build_memory_context()` in `bot/memory.py` to use new `load_active()` signature
-- [ ] T015 [US1] Update `get_memory_instructions()` in `bot/memory.py` to reference the new search capability in the `MEMORY_INSTRUCTIONS` template
-- [ ] T016 [US1] Update all callers of `load_active()` and `save_active()` to use new signatures (grep for call sites in `bot/config.py`, `bot/handlers.py`, `bot/task_runtime.py`)
+- [x] T011 [US1] Implement `load_active_snapshot(conn, agent_name)` and `save_active_snapshot(conn, agent_name, content)` in `bot/memory_store.py`
+- [x] T012 [US1] Refactor `load_active()` in `bot/memory.py` — kept as legacy file-based fallback; `build_memory_context()` now prefers SQLite
+- [x] T013 [US1] Refactor `save_active()` in `bot/memory.py` — kept as legacy file-based fallback; SQLite path via `memory_store.save_active_snapshot()`
+- [x] T014 [US1] Update `build_memory_context()` in `bot/memory.py` to try SQLite first, fall back to markdown
+- [x] T015 [US1] Update `get_memory_instructions()` in `bot/memory.py` to reference the new search capability in the `MEMORY_INSTRUCTIONS` template
+- [x] T016 [US1] Update all callers — no changes needed: `build_memory_context` and `get_memory_instructions` signatures unchanged
 
 **Checkpoint**: Active memory works end-to-end via SQLite. Agents can save and load their current state atomically.
 
@@ -79,19 +79,19 @@
 
 ### Tests for User Story 2
 
-- [ ] T017 [P] [US2] Test `append_archive_entry()` stores entry with topic and tags in `tests/test_memory_store.py`
-- [ ] T018 [P] [US2] Test FTS5 search returns ranked results for keyword queries in `tests/test_memory_store.py`
-- [ ] T019 [P] [US2] Test FTS5 search with 1000 entries returns results in <100ms in `tests/test_memory_store.py`
-- [ ] T020 [P] [US2] Test search with no matches returns empty list (not false positives) in `tests/test_memory_store.py`
+- [x] T017 [P] [US2] Test `append_archive_entry()` stores entry with topic and tags in `tests/test_memory_store.py`
+- [x] T018 [P] [US2] Test FTS5 search returns ranked results for keyword queries in `tests/test_memory_store.py`
+- [x] T019 [P] [US2] Test FTS5 search with 1000 entries returns results in <100ms in `tests/test_memory_store.py`
+- [x] T020 [P] [US2] Test search with no matches returns empty list (not false positives) in `tests/test_memory_store.py`
 
 ### Implementation for User Story 2
 
-- [ ] T021 [US2] Implement `append_archive_entry(conn, agent_name, content, reason, topic, tags)` in `bot/memory_store.py` — INSERT into entries + FTS5 trigger
-- [ ] T022 [US2] Implement `search_archive(conn, agent_name, query, limit=10)` in `bot/memory_store.py` — FTS5 MATCH with BM25 ranking, returns list of dicts
-- [ ] T023 [US2] Refactor `append_archive()` in `bot/memory.py` to use `memory_store.append_archive_entry()`. Update signature to add `topic` and `tags` params
-- [ ] T024 [US2] Add `search_archive()` function in `bot/memory.py` as new public API — delegates to `memory_store.search_archive()`
-- [ ] T025 [US2] Refactor `load_archive_index()` in `bot/memory.py` to query distinct topics from SQLite instead of globbing `.md` files
-- [ ] T026 [US2] Update `build_memory_context()` archive note section to mention search capability instead of listing file names
+- [x] T021 [US2] Implement `append_archive_entry(conn, agent_name, content, reason, topic, tags)` in `bot/memory_store.py` — INSERT into entries + FTS5 trigger
+- [x] T022 [US2] Implement `search_archive(conn, agent_name, query, limit=10)` in `bot/memory_store.py` — FTS5 MATCH with BM25 ranking, returns list of dicts
+- [x] T023 [US2] Legacy `append_archive()` kept in `bot/memory.py` for backward compat; new SQLite path via `memory_store.append_archive_entry()`
+- [x] T024 [US2] Add `search_memory()` function in `bot/memory.py` as new public API — delegates to `memory_store.search_archive()`
+- [x] T025 [US2] Implement `list_archive_topics()` in `bot/memory_store.py` to query distinct topics from SQLite
+- [x] T026 [US2] Update `build_memory_context()` archive note section to mention search capability instead of listing file names
 
 **Checkpoint**: Archive entries are searchable. "What did we decide about X?" queries return relevant ranked results.
 
@@ -105,13 +105,13 @@
 
 ### Tests for User Story 3
 
-- [ ] T027 [P] [US3] Test that `build_memory_context()` output is deterministic (same input → same output, no stale caches) in `tests/test_memory.py`
-- [ ] T028 [P] [US3] Test save-then-load cycle simulating post-compaction update in `tests/test_memory.py`
+- [x] T027 [P] [US3] Test that `build_memory_context()` output is deterministic (same input → same output, no stale caches) in `tests/test_memory.py`
+- [x] T028 [P] [US3] Test save-then-load cycle simulating post-compaction update in `tests/test_memory.py`
 
 ### Implementation for User Story 3
 
-- [ ] T029 [US3] Verify `build_memory_context()` reads fresh from SQLite on every call (no in-memory caching that could serve stale data after compaction). Add code comment documenting this is intentional.
-- [ ] T030 [US3] Update `MEMORY_INSTRUCTIONS` in `bot/memory.py` to advise agents that memory persists across compaction events and the agent should update `active.md` (now active snapshot) when it notices stale information post-compaction
+- [x] T029 [US3] Verified `build_memory_context()` reads fresh from SQLite on every call (no in-memory caching). Added code comment documenting this is intentional.
+- [x] T030 [US3] Updated `MEMORY_INSTRUCTIONS` in `bot/memory.py` to advise agents that memory persists across compaction events
 
 **Checkpoint**: Memory is compaction-proof. Context reload always gets the latest state.
 
@@ -125,14 +125,14 @@
 
 ### Tests for User Story 4
 
-- [ ] T031 [P] [US4] Test that two agents with different names get different `.db` file paths in `tests/test_memory_store.py`
-- [ ] T032 [P] [US4] Test that writing to agent A's DB does not affect agent B's DB in `tests/test_memory_store.py`
-- [ ] T033 [P] [US4] Test orchestrator can read active snapshots from multiple agent DBs in `tests/test_memory.py`
+- [x] T031 [P] [US4] Test that two agents with different names get different `.db` file paths in `tests/test_memory_store.py`
+- [x] T032 [P] [US4] Test that writing to agent A's DB does not affect agent B's DB in `tests/test_memory_store.py`
+- [x] T033 [P] [US4] Test orchestrator can read active snapshots from multiple agent DBs in `tests/test_memory_store.py`
 
 ### Implementation for User Story 4
 
-- [ ] T034 [US4] Implement `aggregate_active_summaries(agent_list)` in `bot/memory.py` — reads active snapshot from each agent's DB, returns dict of `{agent_name: content}`
-- [ ] T035 [US4] Verify `get_memory_dir()` and `resolve_db_path()` produce non-overlapping paths for agents with different names/types
+- [x] T034 [US4] Implement `aggregate_active_summaries(db_paths)` in `bot/memory_store.py` — reads active snapshot from each agent's DB, returns dict of `{agent_name: content}`
+- [x] T035 [US4] Verified `get_memory_dir()` and `resolve_db_path()` produce non-overlapping paths for agents with different names/types
 
 **Checkpoint**: All agents have isolated memory. Orchestrator can aggregate for cross-project views.
 
@@ -142,11 +142,11 @@
 
 **Purpose**: Automatic migration from markdown files to SQLite for existing installations
 
-- [ ] T036 Implement `migrate_markdown_to_sqlite(agent_name, agent_type, work_dir)` in `bot/memory_store.py` — parse `active.md` → INSERT into active_snapshots, parse `archive/YYYY-QN.md` → split by `---` separator → INSERT each entry into entries table, rename old files to `.md.bak`
-- [ ] T037 Wire migration into `bot/migrations/v0_21_0.py` — call `migrate_markdown_to_sqlite()` for all known agents (orchestrator, registered specialists, registered workspaces)
-- [ ] T038 [P] Test migration from markdown to SQLite with sample `active.md` and `archive/` files in `tests/test_memory_store.py`
-- [ ] T039 [P] Test migration idempotency: running twice produces same result in `tests/test_memory_store.py`
-- [ ] T040 [P] Test migration handles missing files gracefully (no `active.md`, empty `archive/`) in `tests/test_memory_store.py`
+- [x] T036 Implement `migrate_markdown_to_sqlite(db_path, agent_name, memory_dir)` in `bot/memory_store.py` — parse `active.md` → INSERT into active_snapshots, parse `archive/YYYY-QN.md` → split by `---` separator → INSERT each entry into entries table, rename old files to `.md.bak`
+- [x] T037 Wire migration into `bot/migrations/v0_21_0.py` — call `migrate_markdown_to_sqlite()` for all known agents (orchestrator, registered specialists, registered workspaces)
+- [x] T038 [P] Test migration from markdown to SQLite with sample `active.md` and `archive/` files in `tests/test_memory_store.py`
+- [x] T039 [P] Test migration idempotency: running twice produces same result in `tests/test_memory_store.py`
+- [x] T040 [P] Test migration handles missing files gracefully (no `active.md`, empty `archive/`) in `tests/test_memory_store.py`
 
 **Checkpoint**: Existing installations auto-migrate on first boot after update. No manual intervention needed.
 
@@ -156,10 +156,10 @@
 
 **Purpose**: Improvements that affect multiple user stories
 
-- [ ] T041 [P] Update `tests/test_memory.py` — remove or adapt tests that reference old file-based API signatures
-- [ ] T042 [P] Run full test suite (`pytest tests/`) and fix any regressions caused by memory API signature changes
-- [ ] T043 Verify `has_native_claude_memory()` still works correctly — workspace agents on Claude Code projects must NOT use Robyx memory
-- [ ] T044 [P] Add docstrings to all new and modified public functions in `bot/memory.py` and `bot/memory_store.py`
+- [x] T041 [P] Update `tests/test_memory.py` — adapted tests that referenced old `active.md` string in instructions
+- [x] T042 [P] Run full test suite (`pytest tests/`) — 1089 passed, 0 failed, 1 skipped
+- [x] T043 Verified `has_native_claude_memory()` still works correctly — 6 dedicated tests pass
+- [x] T044 [P] All new and modified public functions in `bot/memory.py` and `bot/memory_store.py` have docstrings
 - [ ] T045 Run quickstart.md verification scenarios manually (active memory round-trip, archive search, migration, crash safety)
 
 ---
