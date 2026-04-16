@@ -65,3 +65,26 @@ Additional dead items identified but kept (legacy fallback): memory.py legacy fu
 | F17 | collaborative.py | Med | Partial load on malformed JSON |
 | F20 | voice.py | Med | `%` formatting can raise TypeError |
 | All adapters | Med | `reply`/`edit_message` unprotected while `send_message` uses retry_send |
+
+---
+
+## Pass 2 Baseline (recorded 2026-04-16, T059)
+
+| Metric | Value |
+|--------|-------|
+| Tests (pytest) | 1085 passed, 1 skipped (1086 collected) |
+| LOC under `bot/` | 12 329 |
+| Modules under `bot/` | 53 |
+| Migration files (`bot/migrations/v*.py`) | 18 (`v0_20_12` … `v0_21_0`) — plan.md erroneously said 25 |
+| Version | 0.21.0 |
+| Plan-assumption correction | `bot/i18n.py` is **single-locale English**, not IT+EN. Pass 2 plan and conversation contract assumed bilingual — to correct before Phase 12. |
+
+## Pass 2 Findings
+
+| ID | Module | Lens | Sev | Description | Fix | Status |
+|----|--------|------|-----|-------------|-----|--------|
+| P2-00 | plan.md / contract | Meta | Low | Pass 2 planning docs claimed IT/EN locale parity, but `bot/i18n.py` is English-only | Corrected in plan.md + contracts/conversation-contract.md; single-locale discipline now articulated; multi-locale becomes a *future* concern | fixed |
+| P2-01 | handlers.py:213 | NI | Low | Hard-coded literal `"Usage: /reset <name>"` passed to `platform.reply` (bypasses i18n) | Relocate to `bot/i18n.py` under key `reset_usage`; replace call site with `t("reset_usage")` | open |
+| P2-02 | handlers.py:306 | NI | Low | Hard-coded literal `"Checking for pending update..."` passed to `platform.reply` | Relocate to i18n key `update_checking_manual`; reuse existing `update_checking` if semantics match | open |
+| P2-03 | handlers.py:1350 | NI | Low | Hard-coded literal `"No users registered in this workspace."` passed to `platform.reply` | Relocate to i18n key `collab_no_users`; add i18n key and swap call | open |
+
