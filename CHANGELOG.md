@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.21.3
+
+Third Pass 2 slice. One Medium-severity security fix, three Low-severity
+i18n-discipline fixes, two new parametrised test suites.
+
+### Fixed (security)
+- **`bot/media.py`** — Pillow's default decompression-bomb behaviour was
+  a warning (not an exception), and there was no pre-Pillow file-size
+  cap. Added three layered defences: 25 MB file-size cap enforced via
+  `stat()` before `Image.open`; `Image.MAX_IMAGE_PIXELS` lowered to
+  50 MP; `DecompressionBombWarning` promoted to error via scoped
+  `warnings.simplefilter`. Any suspicious image now raises `MediaError`
+  instead of silently allocating memory. **Finding P2-50. Closes
+  trust-boundary TG-4.**
+
+### Fixed (natural interaction)
+- **`bot/handlers.py` + `bot/i18n.py`** — three literal strings were
+  passed directly to `platform.reply()` bypassing the i18n layer
+  (`"Usage: /reset <name>"`, `"Checking for pending update..."`, `"No
+  users registered in this workspace."`). Relocated to
+  `STRINGS["reset_usage"]`, `STRINGS["update_checking_manual"]`,
+  `STRINGS["collab_no_users"]`. Ripgrep confirms **zero remaining
+  direct-literal violations** across 105 messaging call-sites.
+  **Findings P2-01, P2-02, P2-03.**
+
+### Added (test infrastructure)
+- **`tests/test_i18n_parity.py`** — two new test classes that catch
+  future drift automatically:
+  - `TestStringSubstitution` — parametrised over every `STRINGS` key;
+    asserts `%s`/`%d` substitution is clean and no `{placeholder}` 
+    tokens survive. Closes the residual risk from Pass 1 F19.
+  - `TestHelpParity` — set-equality between `make_handlers()` keys and
+    the `/command` tokens in `help_text`, modulo curated exclusions
+    (`start`, `help`, internal dispatch). A registered command missing
+    from `/help`, or a `/help` entry without a handler, now fails the
+    build. **Finding P2-60. Closes T097 and T101.**
+
+### Re-scoped
+- **T100** (locale parity) — the bot is single-locale (English). The
+  parity dimension that actually matters today is `/help` ⟷ handlers,
+  covered by `TestHelpParity`. A locale-parity test becomes relevant
+  only if a second locale is added.
+
+### Tests
+1270 passed, 1 skipped (+160 from 0.21.2; dominated by the 75-key
+parametrised substitution suite).
+
+### Migration
+`bot/migrations/v0_21_3.py` — no-op (code-only release).
+
 ## 0.21.2
 
 Small point release. One Medium-severity stability fix plus two Pass 2
