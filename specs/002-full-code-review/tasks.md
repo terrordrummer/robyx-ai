@@ -206,3 +206,255 @@
 - Commit after each module or logical group of modules
 - Stop at any checkpoint to validate independently
 - FR-004: every bug fix MUST have a corresponding test
+
+---
+---
+
+# Pass 2 Tasks: Security / Stability / Ease of use / Natural Interaction
+
+**Pass 2 plan**: [plan.md](./plan.md) · **Research**: [research.md](./research.md) · **Conversation contract**: [contracts/conversation-contract.md](./contracts/conversation-contract.md) · **Quickstart**: [quickstart.md](./quickstart.md)
+
+**Story labels used in Pass 2**:
+
+- `[P2-SEC]` — Security deep dive (User Story: Pass 2, Security)
+- `[P2-STB]` — Stability under failure modes (User Story: Pass 2, Stability)
+- `[P2-UX]`  — Ease of use / discoverability (User Story: Pass 2, Ease of use)
+- `[P2-NI]`  — Natural interaction / tone / i18n (User Story: Pass 2, Natural interaction)
+
+**Baseline at Pass 2 start**: 1086 tests collected, 12 329 LOC under `bot/`, 53 modules, v0.21.0.
+
+**Close-out gate**: `pytest tests/ -q` ≥ 1086 passing with new regression tests, every `P2-*` finding marked `fixed` or `deferred with rationale`, Pass 1 deferred findings (F12, F13, F14, F17, F20, P1–P5) re-evaluated, release notes drafted.
+
+---
+
+## Phase 7: Pass 2 Setup
+
+**Purpose**: Lock baseline and create tracking scaffolding for Pass 2.
+
+- [X] T059 Record Pass 2 baseline in `specs/002-full-code-review/findings.md`: run `pytest tests/ -q` and capture passing count; run `find bot -name '*.py' | xargs wc -l` and capture total
+- [X] T060 [P] Append `## Pass 2 Findings` section to `specs/002-full-code-review/findings.md` with columns `ID | Module | Lens | Sev | Description | Fix | Status` and leave rows empty; use prefix `P2-NN`
+- [X] T061 [P] Re-read `specs/002-full-code-review/contracts/conversation-contract.md` and confirm the 8-question checklist is referenced from every string-touching task below
+
+**Checkpoint**: baseline frozen, findings table ready, contract understood.
+
+---
+
+## Phase 8: Foundational — Cross-cutting Inventories (blocking all Pass 2 stories)
+
+**Purpose**: Gather global data that every story phase consumes. Must complete before US1-US4.
+
+- [X] T062 Run the two ripgrep sweeps from `research.md` §R4 and produce `specs/002-full-code-review/string-inventory.md` listing every user-visible string literal found outside `bot/i18n.py` (columns: file, line, literal, suspected trigger, i18n candidate key)
+- [X] T063 [P] Produce `specs/002-full-code-review/trust-boundaries.md` mapping each adapter's inputs to the downstream sinks that consume them (one table per adapter; source: `research.md` §R1)
+- [X] T064 [P] Produce `specs/002-full-code-review/crash-matrix.md` by expanding the 12 scenarios from `research.md` §R2 into one row per scenario with `current-behavior-verified` / `reproduction-steps` / `target-behavior` columns
+
+**Checkpoint**: three inventories published, every Pass 2 story phase has data to consume.
+
+---
+
+## Phase 9: Pass 2 — User Story P2-SEC — Security Deep Dive (Priority: P1)
+
+**Goal**: Close every medium-or-higher security gap the Pass 1 review did not catch, using `trust-boundaries.md` as input.
+
+**Independent Test**: every row in `trust-boundaries.md` with status "gap" has a corresponding `P2-NN` row in `findings.md` with status `fixed`; every fix has a regression test under `tests/`.
+
+### Group A — Core / high-risk modules (security lens)
+
+- [ ] T065 [P2-SEC] Security-audit `bot/handlers.py` against `trust-boundaries.md`: auth-before-mutation, AI-controlled path validation, command-injection residuals, secret-in-error-reply; file findings, fix, add tests under `tests/test_handlers.py`
+- [ ] T066 [P2-SEC] Security-audit `bot/ai_invoke.py`: argv-only subprocess, env scrubbing, timeout enforcement, output size limits, orphan cleanup under SIGKILL; fix findings, add tests under `tests/test_ai_invoke.py`
+- [ ] T067 [P2-SEC] Security-audit `bot/updater.py`: re-verify Pass 1 tarball symlink/hardlink rejection, add size caps, validate pip subprocess env, confirm rollback doesn't leave executable permissions wider than before; tests under `tests/test_updater.py`
+- [ ] T068 [P2-SEC] Security-audit `bot/bot.py` startup/shutdown: PID-lock race window, signal handler secret-echo, atexit ordering leaks; tests under `tests/test_bot.py`
+- [ ] T069 [P2-SEC] Security-audit `bot/scheduler.py`: attacker-controllable queue fields, path-traversal in `work_dir`, retry amplification DoS; tests under `tests/test_scheduler.py`
+
+### Group B — Platform adapters (security lens, parity-aware)
+
+- [ ] T070 [P] [P2-SEC] Security-audit `bot/messaging/telegram.py`: size caps before download, filename path-traversal, token never in error replies, message-length bounds propagated; tests under `tests/test_telegram.py`
+- [ ] T071 [P] [P2-SEC] Security-audit `bot/messaging/discord.py`: extend Pass 1 domain allow-list from voice to ALL attachment fetches, thread-mutation auth race, token scrubbing; tests under `tests/test_discord.py`
+- [~] T072 [P] [P2-SEC] Security-audit `bot/messaging/slack.py`: Socket Mode dedup store size bound, `url_private` token scrubbing in error paths, `event_id` replay protection; tests under `tests/test_slack.py` — **partial**: P2-10 (bearer-token redirect exfiltration, High) fixed out-of-band in the security point release; dedup store bound + event_id replay + error-path token scrubbing still to do
+- [ ] T073 [P] [P2-SEC] Security-audit `bot/messaging/base.py`: confirm ABC contract enforces validation hooks uniformly across adapters; tests under `tests/test_messaging_base.py`
+
+### Group D — Config & support (security lens)
+
+- [ ] T074 [P] [P2-SEC] Security-audit `bot/config.py` + `bot/config_updates.py`: env parse safety, secret-write atomicity, concurrent `.env` write race, hot-reload-during-AI-call guard; tests under `tests/test_config.py`
+- [ ] T075 [P] [P2-SEC] Security-audit `bot/media.py`: Pillow decompression-bomb protection (max pixels, max bytes), path validation for temp writes; tests under `tests/test_media.py`
+- [ ] T076 [P] [P2-SEC] Security-audit `bot/voice.py`: OpenAI API key never logged, temp-file cleanup on exception, file-size cap; tests under `tests/test_voice.py`
+- [ ] T077 [P] [P2-SEC] Security-audit `bot/memory.py` + `bot/memory_store.py`: SQLite parameterization, journal-mode safety, secret-key-in-value leak check; tests under `tests/test_memory.py`
+
+### Group E — Infrastructure (security lens)
+
+- [ ] T078 [P] [P2-SEC] Security-audit `bot/authorization.py`: every permission check reachable, no bypass via unset field, collaborative auth path; tests under `tests/test_authorization.py`
+- [ ] T079 [P] [P2-SEC] Security-audit `bot/_bootstrap.py` + `bot/process.py`: import-time side effects, subprocess lifecycle guarantees, zombie reaping; tests under `tests/test_bootstrap.py` and `tests/test_process.py`
+
+**Checkpoint P2-SEC**: all listed modules audited; every finding closed or explicitly deferred with rationale; test count increased by at least one per fix.
+
+---
+
+## Phase 10: Pass 2 — User Story P2-STB — Stability Under Failure Modes (Priority: P1)
+
+**Goal**: Every row in `crash-matrix.md` where `current-behavior-verified != target-behavior` becomes a `P2-NN` finding that is fixed and tested.
+
+**Independent Test**: a stability test harness (see T085) exercises each scenario; all pass.
+
+### Group A — Core modules (stability lens)
+
+- [ ] T080 [P2-STB] Stability-audit `bot/scheduler.py`: `time.monotonic()` for intervals, tmp+rename on `queue.json` writes, late-fire dedup on restart, retry amplification cap; fix findings, tests under `tests/test_scheduler.py`
+- [~] T081 [P2-STB] Stability-audit `bot/bot.py`: lock mechanism is POSIX `fcntl.flock`-style (not PID-file-check race), restart-storm survival; tests under `tests/test_bot.py` — **partial**: P2-20 (TOCTOU PID-lock, High) fixed out-of-band in the security point release; restart-storm survival and `data/*.tmp` cleanup on startup still to do
+- [ ] T082 [P2-STB] Stability-audit `bot/ai_invoke.py`: subprocess stall → kill → orphan-tracker cleanup path under parent-death scenario; tests under `tests/test_ai_invoke.py`
+- [ ] T083 [P2-STB] Stability-audit `bot/updater.py`: disk-full on snapshot, pip failure mid-install, interrupted smoke test rollback; tests under `tests/test_updater.py`
+
+### Group C — Agents & tasks (stability lens)
+
+- [ ] T084 [P] [P2-STB] Stability-audit `bot/continuous.py`: step boundary atomicity, resume-from-last-committed-step under SIGKILL; tests under `tests/test_continuous.py`
+- [ ] T085 [P] [P2-STB] Stability-audit `bot/agents.py` + `bot/task_runtime.py`: atomic `agents.json` write (tmp+rename+fsync), partial-load handling for malformed JSON (Pass 1 F17 deferred — fix now); tests under `tests/test_agents.py`
+- [ ] T086 [P] [P2-STB] Stability-audit `bot/scheduled_delivery.py`: silent-delivery policy verified per adapter; tests under `tests/test_scheduled_delivery.py`
+- [ ] T087 [P] [P2-STB] Stability-audit `bot/topics.py` + `bot/collaborative.py`: crash mid-topic-creation, partial workspace state recovery; tests under `tests/test_topics.py` and `tests/test_collaborative.py`
+
+### Group F — Migration framework (stability lens)
+
+- [ ] T088 [P] [P2-STB] Stability-audit `bot/migrations/runner.py` + `bot/migrations/tracker.py`: idempotency re-verify (apply twice = no-op), version-advance-only-after-fsync, interrupted-migration recovery; tests under `tests/test_migrations.py`
+- [ ] T089 [P] [P2-STB] Stability-audit `bot/migrations/base.py` + `bot/migrations/legacy.py`: legacy chain handoff, missing-migration detection; tests under `tests/test_migrations.py`
+- [ ] T090 [P] [P2-STB] Stability-audit latest 5 migration files (`v0_20_25` … `v0_21_0`): each idempotent, each has test covering re-run; tests under `tests/test_migration_v*.py`
+
+### Cross-cutting stability infrastructure
+
+- [ ] T091 [P2-STB] Add `tests/test_crash_matrix.py`: one pytest per scenario in `crash-matrix.md`, using `tmp_path` + signal handlers to simulate failures
+
+**Checkpoint P2-STB**: `crash-matrix.md` shows all rows green; `tests/test_crash_matrix.py` passes.
+
+---
+
+## Phase 11: Pass 2 — User Story P2-UX — Ease of Use (Priority: P2)
+
+**Goal**: First-time-user onboarding across all 3 platforms works without file editing, without stack traces, without guessing.
+
+**Independent Test**: manual onboarding walkthrough against `quickstart.md` §2 works on Telegram, Discord, Slack using a fresh `data/` dir; `/help` output covers every registered command.
+
+- [ ] T092 [P2-UX] Audit `bot/handlers.py` for every registered command: is it listed in `/help`? Does the error path produce an actionable message? Does a destructive command require confirmation? Fix gaps; tests under `tests/test_handlers.py`
+- [ ] T093 [P2-UX] Audit `bot/bot.py` startup: missing env vars produce actionable messages (not tracebacks); `.env.example` file is current and complete
+- [ ] T094 [P] [P2-UX] Audit `bot/ai_backend.py`: missing AI CLI binary surfaces as a readable user-visible message via `i18n`, not a Python traceback; tests under `tests/test_ai_backend.py`
+- [ ] T095 [P] [P2-UX] Audit `bot/config.py` + `bot/config_updates.py`: every failure path produces a user-visible error with remediation hint; tests under `tests/test_config.py`
+- [ ] T096 [P] [P2-UX] Audit `bot/collaborative.py`: workspace sharing errors tell the user how to fix (not just "invalid state"); tests under `tests/test_collaborative.py`
+- [ ] T097 [P2-UX] Cross-reference `/help` output against handler registrations: any registered command not in `/help` is a finding; any `/help` entry without a handler is a finding; tests under `tests/test_help.py`
+- [ ] T098 [P2-UX] Update `.env.example` / `install/` scripts if any required env var is missing from documentation
+
+**Checkpoint P2-UX**: onboarding walkthrough passes on all 3 adapters; `/help` parity verified; no stack trace reachable by any user action.
+
+---
+
+## Phase 12: Pass 2 — User Story P2-NI — Natural Interaction (Priority: P2)
+
+**Goal**: Every user-visible string passes the 8-question checklist in `contracts/conversation-contract.md` §8.
+
+**Independent Test**: `string-inventory.md` shows zero literals outside `bot/i18n.py` (excluding debug logs); every `i18n` key has IT + EN; automated test verifies locale parity.
+
+### String relocation & i18n parity
+
+- [ ] T099 [P2-NI] Process `string-inventory.md` top-down: for every literal, either relocate it to `bot/i18n.py` (adding IT + EN keys) or justify it as internal/log-only with a code comment; commit after each batch of 10
+- [ ] T100 [P] [P2-NI] Add `tests/test_i18n_parity.py`: assert every key under `STRINGS_IT` has a matching key under `STRINGS_EN` (and vice versa), asserting no locale has orphan keys
+- [ ] T101 [P] [P2-NI] Add `tests/test_i18n_substitution.py`: iterate every key, instantiate with representative arguments, assert no `{placeholder}` remains unsubstituted (closes residual risk from Pass 1 F19)
+
+### Tone audit per module
+
+- [ ] T102 [P2-NI] Tone-audit `bot/handlers.py` replies: no `Error:` / `Exception:` prefixes, every error has an actionable next step, voice is first-person plural or second-person (per contract §3.1); fix in-place by updating `i18n` keys
+- [ ] T103 [P] [P2-NI] Tone-audit `bot/messaging/telegram.py`, `discord.py`, `slack.py`: replies differ only due to platform capability, never wording; parity test under `tests/test_messaging_parity.py`
+- [ ] T104 [P] [P2-NI] Tone-audit `bot/voice.py` user-facing strings (transcription failure, key-missing, file-too-large)
+- [ ] T105 [P] [P2-NI] Tone-audit `bot/continuous.py` + `bot/scheduled_delivery.py`: silence-policy compliance (per contract §4) — no progress messages unless user requested them
+- [ ] T106 [P] [P2-NI] Tone-audit `bot/updater.py`: pre/post-update messages are conversational, not release-engineer-speak
+
+### Template hygiene
+
+- [ ] T107 [P2-NI] Sweep `templates/` directory: verify every prompt template substitutes all `{placeholders}`, intentional `{{literal}}` escapes carry a comment explaining why
+- [ ] T108 [P2-NI] Verify agent persona consistency: prompts in `templates/` do not contradict agent-configured persona strings
+
+**Checkpoint P2-NI**: every row in `string-inventory.md` resolved; `test_i18n_parity.py` and `test_i18n_substitution.py` pass; messaging-parity test passes.
+
+---
+
+## Phase 13: Polish & Cross-Cutting Close-out
+
+**Purpose**: Re-evaluate Pass 1 deferred findings, finalize documentation, version bump.
+
+- [ ] T109 Re-evaluate Pass 1 deferred finding F12 (`telegram.py` Markdown behavioral change): decide fix or keep deferred with updated rationale; record under `## Pass 2 Findings`
+- [ ] T110 [P] Re-evaluate Pass 1 F13 (`discord.py download_voice` error handling): fix or re-defer with rationale
+- [ ] T111 [P] Re-evaluate Pass 1 F14 (`slack.py` reply/edit_message error handling): fix or re-defer with rationale
+- [ ] T112 [P] Re-evaluate Pass 1 F17 (`collaborative.py` malformed JSON partial load): likely closed by T085 — confirm and mark
+- [ ] T113 [P] Re-evaluate Pass 1 F20 (`voice.py` `%` formatting TypeError): fix or re-defer with rationale
+- [ ] T114 [P] Re-evaluate Pass 1 performance finding P1 (`scheduler.py` redundant `queue.json` read)
+- [ ] T115 [P] Re-evaluate Pass 1 performance finding P2 (`scheduler.py` blocking sync I/O in async) — if stability work in T080 already moved to `asyncio.to_thread`, close here
+- [ ] T116 [P] Re-evaluate Pass 1 performance findings P3, P4, P5: fix or re-defer with updated rationale
+- [ ] T117 Run full `pytest tests/ -q` and confirm count ≥ 1086; diagnose any regression before proceeding
+- [ ] T118 Finalize `specs/002-full-code-review/findings.md`: every `P2-NN` row has status `fixed` or `deferred (rationale: ...)`; every Pass 1 deferred row has a Pass 2 status update
+- [ ] T119 Bump `VERSION` (patch bump unless a migration was introduced) and add a migration entry under `bot/migrations/` via `scripts/new_migration.py` only if a schema change was actually made
+- [ ] T120 Create `releases/vX.Y.Z.md` summarizing Pass 2: findings fixed count, deferred-with-rationale count, test-count delta, LOC delta
+- [ ] T121 Append Pass 2 section to `CHANGELOG.md`
+- [ ] T122 Run `quickstart.md` §8 close-out sequence end-to-end; do NOT push without explicit user request
+
+---
+
+## Dependencies & Execution Order (Pass 2)
+
+### Phase dependencies
+
+- **Phase 7 Setup (T059-T061)**: No dependencies — start immediately after Pass 2 kickoff.
+- **Phase 8 Foundational (T062-T064)**: Depends on Phase 7 — BLOCKS P2-SEC, P2-STB, P2-NI.
+- **Phase 9 P2-SEC**: Depends on Phase 8 (needs `trust-boundaries.md`).
+- **Phase 10 P2-STB**: Depends on Phase 8 (needs `crash-matrix.md`). Can run in parallel with Phase 9 (different modules and lenses, minimal file overlap).
+- **Phase 11 P2-UX**: Depends on Phase 9 completion for `bot/handlers.py` (T092) to avoid merge conflicts; other UX tasks can start after Phase 8.
+- **Phase 12 P2-NI**: Depends on Phase 8 (needs `string-inventory.md`). Can run in parallel with P2-SEC/STB for modules those phases don't touch.
+- **Phase 13 Polish**: Depends on all preceding Pass 2 phases.
+
+### Within-phase parallelism
+
+- Phase 9 Group B (T070-T073) fully parallel — one adapter per developer.
+- Phase 9 Group D (T074-T077) fully parallel.
+- Phase 10 Group C (T084-T087) fully parallel.
+- Phase 10 Group F (T088-T090) fully parallel.
+- Phase 11 independent handler + AI-backend tasks (T094-T096) parallel.
+- Phase 12 tone-audit tasks per module (T103-T106) fully parallel.
+- Phase 13 re-evaluations (T110-T116) fully parallel.
+
+---
+
+## Parallel Example: Phase 9 Group B
+
+```bash
+# Three developers audit the three adapters in parallel:
+Developer A → T070 telegram.py
+Developer B → T071 discord.py
+Developer C → T072 slack.py
+Developer D → T073 base.py
+```
+
+---
+
+## Implementation Strategy (Pass 2)
+
+### MVP First (P2-SEC only)
+
+1. Phase 7 Setup → baseline.
+2. Phase 8 Foundational → inventories.
+3. Phase 9 P2-SEC → security gaps closed. **STOP and VALIDATE**.
+4. Ship as a security-hardening point release if justified.
+
+### Incremental delivery
+
+1. Setup + Foundational → inventories published.
+2. P2-SEC → security hardened → optional point release.
+3. P2-STB → crash matrix green → optional point release.
+4. P2-UX + P2-NI → user-facing polish → release vX.Y+1.0 with Pass 2 summary.
+
+### Parallel team strategy
+
+- Phase 9 (SEC) and Phase 10 (STB) share Group A modules (handlers, scheduler, bot, ai_invoke, updater) — assign same developer to both lenses on the same module to avoid merge conflicts; parallelize across modules, not across lenses.
+- Phases 11 (UX) and 12 (NI) overlap heavily on `i18n.py` and `handlers.py` — single reviewer for both on the same file.
+
+---
+
+## Pass 2 Notes
+
+- `[P]` = different files, no dependencies.
+- Story labels are `P2-SEC`, `P2-STB`, `P2-UX`, `P2-NI` to distinguish from Pass 1's `US1`–`US4`.
+- Every fix ships with a regression test (FR-004 from spec still applies).
+- Commit per module or per logical group of findings; keep commits bisectable.
+- If a fix changes a user-visible string, both IT and EN `i18n` keys update in the same commit.
+- Multi-platform parity (Constitution Principle I) must hold for any adapter-touching commit.
+- Stop at any Pass 2 checkpoint to re-baseline and decide whether to ship.
