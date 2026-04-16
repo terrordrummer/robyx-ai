@@ -5,6 +5,21 @@ different upload size limits (Telegram 10 MB for photos, Discord 8 MB free
 tier, etc.) and agents must not be burdened with computing byte sizes. The
 platform adapter passes its ``max_photo_bytes`` and this module returns a
 path to a file that is guaranteed to fit, re-encoding as JPEG if needed.
+
+Decompression-bomb defence (Pass 2 T075):
+
+* ``_MAX_IMAGE_FILE_BYTES`` rejects pathologically large *file* sizes
+  before Pillow ever touches the decoder — a 10 GB crafted PNG never
+  reaches ``Image.open``.
+* ``Image.MAX_IMAGE_PIXELS`` is lowered from Pillow's default (89 MP)
+  to 50 MP — generous enough for any consumer camera, tight enough to
+  short-circuit the "tiny compressed file, enormous decoded pixmap"
+  attack class.
+* The ``Image.open`` / ``img.load`` block is wrapped in
+  ``warnings.catch_warnings()`` and promotes ``DecompressionBombWarning``
+  to an error so a crafted image in the ``(MAX_IMAGE_PIXELS, 2 *
+  MAX_IMAGE_PIXELS)`` range raises instead of quietly allocating the
+  memory.
 """
 
 from __future__ import annotations
@@ -12,6 +27,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import warnings
 from pathlib import Path
 
 from PIL import Image
@@ -22,6 +38,16 @@ log = logging.getLogger("robyx.media")
 _QUALITY_STEPS = (90, 80, 70, 60, 50, 40)
 # Downscale factors applied when even q=40 is too big.
 _DOWNSCALE_STEPS = (1.0, 0.75, 0.5, 0.35, 0.25)
+
+# Decompression-bomb caps (Pass 2 T075).
+_MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024  # 25 MB on-disk ceiling.
+_MAX_IMAGE_PIXELS = 50 * 1000 * 1000       # 50 MP decoded ceiling.
+
+# Lower Pillow's global pixel threshold. Anything above 2 × this value
+# raises ``Image.DecompressionBombError`` automatically; anything in
+# (_MAX_IMAGE_PIXELS, 2 × _MAX_IMAGE_PIXELS) raises
+# ``DecompressionBombWarning``, which our caller promotes to error.
+Image.MAX_IMAGE_PIXELS = _MAX_IMAGE_PIXELS
 
 
 class MediaError(Exception):
@@ -55,6 +81,16 @@ def prepare_image_for_upload(path: str, max_bytes: int) -> str:
         raise MediaError("Not a regular file: %s" % path)
 
     src_size = src.stat().st_size
+
+    # Reject files above the bomb-defence cap before opening anything.
+    # This catches crafted inputs whose on-disk size alone would exhaust
+    # memory or disk when decoded.
+    if src_size > _MAX_IMAGE_FILE_BYTES:
+        raise MediaError(
+            "Image file %s is %.1f MB — exceeds %d MB safety cap"
+            % (path, src_size / 1e6, _MAX_IMAGE_FILE_BYTES // (1024 * 1024))
+        )
+
     if src_size <= max_bytes:
         log.info(
             "Image fits (%.2f MB ≤ %.2f MB), no compression needed: %s",
@@ -68,9 +104,16 @@ def prepare_image_for_upload(path: str, max_bytes: int) -> str:
     )
 
     try:
-        img = Image.open(src)
-        img.load()
-    except (OSError, SyntaxError) as e:
+        with warnings.catch_warnings():
+            # Promote "this image is suspiciously large" warning into an
+            # exception; a legitimate camera photo is well under the
+            # threshold, so the only things we reject here are crafted
+            # decompression bombs.
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            img = Image.open(src)
+            img.load()
+    except (OSError, SyntaxError, Image.DecompressionBombWarning,
+            Image.DecompressionBombError) as e:
         raise MediaError("Cannot open image %s: %s" % (path, e)) from e
 
     # JPEG cannot encode RGBA / paletted / etc.

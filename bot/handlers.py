@@ -210,7 +210,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
     @owner_only
     async def cmd_reset(platform, msg, msg_ref):
         if not msg.args:
-            await platform.reply(msg_ref, "Usage: /reset <name>")
+            await platform.reply(msg_ref, STRINGS["reset_usage"])
             return
         name = msg.args[0].lower()
         agent = manager.get(name)
@@ -303,7 +303,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
     @owner_only
     async def cmd_doupdate(platform, msg, msg_ref):
-        sent_ref = await platform.reply(msg_ref, "Checking for pending update...")
+        sent_ref = await platform.reply(msg_ref, STRINGS["update_checking_manual"])
 
         # Check for busy agents
         busy_agents = [a for a in manager.list_active() if a.busy]
@@ -1347,7 +1347,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         from collaborative import Role
         users = collab_ws.list_users()
         if not users:
-            await platform.reply(msg_ref, "No users registered in this workspace.")
+            await platform.reply(msg_ref, STRINGS["collab_no_users"])
             return True
         lines = [STRINGS["collab_roles_title"]]
         role_order = {Role.OWNER: 0, Role.OPERATOR: 1, Role.PARTICIPANT: 2}

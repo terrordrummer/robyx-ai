@@ -275,7 +275,7 @@
 ### Group D — Config & support (security lens)
 
 - [X] T074 [P] [P2-SEC] Security-audit `bot/config.py` + `bot/config_updates.py`: env parse safety, secret-write atomicity, concurrent `.env` write race, hot-reload-during-AI-call guard; tests under `tests/test_config.py` — closed as no-action: there is no `.env` hot-reload mechanism in the codebase (the bot reads `.env` once via `load_dotenv()` at startup and i18n tells users to restart after edits); trust-boundary X-3 was mis-identified
-- [ ] T075 [P] [P2-SEC] Security-audit `bot/media.py`: Pillow decompression-bomb protection (max pixels, max bytes), path validation for temp writes; tests under `tests/test_media.py`
+- [X] T075 [P] [P2-SEC] Security-audit `bot/media.py`: Pillow decompression-bomb protection (max pixels, max bytes), path validation for temp writes; tests under `tests/test_media.py` — closed P2-50 (file-size cap + lowered MAX_IMAGE_PIXELS + warning→error promotion, +4 regression tests)
 - [ ] T076 [P] [P2-SEC] Security-audit `bot/voice.py`: OpenAI API key never logged, temp-file cleanup on exception, file-size cap; tests under `tests/test_voice.py`
 - [ ] T077 [P] [P2-SEC] Security-audit `bot/memory.py` + `bot/memory_store.py`: SQLite parameterization, journal-mode safety, secret-key-in-value leak check; tests under `tests/test_memory.py`
 
@@ -333,7 +333,7 @@
 - [ ] T094 [P] [P2-UX] Audit `bot/ai_backend.py`: missing AI CLI binary surfaces as a readable user-visible message via `i18n`, not a Python traceback; tests under `tests/test_ai_backend.py`
 - [ ] T095 [P] [P2-UX] Audit `bot/config.py` + `bot/config_updates.py`: every failure path produces a user-visible error with remediation hint; tests under `tests/test_config.py`
 - [ ] T096 [P] [P2-UX] Audit `bot/collaborative.py`: workspace sharing errors tell the user how to fix (not just "invalid state"); tests under `tests/test_collaborative.py`
-- [ ] T097 [P2-UX] Cross-reference `/help` output against handler registrations: any registered command not in `/help` is a finding; any `/help` entry without a handler is a finding; tests under `tests/test_help.py`
+- [X] T097 [P2-UX] Cross-reference `/help` output against handler registrations: any registered command not in `/help` is a finding; any `/help` entry without a handler is a finding; tests under `tests/test_help.py` — closed via `TestHelpParity` in `tests/test_i18n_parity.py` (two tests: handler.keys ⊆ help_text commands, and help_text commands ⊆ handler.keys, modulo the `start`/`help`/internal-dispatch exclusions)
 - [ ] T098 [P2-UX] Update `.env.example` / `install/` scripts if any required env var is missing from documentation
 
 **Checkpoint P2-UX**: onboarding walkthrough passes on all 3 adapters; `/help` parity verified; no stack trace reachable by any user action.
@@ -348,9 +348,9 @@
 
 ### String relocation & i18n parity
 
-- [ ] T099 [P2-NI] Process `string-inventory.md` top-down: for every literal, either relocate it to `bot/i18n.py` (adding IT + EN keys) or justify it as internal/log-only with a code comment; commit after each batch of 10
-- [ ] T100 [P] [P2-NI] Add `tests/test_i18n_parity.py`: assert every key under `STRINGS_IT` has a matching key under `STRINGS_EN` (and vice versa), asserting no locale has orphan keys
-- [ ] T101 [P] [P2-NI] Add `tests/test_i18n_substitution.py`: iterate every key, instantiate with representative arguments, assert no `{placeholder}` remains unsubstituted (closes residual risk from Pass 1 F19)
+- [X] T099 [P2-NI] Process `string-inventory.md` top-down: for every literal, either relocate it to `bot/i18n.py` (adding IT + EN keys) or justify it as internal/log-only with a code comment; commit after each batch of 10 — closed P2-01/02/03 (all 3 direct-literal violations in handlers.py moved to `STRINGS`); §B `raise` prose verified as internal-only and not echoed to users; §D templates still pending (T107)
+- [~] T100 [P] [P2-NI] Add `tests/test_i18n_parity.py`: assert every key under `STRINGS_IT` has a matching key under `STRINGS_EN` (and vice versa), asserting no locale has orphan keys — re-scoped: bot is single-locale (English); wrote `TestHelpParity` in the same file for the parity dimension that's actually meaningful today. Locale-parity test becomes relevant only if a second locale is added.
+- [X] T101 [P] [P2-NI] Add `tests/test_i18n_substitution.py`: iterate every key, instantiate with representative arguments, assert no `{placeholder}` remains unsubstituted (closes residual risk from Pass 1 F19) — implemented as `TestStringSubstitution` in `tests/test_i18n_parity.py` (two parametrised tests across every `STRINGS` key — %s/%d substitution check + `{placeholder}` leak check)
 
 ### Tone audit per module
 
