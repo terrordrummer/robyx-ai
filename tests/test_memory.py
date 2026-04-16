@@ -357,7 +357,7 @@ class TestGetMemoryInstructions:
     def test_contains_rules(self, tmp_path):
         with patch.object(memory, "DATA_DIR", tmp_path / "data"):
             result = get_memory_instructions("robyx", "orchestrator", str(tmp_path))
-        assert "active.md" in result
+        assert "active memory" in result.lower()
         assert "5000 words" in result
         assert "archive" in result.lower()
 
@@ -378,4 +378,4 @@ class TestGetMemoryInstructions:
         (tmp_path / "CLAUDE.md").write_text("# Doesn't matter")
         with patch.object(memory, "DATA_DIR", tmp_path / "data"):
             result = get_memory_instructions("reviewer", "specialist", str(tmp_path))
-        assert "active.md" in result
+        assert "active memory" in result.lower()
