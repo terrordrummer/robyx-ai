@@ -194,6 +194,8 @@ Once the program is agreed upon, emit:
 - `name` is a unique slug (also used as directory name and git branch suffix).
 - `work_dir` is normally **your own** workspace path — the continuous task
   operates on the same project you manage.
+- Use ASCII straight quotes (`"`) around attribute values. Curly/typographic
+  quotes are tolerated but plain ASCII is preferred and makes logs readable.
 
 The system will:
 - create a dedicated topic prefixed with `🔄`;

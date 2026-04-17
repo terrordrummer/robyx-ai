@@ -10,6 +10,7 @@ from typing import Any
 
 from ai_backend import AIBackend
 from ai_invoke import SILENT_PATTERN, split_message
+from continuous_macro import strip_continuous_macros_for_log
 
 STATUS_PATTERN = re.compile(r"\[STATUS\s+(.+?)\]")
 
@@ -34,7 +35,12 @@ def _coerce_target_id(raw_target: Any) -> Any:
 
 
 def _clean_result_text(text: str) -> str:
-    clean = STATUS_PATTERN.sub("", text or "").strip()
+    # Scrub any stray continuous-task macro tokens. Scheduled subprocess
+    # output has no interactive agent context, so we MUST NOT dispatch a
+    # new continuous task from here — but we MUST still strip the tokens
+    # so a leaked macro cannot reach the chat (feature 004, FR-001/FR-011).
+    clean, _ = strip_continuous_macros_for_log(text or "")
+    clean = STATUS_PATTERN.sub("", clean).strip()
     clean = re.sub(r"\n{3,}", "\n\n", clean)
     return clean.strip()
 

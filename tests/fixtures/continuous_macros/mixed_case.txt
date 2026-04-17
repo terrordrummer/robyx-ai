@@ -1,0 +1,8 @@
+[Create_Continuous name="mixed-case" work_dir="/tmp/robyx-test-workspace/mc"]
+[continuous_program]
+{
+  "objective": "Case-insensitive tag tokens.",
+  "success_criteria": ["still intercepted"],
+  "first_step": {"number": 1, "description": "start"}
+}
+[/Continuous_Program]

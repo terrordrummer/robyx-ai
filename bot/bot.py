@@ -344,6 +344,12 @@ def main():
     from collaborative import CollabStore
     collab_store = CollabStore()
 
+    # Expose the store to the orchestrator system-prompt builder so the
+    # live [AVAILABLE_EXTERNAL_GROUPS] section is rendered every turn
+    # (feature 003-external-group-wiring, R-04).
+    from ai_invoke import register_collab_store
+    register_collab_store(collab_store)
+
     # Build handlers
     h = make_handlers(manager, backend, collab_store=collab_store)
 
@@ -456,7 +462,7 @@ def _run_telegram(plat, h, backend, manager):
     # Register text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _wrap_message(h["message"])))
 
-    # Collaborative workspaces: detect when the bot is added to a new group.
+    # Collaborative workspaces: dispatch on bot added / removed / migrated.
     if "collab_bot_added" in h:
         async def _on_my_chat_member(update, context):
             member_update = update.my_chat_member
@@ -466,12 +472,47 @@ def _run_telegram(plat, h, backend, manager):
             old_status = member_update.old_chat_member.status
             chat = member_update.chat
             added_by = member_update.from_user
+            old_chat_id = getattr(member_update, "migrate_from_chat_id", None) or None
+            new_chat_id = getattr(member_update, "migrate_to_chat_id", None) or None
+
+            # Supergroup migration: old chat becomes unusable, new chat_id
+            # replaces it. Telegram sets ``migrate_to_chat_id`` on the
+            # old-chat update and ``migrate_from_chat_id`` on the new-chat
+            # update; either half triggers the rebind.
+            if new_chat_id and "collab_bot_migrated" in h:
+                log.info(
+                    "Bot chat migrated: %s → %s title=%r",
+                    chat.id, new_chat_id, chat.title,
+                )
+                await h["collab_bot_migrated"](plat, chat.id, new_chat_id)
+                return
+            if old_chat_id and "collab_bot_migrated" in h:
+                log.info(
+                    "Bot chat migrated: %s ← %s title=%r",
+                    chat.id, old_chat_id, chat.title,
+                )
+                await h["collab_bot_migrated"](plat, old_chat_id, chat.id)
+                return
+
             if new_status in ("member", "administrator") and old_status in ("left", "kicked"):
                 log.info(
                     "Bot added to group: chat_id=%s title=%r by user=%s",
                     chat.id, chat.title, added_by.id if added_by else "unknown",
                 )
                 await h["collab_bot_added"](plat, chat, added_by)
+                return
+
+            if (
+                new_status in ("left", "kicked")
+                and old_status in ("member", "administrator")
+                and "collab_bot_removed" in h
+            ):
+                log.info(
+                    "Bot removed from group: chat_id=%s title=%r",
+                    chat.id, chat.title,
+                )
+                await h["collab_bot_removed"](plat, chat)
+                return
 
         app.add_handler(ChatMemberHandler(_on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
 
@@ -665,6 +706,32 @@ def _run_slack(plat, h, backend, manager):
         )
         await h["message"](plat, msg, msg_ref)
 
+    # External collaborative groups are Telegram-only for now (FR-013).
+    # When the Slack bot is added to a channel, post a single notice so
+    # the add isn't a silent no-op.
+    @app.event("member_joined_channel")
+    async def _on_member_joined_channel(event, client):
+        from i18n import STRINGS
+        try:
+            auth = await client.auth_test()
+            bot_user_id = auth.get("user_id")
+        except Exception as e:
+            log.warning("Slack auth_test failed in member_joined_channel: %s", e)
+            return
+        if event.get("user") != bot_user_id:
+            return
+        channel = event.get("channel", "")
+        log.info(
+            "collab.unsupported_platform platform=slack channel=%s", channel,
+        )
+        try:
+            await client.chat_postMessage(
+                channel=channel,
+                text=STRINGS["collab_unsupported_platform_slack"],
+            )
+        except Exception as e:
+            log.warning("Failed to post Slack unsupported-platform notice: %s", e)
+
     async def _run():
         control_room = plat.control_room_channel
         await _run_boot_sequence(plat, manager, control_room)
@@ -704,6 +771,30 @@ def _run_discord(plat, h, backend, manager):
         # Start background loops
         client.loop.create_task(_background_scheduler_loop(plat, backend, control_room))
         client.loop.create_task(_background_update_loop(plat, control_room, manager))
+
+    # External collaborative groups are Telegram-only for now (FR-013).
+    # When the bot is added to a new Discord guild, post a single message
+    # explaining the limitation so the add isn't a silent no-op.
+    @client.event
+    async def on_guild_join(guild):
+        from i18n import STRINGS
+        log.info(
+            "collab.unsupported_platform platform=discord guild=%s name=%r",
+            guild.id, getattr(guild, "name", None),
+        )
+        try:
+            target = None
+            if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
+                target = guild.system_channel
+            else:
+                for ch in guild.text_channels:
+                    if ch.permissions_for(guild.me).send_messages:
+                        target = ch
+                        break
+            if target is not None:
+                await target.send(STRINGS["collab_unsupported_platform_discord"])
+        except Exception as e:
+            log.warning("Failed to send Discord unsupported-platform notice: %s", e)
 
     @client.event
     async def on_message(message):

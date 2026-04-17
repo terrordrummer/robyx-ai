@@ -252,6 +252,21 @@ class TelegramPlatform(Platform):
             log.error("Error generating invite link for chat %d: %s", chat_id, e)
             return None
 
+    async def leave_chat(self, chat_id: int) -> None:
+        """Leave a Telegram chat/group. Used by the unauthorised-adder
+        guard for external collaborative groups.
+
+        Uses the PTB ``Bot.leave_chat`` API; raises on transport failure
+        so the caller can log and still post the HQ notification. The
+        caller is responsible for sending any user-facing "leaving" copy
+        BEFORE calling this, since once we leave we can no longer post
+        in the chat.
+        """
+        if self._bot is None:
+            raise RuntimeError("Telegram bot not set; cannot leave_chat")
+        await self._bot.leave_chat(chat_id=chat_id)
+        log.info("Left Telegram chat %d", chat_id)
+
     async def rename_main_channel(self, display_name: str, slug: str) -> bool:
         """Rename the General topic of the forum supergroup.
 

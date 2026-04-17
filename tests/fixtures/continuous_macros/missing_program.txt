@@ -1,0 +1,3 @@
+Here's the plan. I'll kick off the continuous task now.
+
+[CREATE_CONTINUOUS name="orphan-opener" work_dir="/tmp/robyx-test-workspace/x"]

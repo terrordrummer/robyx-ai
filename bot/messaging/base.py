@@ -183,6 +183,19 @@ class Platform(abc.ABC):
         """
         return None
 
+    async def leave_chat(self, chat_id: Any) -> None:
+        """Leave a chat/group. Used by the unauthorised-adder guard for
+        external collaborative groups.
+
+        Default: not supported — adapters that cannot implement this
+        MUST override and raise ``NotImplementedError``. Telegram
+        implements it via the bot API; Discord/Slack raise for now
+        (external groups are Telegram-only in this iteration).
+        """
+        raise NotImplementedError(
+            "leave_chat is not supported on this platform",
+        )
+
     @abc.abstractmethod
     async def rename_main_channel(self, display_name: str, slug: str) -> bool:
         """Rename the platform's main destination (where Robyx lives).

@@ -71,3 +71,6 @@ continuous task:
 
 The system will create a dedicated workspace topic, a git branch, and start
 the first step automatically.
+
+Use ASCII straight quotes (`"`) around attribute values. Curly/typographic
+quotes are tolerated but plain ASCII is preferred.

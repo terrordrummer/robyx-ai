@@ -1,0 +1,8 @@
+[CREATE_CONTINUOUS name="escape" work_dir="/etc/passwd"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Try to escape the workspace root.",
+  "success_criteria": ["must be rejected"],
+  "first_step": {"number": 1, "description": "n/a"}
+}
+[/CONTINUOUS_PROGRAM]

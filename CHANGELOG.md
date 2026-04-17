@@ -1,5 +1,107 @@
 # Changelog
 
+## 0.22.1
+
+Feature `004-fix-continuous-task-macro` — close the continuous-task macro
+leak that exposed raw `[CREATE_CONTINUOUS ...] / [CONTINUOUS_PROGRAM]`
+tokens and program JSON to users when the emission was non-golden or came
+from a workspace agent instead of the orchestrator.
+
+### Fixed
+- **Routing gap** — the macro used to be intercepted only on the `is_robyx`
+  branch of `_process_and_send`. Workspace agents that followed the
+  documented prompt (`prompt_workspace_agent.md`) leaked verbatim. Now
+  interception runs before the `is_robyx`/workspace-agent split and covers
+  every executive emission uniformly.
+- **Conjunction-gated stripping** — the old code only scrubbed both tags
+  when both were present. A single missing, misnamed, or malformed tag
+  disabled stripping of the other. The new `bot/continuous_macro.py`
+  scrubs every detected token independently so the failure mode is "not
+  executed", never "leaked".
+- **Typographic variants** — the detector now tolerates curly/typographic
+  quotes around attribute values, case-insensitive tag tokens, multi-line
+  attribute whitespace, and triple-backtick code fences that wrap the
+  macro.
+- **Payload-only leaks** — an unclosed `[CONTINUOUS_PROGRAM]` now strips to
+  end-of-text so the JSON can never reach the chat.
+- **Scheduled-delivery defense-in-depth** — `bot/scheduled_delivery.py`
+  scrubs stray macro tokens from parsed subprocess output before delivery
+  (dispatch is NOT attempted from that path; scrub only).
+- **Prose error substitution** — every rejection path (missing program,
+  missing opener, bad JSON, missing required field, path escape, name
+  collision, permission denied, downstream error) renders a short
+  i18n-localized prose line. No raw tokens or JSON leak, ever.
+
+### Added
+- `bot/continuous_macro.py` — `extract_continuous_macros`,
+  `apply_continuous_macros`, `strip_continuous_macros_for_log`, plus the
+  supporting `ContinuousMacroTokens`, `ContinuousMacroOutcome`,
+  `ApplyContext` dataclasses and `RejectReason` enum.
+- Eight new i18n keys (`continuous_task_created`,
+  `continuous_task_error_{malformed,bad_json,missing_field,path_denied,name_taken,permission_denied,downstream}`)
+  replacing the previously-inlined English strings in `handlers.py`.
+- `tests/test_continuous_macro.py` (53 tests, fixture-driven), plus
+  handler integration coverage (`TestContinuousMacroInterception`) and a
+  scheduled-delivery regression test (`TestContinuousMacroScrubbing`).
+- 13 regression fixtures under `tests/fixtures/continuous_macros/`
+  covering golden, malformed, and realistic-variation cases.
+
+### Changed
+- Tolerant regex on `CREATE_CONTINUOUS_PATTERN` and
+  `CONTINUOUS_PROGRAM_PATTERN` in `bot/ai_invoke.py` — behaviour is a
+  superset of the pre-fix patterns (every previously accepted macro is
+  still accepted).
+- Prompt templates (`prompt_workspace_agent.md`, `prompt_focused_agent.md`,
+  `prompt_collaborative_agent.md`, `CONTINUOUS_SETUP.md`) add an
+  ASCII-quote preference note and an explicit non-emission prohibition
+  for collaborative agents.
+
+### Migration
+None. The `data/continuous/<name>/state.json` schema is unchanged; the fix
+is behaviour-compatible with pre-fix state files.
+
+## 0.22.0
+
+Feature `003-external-group-wiring` — end-to-end two-way wiring between
+the HQ orchestrator and external collaborative Telegram groups.
+
+### Added
+- **`[COLLAB_ANNOUNCE]` / `[COLLAB_SETUP_COMPLETE]` / `[COLLAB_SEND]` /
+  `[NOTIFY_HQ]`** — orchestrator + collab-agent control commands. See
+  `specs/003-external-group-wiring/contracts/` for grammars.
+- **Flow B replaced** — the "bot added to brand-new group" path now
+  performs a real AI bootstrap turn instead of the hardcoded "how
+  would you like to set up this workspace?" template. When the setup
+  agent emits `[COLLAB_SETUP_COMPLETE]`, the handler rewrites the
+  agent brief, promotes the workspace `setup → active`, and notifies
+  HQ with the captured purpose.
+- **Live registry in the orchestrator prompt** —
+  `[AVAILABLE_EXTERNAL_GROUPS]` is rendered every turn from
+  `CollabStore.list_for_orchestrator()`, so HQ sees what currently
+  exists without a separate sync step.
+- **Lifecycle events** — bot-removed and supergroup-migrated are now
+  handled: removal closes the workspace and drops it from the
+  registry; migration rebinds `chat_id` without losing history.
+- **Unauthorised-adder guard** (FR-011) — if the bot is added by
+  someone who is neither the owner nor an operator/owner in an
+  existing workspace, the bot sends a refusal, leaves the chat, and
+  notifies HQ. No `CollabWorkspace` is persisted.
+- **Discord/Slack FR-013 stubs** — `on_guild_join` /
+  `member_joined_channel` post a single "not yet supported on this
+  platform" notice and do not register a workspace. Telegram-only
+  scope is a justified Principle I violation; see
+  `specs/003-external-group-wiring/plan.md` Complexity Tracking.
+- **`CollabStore` helpers** — `create_pending`, `finalize_setup`,
+  `migrate_chat_id`, `list_for_orchestrator`. No schema change.
+- **`Platform.leave_chat`** abstract method. Telegram implements;
+  Discord/Slack raise `NotImplementedError`.
+- **Authorization helper** — `authorization.is_authorised_adder()`.
+- **Tests** — `tests/test_collab_setup_complete.py`,
+  `tests/test_collab_orchestrator.py`, `tests/test_collab_lifecycle.py`,
+  `tests/test_collab_multiplatform.py`; extensions to
+  `tests/test_collab_announce_command.py`,
+  `tests/test_collaborative.py`, `tests/test_i18n_parity.py`.
+
 ## 0.21.3
 
 Third Pass 2 slice. One Medium-severity security fix, three Low-severity

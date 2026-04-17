@@ -79,3 +79,31 @@ def can_close_workspace(
 def can_manage_roles(role: Role | None) -> bool:
     """Return True if the user can promote/demote others."""
     return role == Role.OWNER
+
+
+def is_authorised_adder(
+    user_id: int | None,
+    collab_store: CollabStore,
+    *,
+    owner_id: int | None,
+) -> bool:
+    """Return True if ``user_id`` may provision an external collaborative group.
+
+    Used by ``collab_bot_added`` to gate the "bot added to a new Telegram
+    group" event. An adder is authorised when they are the bot's global
+    owner OR when they already hold an OWNER/OPERATOR role in any
+    existing collaborative workspace. Everyone else is refused — the
+    handler responds in the group, leaves it, and notifies HQ.
+
+    Fails closed: ``user_id is None`` or ``owner_id is None`` with no
+    existing ops role → False.
+    """
+    if user_id is None:
+        return False
+    if owner_id is not None and user_id == owner_id:
+        return True
+    for ws in collab_store.list_all():
+        role = ws.get_role(user_id)
+        if role in (Role.OWNER, Role.OPERATOR):
+            return True
+    return False

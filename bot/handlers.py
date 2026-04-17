@@ -12,6 +12,10 @@ from pathlib import Path
 from agents import AgentManager, format_age
 from ai_backend import AIBackend
 from ai_invoke import (
+    COLLAB_ANNOUNCE_PATTERN,
+    COLLAB_BOOTSTRAP_PROMPT,
+    COLLAB_SEND_PATTERN,
+    COLLAB_SETUP_COMPLETE_PATTERN,
     CREATE_WORKSPACE_PATTERN,
     AGENT_INSTRUCTIONS_PATTERN,
     CLOSE_WORKSPACE_PATTERN,
@@ -20,6 +24,7 @@ from ai_invoke import (
     CREATE_SPECIALIST_PATTERN,
     FOCUS_OFF_PATTERN,
     FOCUS_PATTERN,
+    NOTIFY_HQ_PATTERN,
     REMIND_PATTERN,
     RESTART_PATTERN,
     SEND_IMAGE_PATTERN,
@@ -30,10 +35,12 @@ from ai_invoke import (
     handle_focus_commands,
     handle_specialist_requests,
     invoke_ai,
+    parse_collab_attrs,
     parse_remind_attrs,
     parse_remind_when,
     split_message,
 )
+from continuous_macro import ApplyContext, apply_continuous_macros
 
 
 _EXECUTIVE_MARKERS = (
@@ -49,6 +56,10 @@ _EXECUTIVE_MARKERS = (
     ("SPECIALIST_INSTRUCTIONS", SPECIALIST_INSTRUCTIONS_PATTERN),
     ("SEND_IMAGE", SEND_IMAGE_PATTERN),
     ("REMIND", REMIND_PATTERN),
+    ("COLLAB_ANNOUNCE", COLLAB_ANNOUNCE_PATTERN),
+    ("COLLAB_SEND", COLLAB_SEND_PATTERN),
+    ("COLLAB_SETUP_COMPLETE", COLLAB_SETUP_COMPLETE_PATTERN),
+    ("NOTIFY_HQ", NOTIFY_HQ_PATTERN),
 )
 
 
@@ -434,12 +445,48 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 needs_restart = bool(RESTART_PATTERN.search(response))
                 response = RESTART_PATTERN.sub("", response).strip()
 
+                # Intercept continuous-task macros uniformly for every
+                # executive-authorised agent (orchestrator, workspace agent,
+                # collaborative-executive). Runs on the FULL assembled
+                # response so streaming chunks cannot cause a leak, and
+                # before any other marker handler so the continuous side
+                # effects always see the un-mutated macro. See spec 004.
+                response, _ = await apply_continuous_macros(
+                    response,
+                    ApplyContext(
+                        agent=agent,
+                        thread_id=thread_id,
+                        chat_id=chat_id,
+                        platform=platform,
+                        manager=manager,
+                        is_executive=True,
+                    ),
+                )
+
                 if is_robyx:
                     response = await handle_delegations(
                         response, chat_id, platform, manager, backend, thread_id=thread_id,
                     )
                     response = await _handle_workspace_commands(response, chat_id, platform, thread_id)
+                    response = await _handle_collab_announce(response, chat_id, platform, thread_id)
+                    response = await _handle_collab_send(response, chat_id, platform)
                 else:
+                    collab_ws_for_agent = (
+                        collab_store.get(agent.collab_workspace_id)
+                        if collab_store is not None and agent.collab_workspace_id
+                        else None
+                    )
+                    if collab_ws_for_agent is not None:
+                        # NOTIFY_HQ must run BEFORE _strip_executive_markers
+                        # (which wouldn't run for executive turns anyway);
+                        # the non-executive branch above already strips it
+                        # via _EXECUTIVE_MARKERS.
+                        response = await _handle_notify_hq(
+                            response, collab_ws_for_agent, platform,
+                        )
+                        response = await _handle_collab_setup_complete(
+                            response, collab_ws_for_agent, platform,
+                        )
                     response = await handle_specialist_requests(
                         response, chat_id, platform, manager, backend, agent, thread_id=thread_id,
                     )
@@ -492,6 +539,378 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 await typing_task
             except asyncio.CancelledError:
                 pass
+
+    async def _handle_collab_announce(response, chat_id, platform, thread_id):
+        """Parse ``[COLLAB_ANNOUNCE ...]`` markers emitted by the orchestrator.
+
+        Creates a pending ``CollabWorkspace`` per the
+        ``specs/003-external-group-wiring/contracts/collab-announce.md``
+        contract. Replaces each marker with an ok/error/rejected trailer
+        so the user sees a confirmation in HQ. Assumes the outer
+        invariants already hold (orchestrator only runs from HQ for the
+        owner — enforced at ``handle_message`` and ``_route_and_process``).
+        """
+        matches = list(COLLAB_ANNOUNCE_PATTERN.finditer(response))
+        if not matches:
+            return response
+
+        if collab_store is None:
+            # Defensive — should never happen in production wiring.
+            log.warning("[COLLAB_ANNOUNCE] ignored: collab_store not configured")
+            return COLLAB_ANNOUNCE_PATTERN.sub("", response).strip()
+
+        # Defense-in-depth: refuse when not invoked from the HQ main thread.
+        if not platform.is_main_thread(chat_id, thread_id):
+            log.warning(
+                "[COLLAB_ANNOUNCE] rejected: not HQ main thread "
+                "(chat_id=%s thread_id=%s)", chat_id, thread_id,
+            )
+            return COLLAB_ANNOUNCE_PATTERN.sub(
+                STRINGS["collab_announce_rejected"] % "not authorised",
+                response,
+            ).strip()
+
+        from config import OWNER_ID, AGENTS_DIR
+        if OWNER_ID is None:
+            log.warning("[COLLAB_ANNOUNCE] rejected: OWNER_ID unconfigured")
+            return COLLAB_ANNOUNCE_PATTERN.sub(
+                STRINGS["collab_announce_rejected"] % "owner unconfigured",
+                response,
+            ).strip()
+
+        out = response
+        for match in matches:
+            attrs = parse_collab_attrs(match.group(1))
+            name = attrs.get("name", "").strip()
+            display = attrs.get("display", "").strip() or name
+            purpose = attrs.get("purpose", "").strip()
+            inherit = attrs.get("inherit", "").strip()
+            inherit_memory_raw = attrs.get("inherit_memory", "true").strip().lower()
+            inherit_memory = inherit_memory_raw != "false"
+
+            if not name or not purpose:
+                log.warning(
+                    "[COLLAB_ANNOUNCE] malformed: missing name or purpose (attrs=%s)",
+                    attrs,
+                )
+                out = out.replace(
+                    match.group(0),
+                    STRINGS["collab_announce_error"] % "missing required attribute",
+                    1,
+                )
+                continue
+
+            # Write the seed agent file BEFORE persisting the workspace
+            # (same ordering rule as Flow B at handlers.py:1468-1506 —
+            # if the agent file write fails we roll back cleanly).
+            AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            agent_file = AGENTS_DIR / ("%s.md" % name)
+            inherit_line = inherit if inherit else "none"
+            agent_file_content = (
+                "# %s\n\n"
+                "%s\n\n"
+                "(Inherits from: %s; memory inherit: %s)\n"
+            ) % (display, purpose, inherit_line, str(inherit_memory).lower())
+            try:
+                agent_file.write_text(agent_file_content)
+            except OSError as e:
+                log.error(
+                    "[COLLAB_ANNOUNCE] failed to write agent file for %s: %s",
+                    name, e,
+                )
+                out = out.replace(
+                    match.group(0),
+                    STRINGS["collab_announce_error"] % ("agent file write: %s" % e),
+                    1,
+                )
+                continue
+
+            try:
+                collab_store.create_pending(
+                    name=name,
+                    display_name=display,
+                    agent_name=name,
+                    parent_workspace=inherit or None,
+                    inherit_memory=inherit_memory,
+                    creator_id=OWNER_ID,
+                )
+            except ValueError as e:
+                # Roll back the agent file so the next announce can
+                # reuse the name if the user fixes the collision.
+                try:
+                    agent_file.unlink()
+                except OSError:
+                    pass
+                log.warning("[COLLAB_ANNOUNCE] create_pending rejected: %s", e)
+                out = out.replace(
+                    match.group(0),
+                    STRINGS["collab_announce_error"] % str(e),
+                    1,
+                )
+                continue
+
+            log.info(
+                "collab.announce name=%s creator_id=%s purpose=%r inherit=%r",
+                name, OWNER_ID, purpose, inherit,
+            )
+            out = out.replace(
+                match.group(0),
+                STRINGS["collab_announce_ok"] % name,
+                1,
+            )
+
+        return out.strip()
+
+    async def _handle_collab_setup_complete(response, collab_ws, platform):
+        """Process ``[COLLAB_SETUP_COMPLETE ...]`` from a setup-phase collab agent.
+
+        Semantics per ``contracts/collab-setup-complete.md``:
+        1. Require ``collab_ws.status == "setup"``; otherwise strip + log WARNING.
+        2. Rewrite ``data/agents/<name>.md`` with purpose + inheritance ref.
+        3. On OSError: leave status as ``"setup"``, send a recoverable-failure
+           note to the group, strip the marker. **Do not** flip status.
+        4. On success: call ``collab_store.finalize_setup(...)`` and post the
+           real HQ notification.
+        5. Strip the marker from the outgoing response.
+        """
+        matches = list(COLLAB_SETUP_COMPLETE_PATTERN.finditer(response))
+        if not matches:
+            return response
+
+        if collab_store is None:
+            log.warning("[COLLAB_SETUP_COMPLETE] ignored: collab_store not configured")
+            return COLLAB_SETUP_COMPLETE_PATTERN.sub("", response).strip()
+
+        # Always strip the marker from the outgoing response — the group
+        # should only ever see the agent's natural-language conclusion.
+        stripped = COLLAB_SETUP_COMPLETE_PATTERN.sub("", response).strip()
+
+        # Process only the first marker; a second one in the same turn is
+        # a no-op (after finalize_setup the status is "active" so the
+        # invariant check below rejects it).
+        match = matches[0]
+        attrs = parse_collab_attrs(match.group(1))
+        purpose = attrs.get("purpose", "").strip()
+        inherit = attrs.get("inherit", "").strip()
+        inherit_memory_raw = attrs.get("inherit_memory", "true").strip().lower()
+        inherit_memory = inherit_memory_raw != "false"
+
+        if collab_ws.status != "setup":
+            log.warning(
+                "[COLLAB_SETUP_COMPLETE] ignored for %s: status=%s (expected 'setup')",
+                collab_ws.agent_name, collab_ws.status,
+            )
+            return stripped
+
+        if not purpose:
+            log.warning(
+                "[COLLAB_SETUP_COMPLETE] malformed for %s: missing purpose",
+                collab_ws.agent_name,
+            )
+            return stripped
+
+        # Order matters: rewrite the agent .md file BEFORE flipping status
+        # (matches the race-closing rule at handlers.py Flow B). If the
+        # write fails, the workspace stays in "setup" and the user can retry.
+        from config import AGENTS_DIR
+        inherit_label = inherit if inherit else "none"
+        agent_file = AGENTS_DIR / ("%s.md" % collab_ws.agent_name)
+        try:
+            AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            agent_file.write_text(
+                "# %s\n\n"
+                "%s\n\n"
+                "(Inherits from: %s; memory inherit: %s)\n" % (
+                    collab_ws.display_name,
+                    purpose,
+                    inherit_label,
+                    "true" if inherit_memory else "false",
+                )
+            )
+        except OSError as e:
+            log.error(
+                "[COLLAB_SETUP_COMPLETE] agent file rewrite failed for %s: %s — "
+                "leaving status as 'setup'",
+                collab_ws.agent_name, e,
+            )
+            try:
+                await platform.send_message(
+                    chat_id=collab_ws.chat_id,
+                    text=STRINGS["collab_setup_failed_group"],
+                    parse_mode="markdown",
+                )
+            except Exception as send_e:
+                log.warning("Failed to surface setup-failure to group: %s", send_e)
+            return stripped
+
+        if not collab_store.finalize_setup(
+            collab_ws.id,
+            parent_workspace=inherit or None,
+            inherit_memory=inherit_memory,
+        ):
+            log.warning(
+                "[COLLAB_SETUP_COMPLETE] finalize_setup refused for %s "
+                "(status=%s) — agent file rewritten but store not flipped",
+                collab_ws.id, collab_ws.status,
+            )
+            return stripped
+
+        # Post the real HQ notification (FR-009).
+        hq_chat_id = getattr(_config, "CHAT_ID", None) or 0
+        try:
+            await platform.send_message(
+                chat_id=hq_chat_id,
+                text=STRINGS["collab_setup_complete_hq"] % (
+                    collab_ws.display_name,
+                    collab_ws.name,
+                    purpose,
+                    inherit_label,
+                    "true" if inherit_memory else "false",
+                    collab_ws.chat_id,
+                ),
+                thread_id=platform.control_room_id,
+                parse_mode="markdown",
+            )
+        except Exception as e:
+            log.warning("HQ notification (setup_complete) failed: %s", e)
+
+        log.info(
+            "collab.setup.complete ws_id=%s purpose=%r inherit=%r inherit_memory=%s",
+            collab_ws.id, purpose, inherit, inherit_memory,
+        )
+        return stripped
+
+    async def _handle_collab_send(response, chat_id, platform):
+        """Process ``[COLLAB_SEND ...]`` from the orchestrator in HQ.
+
+        Only runs in the robyx branch of ``_process_and_send``. Resolves
+        each target via ``collab_store.get_by_agent_name`` (which already
+        filters on ``status=="active"``), delivers the text via
+        ``platform.send_message``, and replaces every marker with an
+        ok / error trailer so the orchestrator sees the outcome.
+        """
+        matches = list(COLLAB_SEND_PATTERN.finditer(response))
+        if not matches:
+            return response
+
+        if collab_store is None:
+            log.warning("[COLLAB_SEND] ignored: collab_store not configured")
+            return COLLAB_SEND_PATTERN.sub("", response).strip()
+
+        out = response
+        for match in matches:
+            attrs = parse_collab_attrs(match.group(1))
+            name = attrs.get("name", "").strip()
+            text = attrs.get("text", "")
+            if not name or not text:
+                log.warning(
+                    "[COLLAB_SEND] malformed: missing name or text (attrs=%s)", attrs,
+                )
+                out = out.replace(
+                    match.group(0),
+                    STRINGS["collab_send_error"] % "missing required attribute",
+                    1,
+                )
+                continue
+
+            ws = collab_store.get_by_agent_name(name)
+            if ws is None:
+                # get_by_agent_name filters to status=="active"; a miss can
+                # mean either "unknown name" or "known but not active".
+                # Scan list_all to give a precise error.
+                any_ws = next(
+                    (w for w in collab_store.list_all() if w.agent_name == name),
+                    None,
+                )
+                if any_ws is None:
+                    reason = "unknown group %s" % name
+                else:
+                    reason = "group %s not active (status=%s)" % (name, any_ws.status)
+                log.info("collab.send ok=False target=%s reason=%r", name, reason)
+                out = out.replace(
+                    match.group(0),
+                    STRINGS["collab_send_error"] % reason,
+                    1,
+                )
+                continue
+
+            try:
+                await platform.send_message(
+                    chat_id=ws.chat_id,
+                    text=text,
+                    thread_id=None,
+                )
+            except Exception as e:
+                log.error(
+                    "[COLLAB_SEND] delivery to %s (chat_id=%s) failed: %s",
+                    name, ws.chat_id, e, exc_info=True,
+                )
+                log.info("collab.send ok=False target=%s reason='delivery failed'", name)
+                out = out.replace(
+                    match.group(0),
+                    STRINGS["collab_send_error"] % ("delivery failed: %s" % e),
+                    1,
+                )
+                continue
+
+            log.info("collab.send ok=True target=%s chars=%d", name, len(text))
+            out = out.replace(
+                match.group(0),
+                STRINGS["collab_send_ok"] % name,
+                1,
+            )
+
+        return out.strip()
+
+    async def _handle_notify_hq(response, collab_ws, platform):
+        """Process ``[NOTIFY_HQ ...]`` from a collaborative-workspace agent.
+
+        Delivers the text to HQ's control room (``CHAT_ID`` +
+        ``platform.control_room_id``) prefixed with the group name, and
+        strips the marker from the group-facing response. Delivery
+        failure logs a WARNING but does not surface back to the group —
+        the agent can retry on a subsequent turn.
+        """
+        matches = list(NOTIFY_HQ_PATTERN.finditer(response))
+        if not matches:
+            return response
+
+        stripped = NOTIFY_HQ_PATTERN.sub("", response).strip()
+        hq_chat_id = getattr(_config, "CHAT_ID", None) or 0
+
+        for match in matches:
+            attrs = parse_collab_attrs(match.group(1))
+            text = attrs.get("text", "")
+            if not text:
+                log.warning(
+                    "[NOTIFY_HQ] malformed from %s: missing text", collab_ws.agent_name,
+                )
+                continue
+            # Contract: truncate to 2000 chars with ellipsis; log truncation.
+            if len(text) > 2000:
+                log.info(
+                    "[NOTIFY_HQ] truncating from %s: %d → 2000 chars",
+                    collab_ws.agent_name, len(text),
+                )
+                text = text[:1997] + "..."
+            body = "*[%s]* (`%s`): %s" % (
+                collab_ws.display_name, collab_ws.name, text,
+            )
+            try:
+                await platform.send_message(
+                    chat_id=hq_chat_id,
+                    text=body,
+                    thread_id=platform.control_room_id,
+                    parse_mode="markdown",
+                )
+            except Exception as e:
+                log.warning("[NOTIFY_HQ] delivery failed for %s: %s", collab_ws.agent_name, e)
+                continue
+            log.info(
+                "collab.notify_hq ws=%s chars=%d", collab_ws.agent_name, len(text),
+            )
+
+        return stripped
 
     async def _handle_workspace_commands(response, chat_id, platform, thread_id):
         """Parse and execute workspace/specialist creation/closure commands from Robyx."""
@@ -610,80 +1029,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 else:
                     response += "\n\nFailed to create specialist *%s*." % spec_name
 
-        # Handle CREATE_CONTINUOUS
-        cont_match = CREATE_CONTINUOUS_PATTERN.search(response)
-        prog_match = CONTINUOUS_PROGRAM_PATTERN.search(response)
-        if cont_match and prog_match:
-            response = CREATE_CONTINUOUS_PATTERN.sub("", response)
-            response = CONTINUOUS_PROGRAM_PATTERN.sub("", response)
-            response = response.strip()
-
-            cont_name = cont_match.group(1)
-            cont_work_dir = cont_match.group(2)
-
-            # Validate work_dir stays under WORKSPACE to prevent path traversal
-            # via prompt injection in AI responses.
-            try:
-                resolved_wd = Path(cont_work_dir).resolve()
-                if not str(resolved_wd).startswith(str(WORKSPACE.resolve())):
-                    log.warning(
-                        "Continuous task %s: work_dir %r escapes WORKSPACE — rejected",
-                        cont_name, cont_work_dir,
-                    )
-                    response += "\n\nFailed to create continuous task: work_dir outside workspace."
-                    return response
-            except (OSError, ValueError):
-                response += "\n\nFailed to create continuous task: invalid work_dir."
-                return response
-
-            try:
-                import json as _json
-                program = _json.loads(prog_match.group(1).strip())
-            except (ValueError, TypeError) as e:
-                log.error("Invalid CONTINUOUS_PROGRAM JSON: %s", e)
-                response += "\n\nFailed to create continuous task: invalid program JSON."
-                return response
-
-            from topics import create_continuous_workspace
-
-            parent_agent = manager.get_by_thread(thread_id)
-            if parent_agent:
-                parent_ws_name = parent_agent.name
-            else:
-                log.warning(
-                    "Continuous task %s: thread_id=%s has no mapped "
-                    "workspace; reparenting to 'robyx'",
-                    cont_name, thread_id,
-                )
-                parent_ws_name = "robyx"
-
-            rejection_reason = None
-            try:
-                result = await create_continuous_workspace(
-                    name=cont_name,
-                    program=program,
-                    work_dir=cont_work_dir,
-                    parent_workspace=parent_ws_name,
-                    model="powerful",
-                    manager=manager,
-                    platform=platform,
-                )
-            except ValueError as e:
-                log.warning("create_continuous_workspace(%s) rejected: %s", cont_name, e)
-                result = None
-                rejection_reason = str(e)
-            except Exception as e:
-                log.error("create_continuous_workspace(%s) raised: %s", cont_name, e, exc_info=True)
-                result = None
-
-            if result:
-                response += "\n\n🔄 Continuous task *%s* created (topic #%s, branch `%s`)." % (
-                    result["display_name"], result["thread_id"], result["branch"],
-                )
-            elif rejection_reason:
-                response += "\n\nContinuous task *%s* not created: %s." % (cont_name, rejection_reason)
-            else:
-                response += "\n\nFailed to create continuous task *%s*." % cont_name
+        # CREATE_CONTINUOUS interception has moved to
+        # `_process_and_send` → `apply_continuous_macros` so both the
+        # orchestrator and workspace-agent paths get covered uniformly.
 
         return response
 
@@ -1363,7 +1711,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
         Two flows:
         A) An agent was told in advance (status="pending") → match and configure.
-        B) No pending request → notify Robyx in HQ so the user can decide.
+        B) No pending request → start a real AI-driven setup conversation.
+
+        Unauthorised adders trigger a refusal message, the bot leaves the
+        group, HQ is notified, and no CollabWorkspace is persisted (FR-011).
         """
         if collab_store is None:
             return
@@ -1371,6 +1722,45 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         chat_id = chat.id
         added_by_id = added_by.id if added_by else None
         chat_title = getattr(chat, "title", None) or "Unnamed group"
+
+        # Unauthorised-adder guard (FR-011). Must run BEFORE any persistence
+        # so a rejected add never leaves a stale workspace behind.
+        from authorization import is_authorised_adder
+        owner_id = getattr(_config, "OWNER_ID", None)
+        if not is_authorised_adder(added_by_id, collab_store, owner_id=owner_id):
+            log.info(
+                "collab.unauthorised chat=%d by=%s title=%r",
+                chat_id, added_by_id, chat_title,
+            )
+            try:
+                await platform.send_message(
+                    chat_id=chat_id,
+                    text=STRINGS["collab_unauthorised_adder"],
+                    parse_mode="markdown",
+                )
+            except Exception as e:
+                log.warning("Failed to send unauthorised-adder message: %s", e)
+            try:
+                await platform.leave_chat(chat_id)
+            except NotImplementedError:
+                log.warning(
+                    "leave_chat not supported on %s; cannot auto-leave unauthorised add",
+                    type(platform).__name__,
+                )
+            except Exception as e:
+                log.warning("leave_chat failed for chat %s: %s", chat_id, e)
+            try:
+                await platform.send_message(
+                    chat_id=getattr(_config, "CHAT_ID", None) or 0,
+                    text=STRINGS["collab_unauthorised_adder_hq"] % (
+                        chat_title, chat_id, added_by_id,
+                    ),
+                    thread_id=platform.control_room_id,
+                    parse_mode="markdown",
+                )
+            except Exception as e:
+                log.warning("Failed to notify HQ about unauthorised add: %s", e)
+            return
 
         # Flow A: only match pending workspaces explicitly bound to the
         # user who added the bot. Without this binding, *any* pending
@@ -1401,28 +1791,42 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             except Exception as e:
                 log.warning("Failed to generate invite link for collab %s: %s", ws.id, e)
 
-            # Send welcome message in the new group
+            # Read back the pre-announced purpose from the seed agent
+            # file so the welcome + HQ notification reflect real intent
+            # (SC-001). Silent fallback to display_name keeps the flow
+            # resilient if the file is missing.
+            purpose = ws.display_name
+            try:
+                from config import AGENTS_DIR
+                agent_file = AGENTS_DIR / ("%s.md" % ws.agent_name)
+                if agent_file.exists():
+                    for line in agent_file.read_text().splitlines():
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith("#"):
+                            continue
+                        purpose = stripped
+                        break
+            except OSError as e:
+                log.warning("Could not read agent file for %s: %s", ws.agent_name, e)
+
+            # Send welcome message in the new group — references purpose.
             try:
                 await platform.send_message(
                     chat_id=chat_id,
-                    text="*%s* -- collaborative workspace is ready.\n\n"
-                         "I'm the agent for this workspace. "
-                         "Owner and operators can give me executive instructions; "
-                         "other participants can talk and I'll help when appropriate."
-                         % ws.display_name,
+                    text=STRINGS["collab_welcome_pending"] % (ws.display_name, purpose),
                     parse_mode="markdown",
                 )
             except Exception as e:
                 log.warning("Failed to send collab welcome: %s", e)
 
-            # Notify in HQ
+            # Notify in HQ — include purpose (FR-009, SC-001).
             link_text = "\nInvite link: %s" % ws.invite_link if ws.invite_link else ""
             try:
                 await platform.send_message(
                     chat_id=_config.CHAT_ID if hasattr(_config, "CHAT_ID") else 0,
-                    text="*Collaborative workspace configured*\n\n"
-                         "Workspace *%s* is now linked to group _%s_ (chat_id: %d).%s"
-                         % (ws.display_name, chat_title, chat_id, link_text),
+                    text=STRINGS["collab_bot_added_hq_matched"] % (
+                        ws.display_name, chat_title, chat_id, purpose, link_text,
+                    ),
                     thread_id=platform.control_room_id,
                     parse_mode="markdown",
                 )
@@ -1430,8 +1834,8 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 log.warning("Failed to send collab HQ notification: %s", e)
 
             log.info(
-                "Collaborative workspace [%s] configured: chat_id=%d title=%r",
-                ws.name, chat_id, chat_title,
+                "collab.match ws_id=%s chat_id=%d title=%r purpose=%r",
+                ws.id, chat_id, chat_title, purpose,
             )
             return
 
@@ -1482,11 +1886,14 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         agent_file = AGENTS_DIR / ("%s.md" % safe_name)
         try:
             AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+            # Minimal "setup in progress" marker so the agent's system
+            # prompt is unambiguous during the setup window. The real
+            # purpose is written in by `_handle_collab_setup_complete`.
             agent_file.write_text(
                 "# %s\n\n"
-                "Collaborative workspace in setup phase.\n"
-                "Ask the user what this workspace should focus on and whether "
-                "it should inherit from an existing workspace agent.\n"
+                "Collaborative workspace in setup phase — awaiting "
+                "[COLLAB_SETUP_COMPLETE purpose=\"...\" inherit=\"...\" "
+                "inherit_memory=\"true|false\"] marker from the setup agent.\n"
                 % chat_title
             )
         except OSError as e:
@@ -1513,33 +1920,112 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         except Exception as e:
             log.warning("Failed to generate invite link for collab %s: %s", ws_id, e)
 
-        # Ask in the group
+        # Light HQ notification — setup in progress. The real notification
+        # (with captured purpose / inheritance) fires when the setup agent
+        # emits [COLLAB_SETUP_COMPLETE].
         try:
             await platform.send_message(
-                chat_id=chat_id,
-                text="Hi! I've been added to this group. "
-                     "How would you like to set up this workspace?\n\n"
-                     "- Should I inherit from an existing workspace? If so, which one?\n"
-                     "- Or should we start fresh? Tell me what we'll be working on.\n\n"
-                     "Once you tell me, I'll configure everything.",
-                parse_mode="markdown",
-            )
-        except Exception as e:
-            log.error("Failed to send setup message in group %d: %s", chat_id, e)
-
-        # Also notify in HQ
-        try:
-            from config import CHAT_ID as hq_chat_id
-            await platform.send_message(
-                chat_id=hq_chat_id,
-                text="I've been added to group *%s* (chat_id: `%d`). "
-                     "I'm asking there how to set up the workspace."
-                     % (chat_title, chat_id),
+                chat_id=getattr(_config, "CHAT_ID", None) or 0,
+                text=STRINGS["collab_bot_added_hq_pending"] % (chat_title, chat_id),
                 thread_id=platform.control_room_id,
                 parse_mode="markdown",
             )
         except Exception as e:
             log.warning("Failed to notify HQ about new group: %s", e)
+
+        log.info(
+            "collab.setup.bootstrap ws_id=%s chat_id=%d title=%r by=%s",
+            ws_id, chat_id, chat_title, added_by_id,
+        )
+
+        # Flow B's first in-group message is a REAL AI turn (SC-004), not
+        # a byte-identical template. `_process_and_send` handles typing,
+        # interrupt, marker processing, and response delivery — including
+        # parsing any immediate [COLLAB_SETUP_COMPLETE] the agent emits.
+        bootstrap = COLLAB_BOOTSTRAP_PROMPT.format(
+            chat_title=chat_title,
+            added_by_id=added_by_id if added_by_id is not None else "unknown",
+        )
+        try:
+            await _process_and_send(
+                agent, bootstrap, chat_id, platform,
+                thread_id=None, is_executive=True,
+            )
+        except Exception as e:
+            log.error("Flow-B bootstrap AI turn failed for %s: %s", ws_id, e, exc_info=True)
+
+    async def collab_bot_removed(platform, chat):
+        """Close the collaborative workspace when the bot is removed from a group.
+
+        Contract: ``contracts/lifecycle-events.md``. Persistence happens
+        BEFORE the HQ notification so a crash in between keeps the
+        registry correct (a missed notification is acceptable).
+        """
+        if collab_store is None:
+            return
+        chat_id = chat.id
+        chat_title = getattr(chat, "title", None) or "Unknown group"
+        ws = collab_store.get_by_chat_id(chat_id)
+        if ws is None:
+            log.info(
+                "collab.archive chat_id=%d title=%r — no matching workspace",
+                chat_id, chat_title,
+            )
+            return
+        if not collab_store.close(ws.id):
+            log.warning(
+                "collab.archive close() refused for ws=%s (chat_id=%d)",
+                ws.id, chat_id,
+            )
+            return
+        log.info(
+            "collab.archive ws_id=%s chat_id=%d title=%r reason=bot_removed",
+            ws.id, chat_id, chat_title,
+        )
+        try:
+            await platform.send_message(
+                chat_id=getattr(_config, "CHAT_ID", None) or 0,
+                text=STRINGS["collab_bot_removed_hq"] % ws.display_name,
+                thread_id=platform.control_room_id,
+                parse_mode="markdown",
+            )
+        except Exception as e:
+            log.warning("HQ notification (bot_removed) failed: %s", e)
+
+    async def collab_bot_migrated(platform, old_chat_id, new_chat_id):
+        """Rebind a collaborative workspace to a new chat_id on supergroup migration.
+
+        Contract: ``contracts/lifecycle-events.md``. Status is unchanged;
+        ``chat_id`` is rebound atomically via ``collab_store.migrate_chat_id``.
+        """
+        if collab_store is None:
+            return
+        ws = collab_store.get_by_chat_id(old_chat_id)
+        if ws is None:
+            log.info(
+                "collab.migrate old_chat_id=%d → new_chat_id=%d — no matching workspace",
+                old_chat_id, new_chat_id,
+            )
+            return
+        if not collab_store.migrate_chat_id(old_chat_id, new_chat_id):
+            log.warning(
+                "collab.migrate refused for ws=%s (%d → %d)",
+                ws.id, old_chat_id, new_chat_id,
+            )
+            return
+        log.info(
+            "collab.migrate ws_id=%s old_chat_id=%d new_chat_id=%d",
+            ws.id, old_chat_id, new_chat_id,
+        )
+        try:
+            await platform.send_message(
+                chat_id=getattr(_config, "CHAT_ID", None) or 0,
+                text=STRINGS["collab_migrated_hq"] % (ws.display_name, new_chat_id),
+                thread_id=platform.control_room_id,
+                parse_mode="markdown",
+            )
+        except Exception as e:
+            log.warning("HQ notification (bot_migrated) failed: %s", e)
 
     def _collab_role(role_str):
         """Coerce a stored role string to a ``Role`` enum, tolerating typos.
@@ -1576,5 +2062,12 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
     if collab_store is not None:
         result["collab_bot_added"] = collab_bot_added
+        result["collab_bot_removed"] = collab_bot_removed
+        result["collab_bot_migrated"] = collab_bot_migrated
+        # Exposed for unit tests; stable internal API, not user commands.
+        result["_handle_collab_announce"] = _handle_collab_announce
+        result["_handle_collab_setup_complete"] = _handle_collab_setup_complete
+        result["_handle_collab_send"] = _handle_collab_send
+        result["_handle_notify_hq"] = _handle_notify_hq
 
     return result

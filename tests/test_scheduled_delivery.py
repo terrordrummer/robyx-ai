@@ -238,3 +238,44 @@ class TestStartTaskDeliveryWatch:
         proc.wait.assert_awaited_once()
         assert not lock_file.exists()
         platform.send_to_channel.assert_awaited()
+
+
+class TestContinuousMacroScrubbing:
+    """Feature 004 regression: scheduled subprocess output must NEVER deliver
+    a raw continuous-task macro to the chat. The scheduler has no
+    interactive agent context, so it MUST strip (never dispatch) any tokens
+    it sees."""
+
+    @pytest.mark.asyncio
+    async def test_scheduled_reply_strips_macro(self, tmp_path, mock_platform):
+        output_log = tmp_path / "out.log"
+        output_log.write_text("ignored; the backend parser returns its own text")
+
+        backend = MagicMock()
+        backend.parse_response.return_value = {
+            "text": (
+                "Job done.\n\n"
+                '[CREATE_CONTINUOUS name="stray" work_dir="/tmp/x"]\n'
+                '[CONTINUOUS_PROGRAM]\n'
+                '{"objective":"x","success_criteria":["y"],'
+                '"first_step":{"number":1,"description":"z"}}\n'
+                '[/CONTINUOUS_PROGRAM]'
+            )
+        }
+
+        task = {
+            "name": "nightly-run",
+            "description": "Nightly run",
+            "thread_id": 101,
+        }
+
+        ok = await deliver_task_output(
+            task, output_log, mock_platform, backend, 0, MagicMock(),
+        )
+
+        assert ok is True
+        mock_platform.send_to_channel.assert_awaited()
+        delivered = mock_platform.send_to_channel.await_args.args[1]
+        assert "[CREATE_CONTINUOUS" not in delivered
+        assert "CONTINUOUS_PROGRAM" not in delivered.upper()
+        assert "Job done" in delivered

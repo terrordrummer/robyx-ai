@@ -1,0 +1,7 @@
+[CREATE_CONTINUOUS name="no-objective" work_dir="/tmp/robyx-test-workspace/nof"]
+[CONTINUOUS_PROGRAM]
+{
+  "success_criteria": ["forgot to include objective"],
+  "first_step": {"number": 1, "description": "anything"}
+}
+[/CONTINUOUS_PROGRAM]

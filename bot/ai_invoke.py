@@ -91,15 +91,34 @@ AGENT_INSTRUCTIONS_PATTERN = re.compile(
 )
 CLOSE_WORKSPACE_PATTERN = re.compile(r'\[CLOSE_WORKSPACE\s+name="([^"]+)"\s*\]')
 
-# Continuous task creation
+# Continuous task creation.
+#
+# The tag tokens are matched case-insensitively. Attribute values may be
+# delimited by ASCII double quotes, curly doubles (U+201C U+201D), or curly
+# singles (U+2018 U+2019) — some tokenizers normalize apostrophes and emit
+# typographic variants. Whitespace between the tag name and attributes may
+# include newlines. See specs/004-fix-continuous-task-macro/contracts/
+# continuous-macro-grammar.md for the full grammar.
+#
+# These patterns are consumed by:
+#   - bot/continuous_macro.py (primary detection / dispatch)
+#   - bot/handlers.py::_strip_executive_markers (defense-in-depth stripping
+#     for non-executive collaborative agents, via _EXECUTIVE_MARKERS).
+# Both callers need the public names ``CREATE_CONTINUOUS_PATTERN`` and
+# ``CONTINUOUS_PROGRAM_PATTERN`` — do not rename.
+_CONTINUOUS_QUOTE_CLASS = r'["\u201C\u201D\u2018\u2019]'
 CREATE_CONTINUOUS_PATTERN = re.compile(
-    r'\[CREATE_CONTINUOUS\s+'
-    r'name="([^"]+)"\s+'
-    r'work_dir="([^"]+)"\s*\]',
-    re.DOTALL,
+    r'\[\s*CREATE_CONTINUOUS'
+    r'\s+name\s*=\s*' + _CONTINUOUS_QUOTE_CLASS +
+    r'([^"\u201C\u201D\u2018\u2019]+)' + _CONTINUOUS_QUOTE_CLASS +
+    r'\s+work_dir\s*=\s*' + _CONTINUOUS_QUOTE_CLASS +
+    r'([^"\u201C\u201D\u2018\u2019]+)' + _CONTINUOUS_QUOTE_CLASS +
+    r'\s*\]',
+    re.IGNORECASE | re.DOTALL,
 )
 CONTINUOUS_PROGRAM_PATTERN = re.compile(
-    r'\[CONTINUOUS_PROGRAM\](.*?)\[/CONTINUOUS_PROGRAM\]', re.DOTALL
+    r'\[\s*CONTINUOUS_PROGRAM\s*\](.*?)\[\s*/\s*CONTINUOUS_PROGRAM\s*\]',
+    re.IGNORECASE | re.DOTALL,
 )
 
 # Specialist creation
@@ -134,6 +153,70 @@ TTS_SUMMARY_PATTERN = re.compile(
 
 # Collaborative agent silent response: agent chose not to speak.
 SILENT_PATTERN = re.compile(r'\[SILENT\]')
+
+# External collaborative-group wiring (feature 003). Attribute-style payload,
+# attribute order free. Emitted ONLY by the orchestrator in HQ. See
+# specs/003-external-group-wiring/contracts/collab-announce.md.
+COLLAB_ANNOUNCE_PATTERN = re.compile(
+    r'\[COLLAB_ANNOUNCE\s+([^\]]+?)\]',
+    re.DOTALL,
+)
+COLLAB_SETUP_COMPLETE_PATTERN = re.compile(
+    r'\[COLLAB_SETUP_COMPLETE\s+([^\]]+?)\]',
+    re.DOTALL,
+)
+COLLAB_SEND_PATTERN = re.compile(
+    r'\[COLLAB_SEND\s+([^\]]+?)\]',
+    re.DOTALL,
+)
+NOTIFY_HQ_PATTERN = re.compile(
+    r'\[NOTIFY_HQ\s+([^\]]+?)\]',
+    re.DOTALL,
+)
+_COLLAB_ATTR_PATTERN = re.compile(r'(\w+)="([^"]*)"', re.DOTALL)
+
+
+def parse_collab_attrs(blob: str) -> dict:
+    """Parse the inner attribute string of a [COLLAB_* ...] match into a dict."""
+    return dict(_COLLAB_ATTR_PATTERN.findall(blob))
+
+
+# Module-level CollabStore reference. Set once by bot startup via
+# ``register_collab_store(store)``; read on each orchestrator turn to
+# render the live [AVAILABLE_EXTERNAL_GROUPS] registry section. Kept
+# module-level (rather than threaded through every call site) because
+# ``invoke_ai`` is reached from dozens of scheduler/continuous/delegate
+# code paths that have no legitimate need to know about collab state.
+_collab_store_ref = None
+
+
+def register_collab_store(store) -> None:
+    """Register the CollabStore so the orchestrator's system prompt can
+    render the live [AVAILABLE_EXTERNAL_GROUPS] section on every turn.
+
+    Called once from ``bot.py`` at startup. Safe to call with ``None``
+    to unregister (used by tests for isolation).
+    """
+    global _collab_store_ref
+    _collab_store_ref = store
+
+
+# Flow-B bootstrap prompt for ad-hoc collaborative groups (no prior
+# [COLLAB_ANNOUNCE]). Fed to the freshly-registered collab agent on its
+# first invocation so the first in-group message is a real AI turn, not
+# a byte-identical template (SC-004). See research.md R-02.
+COLLAB_BOOTSTRAP_PROMPT = (
+    "You have just been added to a new Telegram group titled {chat_title!r} "
+    "by user {added_by_id}. No prior announcement exists. Your job now is to: "
+    "(1) greet the group briefly; "
+    "(2) ask what the workspace should focus on and whether it should "
+    "inherit from an existing workspace; "
+    "(3) when you have captured purpose + inheritance, emit "
+    "[COLLAB_SETUP_COMPLETE purpose=\"...\" inherit=\"<name-or-empty>\" "
+    "inherit_memory=\"true|false\"] on its own line at the end of your reply. "
+    "Until you emit that marker you remain in setup mode; do not call any "
+    "other tool-ish command."
+)
 
 # Schedule a reminder: [REMIND at="2026-04-08T17:32:00+02:00" text="..."]
 # or [REMIND in="2m" text="..."] or [REMIND in="1h30m" text="..." thread="903"]
@@ -249,6 +332,40 @@ def _normalize_backend_response(parsed_response):
 # brief is deleted and recreated fast enough that the filesystem hands
 # back the same mtime.
 _instructions_cache: dict[str, tuple[float, int, str]] = {}
+
+
+def _render_external_groups_block() -> str:
+    """Render the live [AVAILABLE_EXTERNAL_GROUPS] section for the
+    orchestrator's system prompt.
+
+    Consults the registered CollabStore on every call (no caching) so
+    newly-announced / newly-closed groups surface on the very next turn
+    (SC-003). Returns an empty string when no store is registered or
+    when the store has no non-closed workspaces — so the orchestrator
+    prompt is unchanged for installations without external groups.
+    """
+    store = _collab_store_ref
+    if store is None:
+        return ""
+    try:
+        rows = store.list_for_orchestrator()
+    except Exception as e:  # defensive — must not break orchestrator turns
+        log.warning("list_for_orchestrator failed: %s", e)
+        return ""
+    if not rows:
+        return ""
+    lines = ["\n\n[AVAILABLE_EXTERNAL_GROUPS]"]
+    for row in rows:
+        lines.append(
+            '- name: %s | purpose: "%s" | chat_id: %s | status: %s' % (
+                row["name"],
+                row["purpose"].replace('"', "'"),
+                row["chat_id"],
+                row["status"],
+            )
+        )
+    lines.append("[/AVAILABLE_EXTERNAL_GROUPS]")
+    return "\n".join(lines)
 
 
 def _load_agent_instructions(agent: Agent) -> str:
@@ -391,7 +508,7 @@ async def _invoke_ai_locked(
     # Determine system prompt
     system_prompt = None
     if agent.name == "robyx":
-        system_prompt = ROBYX_SYSTEM_PROMPT
+        system_prompt = ROBYX_SYSTEM_PROMPT + _render_external_groups_block()
     elif agent.collab_workspace_id:
         system_prompt = COLLABORATIVE_AGENT_SYSTEM_PROMPT
         system_prompt = system_prompt + _load_agent_instructions(agent)

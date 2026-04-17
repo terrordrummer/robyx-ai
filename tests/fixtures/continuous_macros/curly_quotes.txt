@@ -1,0 +1,8 @@
+[CREATE_CONTINUOUS name=“curly” work_dir=“/tmp/robyx-test-workspace/curly”]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Attribute values delimited by curly doubles.",
+  "success_criteria": ["still intercepted"],
+  "first_step": {"number": 1, "description": "start"}
+}
+[/CONTINUOUS_PROGRAM]
