@@ -1936,3 +1936,189 @@ class TestHandleVoice:
         mock_platform.reply.assert_awaited_once_with(msg_ref, STRINGS["voice_no_key"])
         # Should NOT download the file
         mock_platform.download_voice.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Feature 004 — continuous-task macro interception
+#
+# Contracts under test:
+#   - The continuous-task macro is intercepted uniformly for BOTH
+#     orchestrator AND workspace-agent executive turns, not just the
+#     `is_robyx` branch (the pre-fix routing gap).
+#   - The raw macro never reaches the platform send path on ANY fixture:
+#     golden, malformed, or realistic-variation.
+#   - The confirmation line uses the i18n key, not inlined copy.
+#
+# The tests patch `handlers.invoke_ai` to return a canned response and
+# assert both that `apply_continuous_macros` ran and that the text that
+# actually reaches `platform.send_message` contains zero macro tokens.
+# ---------------------------------------------------------------------------
+
+
+class TestContinuousMacroInterception:
+    @pytest.mark.asyncio
+    @patch("handlers.handle_delegations", new_callable=AsyncMock,
+           side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.handle_focus_commands", new_callable=AsyncMock,
+           side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.split_message", side_effect=lambda text, max_len=4000: [text])
+    async def test_orchestrator_macro_never_leaks_raw_tokens(
+        self, mock_split, mock_focus, mock_deleg,
+        handlers, mock_platform, msg_ref, agent_manager, monkeypatch,
+    ):
+        """Robyx in the main thread emits a golden macro. The user-visible
+        text sent to the platform MUST contain none of the macro tokens —
+        only the i18n confirmation line."""
+        import handlers as handlers_mod
+
+        async def stub_create(**kwargs):
+            return {
+                "display_name": kwargs["name"],
+                "thread_id": 42,
+                "branch": "continuous/" + kwargs["name"],
+            }
+
+        golden = (
+            "Setting up the task.\n\n"
+            '[CREATE_CONTINUOUS name="tester" work_dir="%s/w"]\n'
+            '[CONTINUOUS_PROGRAM]\n'
+            '{"objective":"x","success_criteria":["y"],'
+            '"first_step":{"number":1,"description":"z"}}\n'
+            '[/CONTINUOUS_PROGRAM]'
+        ) % monkeypatch.setenv  # placeholder, overwritten below
+
+        import config as _cfg
+        monkeypatch.setattr(_cfg, "WORKSPACE", handlers_mod.WORKSPACE)
+        work = handlers_mod.WORKSPACE / "w"
+        work.mkdir(parents=True, exist_ok=True)
+        golden = (
+            "Setting up the task.\n\n"
+            '[CREATE_CONTINUOUS name="tester" work_dir="%s"]\n'
+            '[CONTINUOUS_PROGRAM]\n'
+            '{"objective":"x","success_criteria":["y"],'
+            '"first_step":{"number":1,"description":"z"}}\n'
+            '[/CONTINUOUS_PROGRAM]'
+        ) % str(work)
+
+        with patch("handlers.invoke_ai", new_callable=AsyncMock, return_value=golden), \
+                patch("continuous_macro._lazy_create_continuous_workspace",
+                      return_value=stub_create):
+            msg = make_message(text="please set it up", thread_id=None)
+            await handlers["message"](mock_platform, msg, msg_ref)
+
+        # Every call to send_message / send_to_channel must have
+        # macro-free text.
+        for awaited in (
+            list(mock_platform.send_message.await_args_list)
+            + list(mock_platform.send_to_channel.await_args_list)
+            + list(mock_platform.reply.await_args_list)
+        ):
+            # Find the text argument across the various signatures.
+            text_args = [a for a in awaited.args if isinstance(a, str)]
+            text_args += [v for k, v in awaited.kwargs.items()
+                          if k in ("text", "body") and isinstance(v, str)]
+            for t in text_args:
+                assert "[CREATE_CONTINUOUS" not in t
+                assert "CONTINUOUS_PROGRAM" not in t.upper()
+
+    @pytest.mark.asyncio
+    @patch("handlers.handle_specialist_requests", new_callable=AsyncMock,
+           side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.handle_focus_commands", new_callable=AsyncMock,
+           side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.split_message", side_effect=lambda text, max_len=4000: [text])
+    async def test_workspace_agent_macro_is_intercepted(
+        self, mock_split, mock_focus, mock_spec,
+        handlers, mock_platform, msg_ref, agent_manager, monkeypatch,
+    ):
+        """Pre-fix routing gap: a non-robyx workspace agent that emits the
+        macro used to leak because `_handle_workspace_commands` was only
+        called on the `is_robyx` branch. After the fix, interception runs
+        before the is_robyx split, so workspace-agent emissions also get
+        stripped."""
+        import handlers as handlers_mod
+
+        agent_manager.add_agent(
+            "alpha", str(handlers_mod.WORKSPACE / "alpha"),
+            "Alpha WS", thread_id=42,
+        )
+
+        async def stub_create(**kwargs):
+            return {
+                "display_name": kwargs["name"],
+                "thread_id": 77,
+                "branch": "continuous/" + kwargs["name"],
+            }
+
+        work = handlers_mod.WORKSPACE / "alpha" / "w"
+        work.mkdir(parents=True, exist_ok=True)
+        import config as _cfg
+        monkeypatch.setattr(_cfg, "WORKSPACE", handlers_mod.WORKSPACE)
+
+        macro_reply = (
+            "Kicking off the iterative task.\n\n"
+            '[CREATE_CONTINUOUS name="alpha-task" work_dir="%s"]\n'
+            '[CONTINUOUS_PROGRAM]\n'
+            '{"objective":"o","success_criteria":["c"],'
+            '"first_step":{"number":1,"description":"s"}}\n'
+            '[/CONTINUOUS_PROGRAM]'
+        ) % str(work)
+
+        with patch("handlers.invoke_ai", new_callable=AsyncMock, return_value=macro_reply), \
+                patch("continuous_macro._lazy_create_continuous_workspace",
+                      return_value=stub_create):
+            msg = make_message(text="please set it up", thread_id=42)
+            await handlers["message"](mock_platform, msg, msg_ref)
+
+        for awaited in (
+            list(mock_platform.send_message.await_args_list)
+            + list(mock_platform.send_to_channel.await_args_list)
+            + list(mock_platform.reply.await_args_list)
+        ):
+            text_args = [a for a in awaited.args if isinstance(a, str)]
+            text_args += [v for k, v in awaited.kwargs.items()
+                          if k in ("text", "body") and isinstance(v, str)]
+            for t in text_args:
+                assert "[CREATE_CONTINUOUS" not in t
+                assert "CONTINUOUS_PROGRAM" not in t.upper()
+
+    @pytest.mark.asyncio
+    @patch("handlers.handle_delegations", new_callable=AsyncMock,
+           side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.handle_focus_commands", new_callable=AsyncMock,
+           side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.split_message", side_effect=lambda text, max_len=4000: [text])
+    async def test_malformed_macro_surfaces_prose_error_not_tokens(
+        self, mock_split, mock_focus, mock_deleg,
+        handlers, mock_platform, msg_ref, agent_manager,
+    ):
+        """FR-004: a malformed macro must produce a prose error, not a
+        leaked JSON payload or raw tag."""
+        malformed = (
+            "Here you go.\n\n"
+            '[CREATE_CONTINUOUS name="bad" work_dir="/etc/passwd"]\n'
+            '[CONTINUOUS_PROGRAM]\n'
+            '{"objective":"x","success_criteria":["y"],'
+            '"first_step":{"number":1,"description":"z"}}\n'
+            '[/CONTINUOUS_PROGRAM]'
+        )
+
+        with patch("handlers.invoke_ai", new_callable=AsyncMock, return_value=malformed):
+            msg = make_message(text="please", thread_id=None)
+            await handlers["message"](mock_platform, msg, msg_ref)
+
+        seen_any_text = False
+        for awaited in (
+            list(mock_platform.send_message.await_args_list)
+            + list(mock_platform.send_to_channel.await_args_list)
+            + list(mock_platform.reply.await_args_list)
+        ):
+            text_args = [a for a in awaited.args if isinstance(a, str)]
+            text_args += [v for k, v in awaited.kwargs.items()
+                          if k in ("text", "body") and isinstance(v, str)]
+            for t in text_args:
+                seen_any_text = True
+                assert "[CREATE_CONTINUOUS" not in t
+                assert "CONTINUOUS_PROGRAM" not in t.upper()
+                assert "/etc/passwd" not in t
+        assert seen_any_text, "handler sent no message at all"

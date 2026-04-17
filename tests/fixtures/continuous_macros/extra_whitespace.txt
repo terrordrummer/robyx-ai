@@ -1,0 +1,11 @@
+[CREATE_CONTINUOUS
+    name="whitespace"
+    work_dir="/tmp/robyx-test-workspace/ws"
+]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Attributes separated by newlines.",
+  "success_criteria": ["still intercepted"],
+  "first_step": {"number": 1, "description": "start"}
+}
+[/CONTINUOUS_PROGRAM]

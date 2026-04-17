@@ -288,3 +288,9 @@ class SlackPlatform(Platform):
         except Exception as e:
             log.error("Error sending to channel %s: %s", channel_id, e)
             return False
+
+    async def leave_chat(self, chat_id: Any) -> None:
+        raise NotImplementedError(
+            "leave_chat is not yet supported on Slack — external collaborative "
+            "groups are Telegram-only in this iteration"
+        )

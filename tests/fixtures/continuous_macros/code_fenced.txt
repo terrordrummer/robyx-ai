@@ -1,0 +1,14 @@
+Here's the continuous-task spec:
+
+```
+[CREATE_CONTINUOUS name="fenced" work_dir="/tmp/robyx-test-workspace/fenced"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Macro wrapped in a triple-backtick fence.",
+  "success_criteria": ["fences are removed when they only wrap the macro"],
+  "first_step": {"number": 1, "description": "start"}
+}
+[/CONTINUOUS_PROGRAM]
+```
+
+Let me know if you want changes.

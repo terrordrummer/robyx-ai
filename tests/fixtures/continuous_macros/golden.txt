@@ -1,0 +1,13 @@
+Sure — I'll set up the continuous task now.
+
+[CREATE_CONTINUOUS name="deconv-bench" work_dir="/tmp/robyx-test-workspace/deconv"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Drive the deconvolution benchmark p95 below 500 ms.",
+  "success_criteria": ["p95 latency < 500 ms on the reference image set"],
+  "constraints": ["Must not regress visual quality metrics."],
+  "checkpoint_policy": "every 3 steps",
+  "context": "Working from branch continuous/deconv-bench off main.",
+  "first_step": {"number": 1, "description": "Profile the current pipeline to find the dominant hotspot."}
+}
+[/CONTINUOUS_PROGRAM]

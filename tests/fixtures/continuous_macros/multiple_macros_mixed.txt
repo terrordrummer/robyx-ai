@@ -1,0 +1,21 @@
+Two macros in one reply — one good, one malformed.
+
+[CREATE_CONTINUOUS name="first-good" work_dir="/tmp/robyx-test-workspace/good"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "This one is fine.",
+  "success_criteria": ["ok"],
+  "first_step": {"number": 1, "description": "profile"}
+}
+[/CONTINUOUS_PROGRAM]
+
+And the second one:
+
+[CREATE_CONTINUOUS name="second-bad" work_dir="/tmp/robyx-test-workspace/bad2"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Trailing comma breaks JSON.",
+  "success_criteria": ["x",],
+  "first_step": {"number": 1, "description": "x"},
+}
+[/CONTINUOUS_PROGRAM]

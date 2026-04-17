@@ -137,9 +137,92 @@ STRINGS = {
     "collab_close_denied": "Only the workspace creator can close it.",
     "collab_no_users": "No users registered in this workspace.",
 
+    # External group wiring (feature 003)
+    "collab_unauthorised_adder": (
+        "I can't be added to external groups by this account. Leaving."
+    ),
+    "collab_unauthorised_adder_hq": (
+        "Unauthorised add attempt to group *%s* (chat_id `%d`) by user `%s`; "
+        "left the group."
+    ),
+    "collab_unsupported_platform_discord": (
+        "External collaborative groups are not yet supported on Discord. "
+        "Use Telegram for external groups. The bot will take no further "
+        "action here."
+    ),
+    "collab_unsupported_platform_slack": (
+        "External collaborative groups are not yet supported on Slack. "
+        "Use Telegram for external groups. The bot will take no further "
+        "action here."
+    ),
+    "collab_announce_ok": "[COLLAB_ANNOUNCE ok: name=%s]",
+    "collab_announce_error": "[COLLAB_ANNOUNCE error: %s]",
+    "collab_announce_rejected": "[COLLAB_ANNOUNCE rejected: %s]",
+    "collab_send_ok": "[COLLAB_SEND ok: %s]",
+    "collab_send_error": "[COLLAB_SEND error: %s]",
+    "collab_send_rejected": "[COLLAB_SEND rejected: %s]",
+    "collab_setup_complete_hq": (
+        "*Collaborative workspace setup complete*\n\n"
+        "Workspace *%s* (`%s`) is now active.\n"
+        "Purpose: %s\n"
+        "Inherits: %s (memory: %s)\n"
+        "chat_id: `%d`"
+    ),
+    "collab_setup_failed_group": (
+        "Couldn't save setup — please try again."
+    ),
+    "collab_bot_added_hq_pending": (
+        "I've been added to group *%s* (chat_id `%d`). "
+        "Setup conversation in progress."
+    ),
+    "collab_bot_added_hq_matched": (
+        "*Collaborative workspace configured*\n\n"
+        "Workspace *%s* is now linked to group _%s_ (chat_id `%d`).\n"
+        "Purpose: %s%s"
+    ),
+    "collab_bot_removed_hq": (
+        "Collaborative workspace *%s* has been closed (bot removed from group)."
+    ),
+    "collab_migrated_hq": (
+        "Workspace *%s* migrated to new chat_id `%d`."
+    ),
+    "collab_welcome_pending": (
+        "*%s* — collaborative workspace is ready.\n\n"
+        "Purpose: %s\n\n"
+        "I'm the agent for this workspace. Owner and operators can give me "
+        "executive instructions; other participants can talk and I'll help "
+        "when appropriate."
+    ),
+
     # Commands (usage and progress)
     "reset_usage": "Usage: /reset <name>",
     "update_checking_manual": "Checking for pending update...",
+
+    # Continuous-task macro (feature 004)
+    "continuous_task_created": (
+        "Continuous task *%s* created (topic #%s, branch `%s`)."
+    ),
+    "continuous_task_error_malformed": (
+        "Continuous task not created — the setup block was incomplete."
+    ),
+    "continuous_task_error_bad_json": (
+        "Continuous task not created — the program payload could not be parsed."
+    ),
+    "continuous_task_error_missing_field": (
+        "Continuous task not created — required field missing: %s."
+    ),
+    "continuous_task_error_path_denied": (
+        "Continuous task not created — the requested work directory is outside the workspace."
+    ),
+    "continuous_task_error_name_taken": (
+        "Continuous task *%s* not created — that name is already in use."
+    ),
+    "continuous_task_error_permission_denied": (
+        "Continuous task not created — this agent is not authorised to create one here."
+    ),
+    "continuous_task_error_downstream": (
+        "Continuous task not created — an internal error prevented setup."
+    ),
 
     # Time formatting
     "time_now": "now",

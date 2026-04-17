@@ -270,3 +270,217 @@ class TestCollabStore:
         store.add(b)
         store.add(c)
         assert {w.id for w in store.list_all()} == {"c1", "c2", "c3"}
+
+
+class TestCreatePending:
+    def test_persists_with_correct_defaults(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        ws = store.create_pending(
+            name="nebula", display_name="Nebula Research",
+            agent_name="nebula",
+            parent_workspace="astro-research", inherit_memory=True,
+            creator_id=777,
+        )
+        assert ws.status == "pending"
+        assert ws.chat_id == 0
+        assert ws.expected_creator_id == 777
+        assert ws.parent_workspace == "astro-research"
+        assert ws.inherit_memory is True
+        assert ws.roles == {"777": "owner"}
+
+    def test_name_collision_raises(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        store.create_pending(
+            name="nebula", display_name="Nebula",
+            agent_name="nebula", parent_workspace=None,
+            inherit_memory=True, creator_id=777,
+        )
+        import pytest
+        with pytest.raises(ValueError, match="name collision"):
+            store.create_pending(
+                name="nebula", display_name="Other",
+                agent_name="nebula", parent_workspace=None,
+                inherit_memory=True, creator_id=777,
+            )
+
+    def test_zero_creator_id_raises(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        import pytest
+        with pytest.raises(ValueError, match="creator_id"):
+            store.create_pending(
+                name="x", display_name="X", agent_name="x",
+                parent_workspace=None, inherit_memory=True, creator_id=0,
+            )
+
+    def test_empty_name_raises(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        import pytest
+        with pytest.raises(ValueError, match="name"):
+            store.create_pending(
+                name="", display_name="X", agent_name="x",
+                parent_workspace=None, inherit_memory=True, creator_id=777,
+            )
+
+    def test_survives_roundtrip(self, tmp_path):
+        path = tmp_path / "collab.json"
+        store = CollabStore(path)
+        store.create_pending(
+            name="nebula", display_name="Nebula",
+            agent_name="nebula", parent_workspace="astro-research",
+            inherit_memory=False, creator_id=777,
+        )
+        reloaded = CollabStore(path)
+        pending = reloaded.list_pending_for_creator(777)
+        assert len(pending) == 1
+        assert pending[0].name == "nebula"
+        assert pending[0].parent_workspace == "astro-research"
+        assert pending[0].inherit_memory is False
+
+
+class TestFinalizeSetup:
+    def test_flips_setup_to_active(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        ws = _make_ws(id="c1", name="c1", agent_name="c1", status="setup")
+        store.add(ws)
+        assert store.finalize_setup(
+            "c1", parent_workspace="astro", inherit_memory=True,
+        ) is True
+        assert ws.status == "active"
+        assert ws.parent_workspace == "astro"
+        assert ws.inherit_memory is True
+
+    def test_rejects_non_setup_status(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        ws = _make_ws(id="c1", name="c1", agent_name="c1", status="active")
+        store.add(ws)
+        assert store.finalize_setup(
+            "c1", parent_workspace=None, inherit_memory=True,
+        ) is False
+        assert ws.status == "active"  # unchanged
+
+    def test_missing_ws_returns_false(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        assert store.finalize_setup(
+            "nonexistent", parent_workspace=None, inherit_memory=True,
+        ) is False
+
+    def test_persists(self, tmp_path):
+        path = tmp_path / "collab.json"
+        store = CollabStore(path)
+        ws = _make_ws(id="c1", name="c1", agent_name="c1", status="setup")
+        store.add(ws)
+        store.finalize_setup(
+            "c1", parent_workspace="astro", inherit_memory=False,
+        )
+        reloaded = CollabStore(path)
+        r = reloaded.get("c1")
+        assert r.status == "active"
+        assert r.parent_workspace == "astro"
+        assert r.inherit_memory is False
+
+
+class TestMigrateChatId:
+    def test_rebinds_active(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        ws = _make_ws(id="c1", name="c1", agent_name="c1",
+                      chat_id=-100111, status="active")
+        store.add(ws)
+        assert store.migrate_chat_id(-100111, -100999) is True
+        assert ws.chat_id == -100999
+        assert ws.status == "active"
+        assert store.get_by_chat_id(-100999) is ws
+        assert store.get_by_chat_id(-100111) is None
+
+    def test_rebinds_setup(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        ws = _make_ws(id="c1", name="c1", agent_name="c1",
+                      chat_id=-100111, status="setup")
+        store.add(ws)
+        assert store.migrate_chat_id(-100111, -100999) is True
+        assert ws.status == "setup"  # unchanged
+
+    def test_rejects_unknown_old_chat(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        assert store.migrate_chat_id(-100000, -100999) is False
+
+    def test_rejects_closed(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        ws = _make_ws(id="c1", name="c1", agent_name="c1",
+                      chat_id=-100111, status="closed")
+        store.add(ws)
+        # closed is not routable so chat_map has no entry → refuse.
+        assert store.migrate_chat_id(-100111, -100999) is False
+
+    def test_rejects_zero_new(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        ws = _make_ws(id="c1", name="c1", agent_name="c1",
+                      chat_id=-100111, status="active")
+        store.add(ws)
+        assert store.migrate_chat_id(-100111, 0) is False
+
+
+class TestListForOrchestrator:
+    def test_excludes_closed(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        a = _make_ws(id="c1", name="a", agent_name="a", status="active")
+        b = _make_ws(id="c2", name="b", agent_name="b",
+                     status="closed", chat_id=-100222)
+        store.add(a)
+        store.add(b)
+        listed = store.list_for_orchestrator()
+        assert {d["name"] for d in listed} == {"a"}
+
+    def test_includes_active_setup_pending(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        a = _make_ws(id="c1", name="a", agent_name="a", status="active")
+        b = _make_ws(id="c2", name="b", agent_name="b",
+                     status="setup", chat_id=-100222)
+        c = _make_ws(id="c3", name="c", agent_name="c",
+                     status="pending", chat_id=0,
+                     expected_creator_id=111)
+        store.add(a)
+        store.add(b)
+        store.add(c)
+        listed = store.list_for_orchestrator()
+        assert {d["name"] for d in listed} == {"a", "b", "c"}
+        statuses = {d["name"]: d["status"] for d in listed}
+        assert statuses == {"a": "active", "b": "setup", "c": "pending"}
+
+    def test_sort_by_created_at_desc(self, tmp_path):
+        store = CollabStore(tmp_path / "collab.json")
+        old = _make_ws(id="c-old", name="old", agent_name="old",
+                       created_at=1000, status="active")
+        new = _make_ws(id="c-new", name="new", agent_name="new",
+                       chat_id=-100222, created_at=2000, status="active")
+        store.add(old)
+        store.add(new)
+        listed = store.list_for_orchestrator()
+        assert [d["name"] for d in listed] == ["new", "old"]
+
+    def test_purpose_falls_back_to_display_name(self, tmp_path):
+        # Agent file missing entirely — purpose should be display_name.
+        store = CollabStore(tmp_path / "collab.json")
+        ws = _make_ws(id="c1", name="nonexistent-agent",
+                      agent_name="nonexistent-agent",
+                      display_name="Fallback Name", status="active")
+        store.add(ws)
+        listed = store.list_for_orchestrator()
+        assert listed[0]["purpose"] == "Fallback Name"
+
+    def test_purpose_reads_first_content_line(self, tmp_path, monkeypatch):
+        import config
+        agents_dir = tmp_path / "agents"
+        agents_dir.mkdir()
+        (agents_dir / "has-purpose.md").write_text(
+            "# Nebula Research\n\nCollaboration on Nebula with Alice and Bob.\n"
+        )
+        monkeypatch.setattr(config, "AGENTS_DIR", agents_dir)
+
+        store = CollabStore(tmp_path / "collab.json")
+        ws = _make_ws(id="c1", name="has-purpose", agent_name="has-purpose",
+                      display_name="Nebula Research", status="active")
+        store.add(ws)
+        listed = store.list_for_orchestrator()
+        assert listed[0]["purpose"] == (
+            "Collaboration on Nebula with Alice and Bob."
+        )

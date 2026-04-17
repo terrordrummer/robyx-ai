@@ -1,0 +1,22 @@
+I've been thinking about this for a while and I want to make sure we capture
+the right set of constraints. The objective is clear — lower the p95 latency
+on the deconvolution benchmark — but the tricky bit is keeping the quality
+metrics within tolerance while we rearrange the hotpath. So the program
+below encodes both: latency as the primary objective, and a hard floor on
+the quality regression as a constraint. I'll also set a checkpoint every
+three steps so we can back out if something goes sideways, and I'll start by
+profiling because we don't yet know which kernel is actually the bottleneck.
+Here is the spec:
+
+[CREATE_CONTINUOUS name="lead" work_dir="/tmp/robyx-test-workspace/lead"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Drive deconvolution p95 below 500 ms.",
+  "success_criteria": ["p95 < 500 ms", "SSIM stays above 0.92"],
+  "constraints": ["no visual quality regression"],
+  "checkpoint_policy": "every 3 steps",
+  "first_step": {"number": 1, "description": "profile the current pipeline"}
+}
+[/CONTINUOUS_PROGRAM]
+
+Let me know if you want to tighten the criteria before we begin.

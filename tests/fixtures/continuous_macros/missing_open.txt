@@ -1,0 +1,9 @@
+Setting up the program block — the opener is still pending.
+
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Orphan program block with no opener.",
+  "success_criteria": ["never gets dispatched"],
+  "first_step": {"number": 1, "description": "n/a"}
+}
+[/CONTINUOUS_PROGRAM]

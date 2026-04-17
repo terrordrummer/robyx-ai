@@ -1,0 +1,8 @@
+[CREATE_CONTINUOUS name="bad-json" work_dir="/tmp/robyx-test-workspace/bad"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Trailing comma makes this invalid JSON.",
+  "success_criteria": ["x",],
+  "first_step": {"number": 1, "description": "x"},
+}
+[/CONTINUOUS_PROGRAM]

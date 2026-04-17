@@ -83,7 +83,9 @@ mechanism itself, answer the question normally.
 Once the user confirms, conduct the setup interview (objective, success
 criteria, constraints, checkpoint policy, first step, context) and emit
 the `[CREATE_CONTINUOUS]` pattern. Refer to the full workspace agent
-documentation for the exact format.
+documentation for the exact format. Use ASCII straight quotes (`"`)
+around the attribute values; curly/typographic quotes are tolerated but
+plain ASCII is preferred.
 
 ## Returning to Robyx
 

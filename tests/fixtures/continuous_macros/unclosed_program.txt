@@ -1,0 +1,9 @@
+Hang on, I forgot to close the block.
+
+[CREATE_CONTINUOUS name="unclosed" work_dir="/tmp/robyx-test-workspace/unclosed"]
+[CONTINUOUS_PROGRAM]
+{
+  "objective": "Payload with no closer.",
+  "success_criteria": ["this should never be parsed"],
+  "first_step": {"number": 1, "description": "nothing"}
+}

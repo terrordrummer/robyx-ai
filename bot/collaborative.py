@@ -1,4 +1,20 @@
-"""Robyx -- Collaborative workspace data model and store."""
+"""Robyx -- Collaborative workspace data model and store.
+
+Logging prefix convention (grep-friendly). Emitted from the handler
+layer in ``bot/handlers.py``; documented here because the state-machine
+lives here:
+
+    collab.announce            -- orchestrator created a pending workspace
+    collab.match               -- bot-added matched a pending workspace (Flow A)
+    collab.setup.bootstrap     -- ad-hoc bot-added started AI setup (Flow B)
+    collab.setup.complete      -- agent emitted [COLLAB_SETUP_COMPLETE]
+    collab.send                -- orchestrator emitted [COLLAB_SEND]
+    collab.notify_hq           -- group agent emitted [NOTIFY_HQ]
+    collab.archive             -- bot removed; workspace closed
+    collab.migrate             -- supergroup migration; chat_id rebound
+    collab.unauthorised        -- non-authorised user tried to provision
+    collab.unsupported_platform-- Discord/Slack add event (not yet supported)
+"""
 
 from __future__ import annotations
 
@@ -307,6 +323,160 @@ class CollabStore:
             and ws.chat_id == 0
             and ws.expected_creator_id == creator_id
         ]
+
+    def create_pending(
+        self,
+        *,
+        name: str,
+        display_name: str,
+        agent_name: str,
+        parent_workspace: str | None,
+        inherit_memory: bool,
+        creator_id: int,
+    ) -> CollabWorkspace:
+        """Persist a pre-announced collaborative workspace.
+
+        Used by the orchestrator's ``[COLLAB_ANNOUNCE ...]`` handler
+        before the external Telegram group exists. The resulting record
+        has ``status="pending"`` and ``chat_id=0``; it is bound to a
+        real chat_id by ``update_chat_id`` when the bot is later added
+        to the matching group.
+
+        Raises ``ValueError`` on: blank ``name``; ``creator_id == 0``;
+        collision with any existing workspace ``name``. The caller is
+        responsible for writing the seed ``data/agents/<name>.md`` file
+        *before* calling this method (matches the ordering convention
+        that closes the "agent registered but file missing" race; see
+        ``bot/handlers.py:1468-1506``).
+        """
+        if not name:
+            raise ValueError("name must not be empty")
+        if creator_id == 0:
+            raise ValueError("creator_id must not be zero")
+        with self._mutex():
+            for existing in self._workspaces.values():
+                if existing.name == name:
+                    raise ValueError("name collision: %s" % name)
+            ws_id = "collab-%s" % name
+            # Uniqueness on id: if someone pre-announced "nebula" before,
+            # then the old one was closed and the name freed, the id would
+            # collide. Append a short suffix to keep ids unique.
+            if ws_id in self._workspaces:
+                import uuid as _uuid
+                ws_id = "%s-%s" % (ws_id, _uuid.uuid4().hex[:6])
+            ws = CollabWorkspace(
+                id=ws_id,
+                name=name,
+                display_name=display_name,
+                agent_name=agent_name,
+                chat_id=0,
+                interaction_mode="intelligent",
+                parent_workspace=parent_workspace,
+                inherit_memory=inherit_memory,
+                status="pending",
+                created_by=creator_id,
+                expected_creator_id=creator_id,
+                roles={str(creator_id): Role.OWNER.value},
+            )
+            self._workspaces[ws.id] = ws
+            self._rebuild_chat_map()
+            self._write_unlocked()
+            return ws
+
+    def finalize_setup(
+        self,
+        ws_id: str,
+        *,
+        parent_workspace: str | None,
+        inherit_memory: bool,
+    ) -> bool:
+        """Promote a ``setup`` workspace to ``active`` after the AI-driven
+        setup conversation emitted ``[COLLAB_SETUP_COMPLETE ...]``.
+
+        Refuses to act unless the workspace is currently ``setup``; other
+        statuses return ``False`` and log a warning. The caller is
+        responsible for rewriting ``data/agents/<name>.md`` *before*
+        calling this (ordering matches ``create_pending``).
+        """
+        with self._mutex():
+            ws = self._workspaces.get(ws_id)
+            if not ws:
+                return False
+            if ws.status != "setup":
+                log.warning(
+                    "Refusing finalize_setup for %s: status=%s (expected 'setup')",
+                    ws_id, ws.status,
+                )
+                return False
+            ws.parent_workspace = parent_workspace
+            ws.inherit_memory = inherit_memory
+            ws.status = "active"
+            self._rebuild_chat_map()
+            self._write_unlocked()
+            return True
+
+    def migrate_chat_id(self, old_chat_id: int, new_chat_id: int) -> bool:
+        """Rebind a workspace from ``old_chat_id`` to ``new_chat_id``
+        without changing status. Used for Telegram supergroup migration.
+
+        Refuses to act unless there is a workspace bound to
+        ``old_chat_id`` in a routable status (active or setup).
+        """
+        if new_chat_id == 0:
+            return False
+        with self._mutex():
+            ws_id = self._chat_map.get(old_chat_id)
+            ws = self._workspaces.get(ws_id) if ws_id else None
+            if not ws:
+                log.warning(
+                    "Refusing migrate_chat_id: no routable workspace at chat_id=%s",
+                    old_chat_id,
+                )
+                return False
+            ws.chat_id = new_chat_id
+            self._rebuild_chat_map()
+            self._write_unlocked()
+            return True
+
+    def list_for_orchestrator(self) -> list[dict]:
+        """Return the live-group registry for injection into the
+        orchestrator's system prompt.
+
+        Excludes closed workspaces; includes active, setup, and pending
+        (chat_id may be 0 for pending). Sorted by ``created_at`` desc.
+        ``purpose`` is a best-effort read of the first non-heading,
+        non-blank line from ``data/agents/<name>.md``; falls back to
+        ``display_name`` when the file is absent or unreadable.
+        """
+        from config import AGENTS_DIR
+        out: list[dict] = []
+        for ws in self._workspaces.values():
+            if ws.status == "closed":
+                continue
+            purpose = ws.display_name
+            agent_file = AGENTS_DIR / ("%s.md" % ws.agent_name)
+            try:
+                if agent_file.exists():
+                    for line in agent_file.read_text().splitlines():
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith("#"):
+                            continue
+                        purpose = stripped
+                        break
+            except OSError:
+                pass
+            out.append({
+                "name": ws.name,
+                "display_name": ws.display_name,
+                "purpose": purpose,
+                "chat_id": ws.chat_id,
+                "status": ws.status,
+            })
+        out.sort(key=lambda d: next(
+            (w.created_at for w in self._workspaces.values() if w.name == d["name"]),
+            0,
+        ), reverse=True)
+        return out
 
     def update_chat_id(
         self,

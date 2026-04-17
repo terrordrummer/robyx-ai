@@ -127,9 +127,17 @@ def _extract_handler_commands() -> set[str]:
     handlers = make_handlers(manager, backend, collab_store=collab_store)
 
     # Drop internal dispatch keys — help_text only describes slash
-    # commands the user types in chat.
-    internal = {"message", "voice", "collab_bot_added", "start", "help"}
-    return {k for k in handlers.keys() if k not in internal}
+    # commands the user types in chat. Keys starting with "_" are
+    # internal helpers exposed for tests (e.g. ``_handle_collab_announce``)
+    # and are never user-facing.
+    internal = {
+        "message", "voice", "collab_bot_added", "collab_bot_removed",
+        "collab_bot_migrated", "start", "help",
+    }
+    return {
+        k for k in handlers.keys()
+        if k not in internal and not k.startswith("_")
+    }
 
 
 class TestHelpParity:
