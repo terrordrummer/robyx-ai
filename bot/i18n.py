@@ -70,6 +70,7 @@ STRINGS = {
     # Voice
     "voice_no_key": "Cannot transcribe voice messages — OpenAI API key is missing.\n\nAdd `OPENAI_API_KEY=sk-...` to `.env` and restart the bot.",
     "voice_error": "Failed to transcribe voice message (error: %s). Please try again shortly.",
+    "voice_too_large": "Voice message is too large to transcribe (%d MB, cap %d MB). Please record a shorter clip.",
     "voice_transcript": "%s",
 
     # Help
