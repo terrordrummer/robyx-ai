@@ -19,6 +19,7 @@ from pathlib import Path
 
 from config import DATA_DIR
 from memory_store import (
+    _validated_db_name_segment,
     get_connection,
     list_archive_topics,
     load_active_snapshot,
@@ -56,11 +57,15 @@ def get_memory_dir(agent_name: str, agent_type: str, work_dir: str) -> Path:
 
     Kept for backward compatibility — callers that need the directory
     (e.g. for memory instructions) still use this.
+
+    Raises ``ValueError`` for specialist ``agent_name`` that would escape
+    the memory directory (same rules as ``resolve_db_path``).
     """
     if agent_type == "orchestrator" or agent_name == "robyx":
         return DATA_DIR / "memory" / "robyx"
     if agent_type == "specialist":
-        return DATA_DIR / "memory" / agent_name
+        safe = _validated_db_name_segment(agent_name)
+        return DATA_DIR / "memory" / safe
     return Path(work_dir) / ".robyx" / "memory"
 
 

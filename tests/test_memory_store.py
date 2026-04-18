@@ -99,6 +99,47 @@ class TestResolveDbPath:
         assert p1 != p2
 
 
+class TestResolveDbPathSafety:
+    """Defense-in-depth: ``resolve_db_path`` must refuse specialist names
+    that could escape the memory directory. Upstream call sites already
+    sanitise, but a tampered state.json or a future call path must not
+    become a path-traversal primitive. Pass 2 P2-84."""
+
+    @pytest.mark.parametrize("bad_name", [
+        "../evil",
+        "..",
+        ".",
+        "sub/dir",
+        "sub\\dir",
+        "",
+        "with\nnewline",
+        "with\x00null",
+    ])
+    def test_rejects_path_traversal_names(self, tmp_path, bad_name):
+        import pytest as _pytest
+        with _pytest.raises(ValueError):
+            resolve_db_path(bad_name, "specialist", "", tmp_path)
+
+    def test_accepts_normal_names(self, tmp_path):
+        # Sanitised forms used by topics._sanitize_task_name must pass.
+        for ok in ("agent-a", "reviewer", "my-proj-123", "robyx"):
+            resolve_db_path(ok, "specialist", "", tmp_path)
+
+    def test_orchestrator_branch_bypasses_validation(self, tmp_path):
+        # The orchestrator branch is hard-coded to ``robyx.db`` — even
+        # weird ``agent_name`` values route there and cannot escape.
+        result = resolve_db_path("../evil", "orchestrator", "", tmp_path)
+        assert result == tmp_path / "memory" / "robyx.db"
+
+    def test_workspace_branch_does_not_use_name_as_path(self, tmp_path):
+        # Workspace DBs live under ``{work_dir}/.robyx/memory.db``;
+        # ``agent_name`` isn't baked into the path so the validator
+        # doesn't fire. Keeps migration v0_21_0 workspace-memory
+        # rehydration compatible with pre-sanitisation agent names.
+        result = resolve_db_path("whatever/weird", "workspace", "/w", tmp_path)
+        assert result == Path("/w/.robyx/memory.db")
+
+
 # ── Active snapshots ──
 
 
@@ -255,6 +296,24 @@ class TestSearchArchive:
     def test_special_characters_handled(self, conn):
         results = search_archive(conn, "agent", "deployment (strategy)")
         assert len(results) > 0
+
+    @pytest.mark.parametrize("hostile_query", [
+        '" OR 1=1 --',                    # SQL-style noise — stripped
+        'deployment" UNION SELECT *',     # SQL-style — stripped
+        'foo AND bar NOT baz NEAR(1)',    # FTS5 operators — stripped to words
+        '../../etc/passwd',               # path-traversal noise — stripped
+        '\x00\x01\x02',                   # control bytes — stripped to empty
+        'foo\\bar',                       # backslash — stripped
+        '`;DROP TABLE entries;--',        # classic — stripped
+    ])
+    def test_hostile_query_does_not_error(self, conn, hostile_query):
+        """P2-85 regression: ``search_archive`` sanitises every user-
+        controlled query via ``re.sub(r"[^\\w\\s*]", "", …)`` + double-
+        quoting each term, so no query string can slip an FTS5 operator
+        or SQL fragment past the parameteriser. These queries must
+        return a list (possibly empty) rather than crash."""
+        results = search_archive(conn, "agent", hostile_query)
+        assert isinstance(results, list)
 
     def test_performance_1000_entries(self, tmp_path):
         """Search across 1000 entries should complete quickly."""
