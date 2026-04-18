@@ -1322,8 +1322,16 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         await platform.send_typing(msg.chat_id, msg.thread_id)
         tmp_path = await platform.download_voice(msg.voice_file_id)
 
-        text, error = await transcribe_voice(tmp_path)
-        os.unlink(tmp_path)
+        try:
+            text, error = await transcribe_voice(tmp_path)
+        finally:
+            # Unlink unconditionally. transcribe_voice catches its own
+            # httpx/OS/Key/Value exceptions, but asyncio cancellation and
+            # any future exception class would otherwise leak the temp.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
         if error or not text:
             await platform.reply(msg_ref, error or STRINGS["ai_empty"])

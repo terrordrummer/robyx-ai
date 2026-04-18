@@ -118,6 +118,64 @@ class TestTranscribeVoice:
         assert error is None
 
     @pytest.mark.asyncio
+    async def test_oversize_file_refused_before_http_call(self, tmp_path, monkeypatch):
+        """P2-83: a file larger than _MAX_TRANSCRIPTION_BYTES must be
+        refused with voice_too_large BEFORE any network call, so we
+        don't burn bandwidth on an API call that will 413 anyway."""
+        # Tighten the cap for the test so we don't have to write 25 MB.
+        monkeypatch.setattr(voice, "_MAX_TRANSCRIPTION_BYTES", 1024)
+
+        big_file = tmp_path / "big.ogg"
+        big_file.write_bytes(b"x" * 4096)  # 4 KB > 1 KB cap
+
+        network_hit = {"n": 0}
+
+        class _FakeClient:
+            async def __aenter__(self):
+                network_hit["n"] += 1
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, *a, **kw):
+                network_hit["n"] += 1
+                raise AssertionError("must not call OpenAI for oversized file")
+
+        with patch("voice.httpx.AsyncClient", _FakeClient):
+            text, error = await voice.transcribe_voice(str(big_file))
+
+        assert text is None
+        assert error is not None
+        assert "too large" in error.lower() or "too big" in error.lower()
+        assert network_hit["n"] == 0, (
+            "oversize files must NEVER reach the network layer"
+        )
+
+    @pytest.mark.asyncio
+    async def test_at_cap_file_is_transcribed(self, tmp_path, mock_httpx_success, monkeypatch):
+        """A file exactly at the cap is accepted (cap is inclusive of
+        the ceiling)."""
+        monkeypatch.setattr(voice, "_MAX_TRANSCRIPTION_BYTES", 1024)
+        at_cap = tmp_path / "ok.ogg"
+        at_cap.write_bytes(b"y" * 1024)  # exactly at cap
+        mock_client, _ = mock_httpx_success
+        with patch("voice.httpx.AsyncClient", return_value=mock_client):
+            text, error = await voice.transcribe_voice(str(at_cap))
+        assert text == "Hello world"
+        assert error is None
+
+    @pytest.mark.asyncio
+    async def test_missing_file_returns_voice_error_not_crash(self, tmp_path):
+        """A path that doesn't exist must return a graceful error
+        (voice_error), never propagate an OSError to the caller."""
+        missing = tmp_path / "nope.ogg"
+        text, error = await voice.transcribe_voice(str(missing))
+        assert text is None
+        assert error is not None
+        assert "%s" not in error, "format spec must be substituted"
+
+    @pytest.mark.asyncio
     async def test_transcribe_correct_api_params(self, audio_file, mock_httpx_success, monkeypatch):
         """Verify the correct API URL, headers, and upload params."""
         monkeypatch.setattr(voice, "OPENAI_API_KEY", "test-openai-key")
@@ -166,7 +224,7 @@ EXPECTED_KEYS = [
     "scheduler_dispatched", "scheduler_skipped", "scheduler_idle",
     "delegation_sent", "delegation_agent_missing", "delegation_result",
     "restart_pending",
-    "voice_no_key", "voice_error", "voice_transcript",
+    "voice_no_key", "voice_error", "voice_too_large", "voice_transcript",
     "help_text",
     "update_available", "update_available_breaking", "update_available_incompatible",
     "update_checking", "update_none", "update_applying", "update_migration",
