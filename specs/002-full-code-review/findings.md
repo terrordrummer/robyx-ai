@@ -79,6 +79,20 @@ Additional dead items identified but kept (legacy fallback): memory.py legacy fu
 | Version | 0.21.0 |
 | Plan-assumption correction | `bot/i18n.py` is **single-locale English**, not IT+EN. Pass 2 plan and conversation contract assumed bilingual — to correct before Phase 12. |
 
+### Baseline refreshed 2026-04-18 (after rebase onto main, 003/004 merged via v0.22.1)
+
+| Metric | Start (2026-04-16) | Refreshed (2026-04-18) | Delta |
+|--------|--------------------|------------------------|-------|
+| Tests (pytest) | 1086 collected | 1451 collected | +365 |
+| LOC under `bot/` | 12 329 | 14 576 | +2 247 |
+| Modules under `bot/` | 53 | 59 | +6 |
+| Migration files | 18 (`v0_20_12` … `v0_21_0`) | 23 (`v0_20_12` … `v0_22_1`) | +5 (`v0_21_1`, `v0_21_2`, `v0_21_3`, `v0_22_0`, `v0_22_1`) |
+| Version | 0.21.0 | 0.22.1 | +0.1.1 |
+| New modules added | — | `bot/continuous_macro.py` (704 LOC), migrations `v0_22_0.py` + `v0_22_1.py`, + 5 new test modules | — |
+| Audit targets modified by 003/004 | — | `bot/bot.py`, `bot/authorization.py`, `bot/messaging/base.py`, `bot/messaging/telegram.py`, `bot/messaging/discord.py`, `bot/messaging/slack.py`, `bot/collaborative.py`, `bot/handlers.py`, `bot/i18n.py`, `bot/ai_invoke.py`, `bot/scheduled_delivery.py` | — |
+
+Close-out gate threshold (T117) correspondingly lifted from ≥ 1086 to ≥ 1451. New SEC task **T079a** added in `tasks.md` for `bot/continuous_macro.py`. **T112** (Pass 1 F17) marked closed — T085 already addressed it.
+
 ## Pass 2 Findings
 
 | ID | Module | Lens | Sev | Description | Fix | Status |
