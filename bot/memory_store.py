@@ -91,6 +91,26 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
 # ── Path resolution ──
 
 
+def _validated_db_name_segment(agent_name: str) -> str:
+    """Reject agent names that would escape their memory directory.
+
+    Upstream call sites (``topics.create_workspace``, ``create_specialist``,
+    collab Flow B bootstrap) already sanitise via ``_sanitize_task_name``.
+    This is defense-in-depth for any future call site or a tampered
+    ``state.json`` — same approach as ``task_runtime.validate_task_name``.
+    """
+    value = str(agent_name or "").strip()
+    if not value:
+        raise ValueError("agent_name is required for memory DB resolution")
+    if any(ch in value for ch in ("\n", "\r", "\t", "\0", "/", "\\")):
+        raise ValueError(
+            "agent_name contains unsupported characters: %r" % agent_name
+        )
+    if value in (".", ".."):
+        raise ValueError("agent_name cannot be '.' or '..'")
+    return value
+
+
 def resolve_db_path(
     agent_name: str,
     agent_type: str,
@@ -102,11 +122,15 @@ def resolve_db_path(
     * orchestrator / robyx  → ``{data_dir}/memory/robyx.db``
     * specialist            → ``{data_dir}/memory/{name}.db``
     * workspace             → ``{work_dir}/.robyx/memory.db``
+
+    Raises ``ValueError`` if ``agent_name`` would escape the memory dir
+    (contains path separators, control chars, or is ``.`` / ``..``).
     """
     if agent_type == "orchestrator" or agent_name == "robyx":
         return data_dir / "memory" / "robyx.db"
     if agent_type == "specialist":
-        return data_dir / "memory" / f"{agent_name}.db"
+        safe = _validated_db_name_segment(agent_name)
+        return data_dir / "memory" / f"{safe}.db"
     return Path(work_dir) / ".robyx" / "memory.db"
 
 
