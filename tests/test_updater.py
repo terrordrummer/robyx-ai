@@ -1339,6 +1339,144 @@ class TestRestoreDataDir:
         ok = updater._restore_data_dir(tmp_path / "nope.tar.gz")
         assert ok is False
 
+    def test_rejects_archive_exceeding_size_cap(self, tmp_path, monkeypatch):
+        """Pass 2 P2-72: _restore_data_dir must refuse a tarball whose
+        cumulative uncompressed member sizes exceed MAX_RESTORE_TOTAL_BYTES
+        (zip-bomb / disk-fill guard). Build a legitimate small snapshot,
+        then drop the cap below its real size so the guard trips."""
+        (updater.DATA_DIR / "state.json").write_text('{"v": 1}')
+        snap = updater._snapshot_data_dir("a", "b")
+        assert snap is not None
+
+        monkeypatch.setattr(updater, "MAX_RESTORE_TOTAL_BYTES", 0)
+        ok = updater._restore_data_dir(snap)
+        assert ok is False
+
+
+class TestScrubbedChildEnv:
+    """Pass 2 P2-71: pip and migration subprocesses must not inherit
+    platform tokens or AI provider keys from the bot's own env."""
+
+    def test_strips_platform_bot_tokens(self, monkeypatch):
+        for key in (
+            "ROBYX_BOT_TOKEN",
+            "KAELOPS_BOT_TOKEN",
+            "DISCORD_BOT_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "SLACK_APP_TOKEN",
+        ):
+            monkeypatch.setenv(key, "secret-" + key)
+        env = updater._scrubbed_child_env()
+        assert "ROBYX_BOT_TOKEN" not in env
+        assert "KAELOPS_BOT_TOKEN" not in env
+        assert "DISCORD_BOT_TOKEN" not in env
+        assert "SLACK_BOT_TOKEN" not in env
+        assert "SLACK_APP_TOKEN" not in env
+
+    def test_strips_ai_provider_keys(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+        env = updater._scrubbed_child_env()
+        assert "OPENAI_API_KEY" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+
+    def test_preserves_unrelated_env(self, monkeypatch):
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("HOME", "/home/robyx")
+        monkeypatch.setenv("PIP_INDEX_URL", "https://pypi.org/simple/")
+        env = updater._scrubbed_child_env()
+        assert env.get("PATH") == "/usr/bin:/bin"
+        assert env.get("HOME") == "/home/robyx"
+        assert env.get("PIP_INDEX_URL") == "https://pypi.org/simple/"
+
+
+class TestApplyUpdateChildEnvHygiene:
+    """Pass 2 P2-71: verify apply_update actually threads the scrubbed env
+    through to pip and to migration-step subprocesses."""
+
+    @pytest.mark.asyncio
+    async def test_pip_install_invoked_with_scrubbed_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ROBYX_BOT_TOKEN", "tg-secret")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-secret")
+        monkeypatch.setenv("PATH", "/usr/bin")
+
+        (tmp_path / "VERSION").write_text("0.1.0\n")
+        (tmp_path / "releases" / "0.2.0.md").write_text(
+            "---\nversion: 0.2.0\nmin_compatible: 0.1.0\n---\n\nbody\n"
+        )
+
+        pip_proc = AsyncMock()
+        pip_proc.communicate = AsyncMock(return_value=(b"", b""))
+        pip_proc.returncode = 0
+
+        captured = {}
+
+        async def _capture_spawn(*args, **kwargs):
+            if args and "pip" in str(args[0]):
+                captured["pip_env"] = kwargs.get("env")
+            return pip_proc
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch("updater.asyncio.create_subprocess_exec", side_effect=_capture_spawn), \
+             patch("updater._snapshot_data_dir", return_value=None), \
+             patch("updater._post_update_smoke_test", new=AsyncMock(return_value=(True, ""))):
+            await updater.apply_update("0.2.0")
+
+        assert "pip_env" in captured, "pip install was not invoked"
+        env = captured["pip_env"]
+        assert env is not None, "pip must receive an explicit env kwarg"
+        assert "ROBYX_BOT_TOKEN" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert env.get("PATH") == "/usr/bin"
+
+    @pytest.mark.asyncio
+    async def test_migration_step_invoked_with_scrubbed_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "dc-secret")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+
+        (tmp_path / "VERSION").write_text("0.1.0\n")
+        (tmp_path / "releases" / "0.2.0.md").write_text(
+            "---\n"
+            "version: 0.2.0\n"
+            "min_compatible: 0.1.0\n"
+            "requires_migration: true\n"
+            "---\n\n"
+            "## Migration\n\n"
+            "1. Run: `echo hello`\n"
+        )
+
+        mig_proc = AsyncMock()
+        mig_proc.communicate = AsyncMock(return_value=(b"ok", b""))
+        mig_proc.returncode = 0
+
+        pip_proc = AsyncMock()
+        pip_proc.communicate = AsyncMock(return_value=(b"", b""))
+        pip_proc.returncode = 0
+
+        captured_envs = []
+
+        async def _capture_spawn(*args, **kwargs):
+            captured_envs.append((args, kwargs.get("env")))
+            if args and "pip" in str(args[0]):
+                return pip_proc
+            return mig_proc
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch("updater.asyncio.create_subprocess_exec", side_effect=_capture_spawn), \
+             patch("updater._snapshot_data_dir", return_value=None), \
+             patch("updater._post_update_smoke_test", new=AsyncMock(return_value=(True, ""))):
+            await updater.apply_update("0.2.0")
+
+        mig_calls = [
+            env for args, env in captured_envs
+            if args and args[0] == "echo"
+        ]
+        assert mig_calls, "migration step was not invoked"
+        env = mig_calls[0]
+        assert env is not None
+        assert "DISCORD_BOT_TOKEN" not in env
+        assert "ANTHROPIC_API_KEY" not in env
+
 
 class TestPostUpdateSmokeTest:
     @pytest.mark.asyncio
