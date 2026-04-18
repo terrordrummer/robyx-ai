@@ -161,6 +161,16 @@ _FENCE_RE = re.compile(
     re.DOTALL,
 )
 
+# Defense-in-depth cap on the ``[CONTINUOUS_PROGRAM]`` payload fed to
+# ``json.loads`` (Pass 2 T079a / P2-73). A prompt-injected or malfunctioning
+# AI could emit a multi-megabyte or deeply-nested JSON bomb that would burn
+# CPU/RAM during parsing before the exception handler recovers. 64 KiB is
+# ~100× larger than any realistic continuous program (a few hundred bytes
+# of name + objective + criteria + schedule) while still bounding worst-case
+# parse cost. Oversized payloads are rejected as ``bad_json`` — same silent
+# failure mode as malformed JSON.
+_MAX_PROGRAM_BYTES = 64 * 1024
+
 
 # ── Pure extraction ─────────────────────────────────────────────────────────
 
@@ -458,8 +468,24 @@ async def apply_continuous_macros(
             continue
 
         # ── 3. JSON parse ──────────────────────────────────────────────
+        program_raw = (tok.program_raw or "").strip()
+        if len(program_raw.encode("utf-8", errors="replace")) > _MAX_PROGRAM_BYTES:
+            outcome = ContinuousMacroOutcome(
+                outcome="rejected",
+                name=tok.name_raw or "?",
+                reason="bad_json",
+                detail="program payload exceeds %d-byte cap" % _MAX_PROGRAM_BYTES,
+            )
+            outcomes.append(outcome)
+            lines.append(strings["continuous_task_error_bad_json"])
+            _log_outcome(ctx, outcome)
+            log.warning(
+                "continuous.macro bad_json reason=oversize bytes=%d cap=%d",
+                len(program_raw), _MAX_PROGRAM_BYTES,
+            )
+            continue
         try:
-            program = json.loads((tok.program_raw or "").strip())
+            program = json.loads(program_raw)
         except (ValueError, TypeError) as exc:
             outcome = ContinuousMacroOutcome(
                 outcome="rejected",

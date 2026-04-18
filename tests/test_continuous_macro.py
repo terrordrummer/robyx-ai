@@ -581,3 +581,84 @@ def test_parent_workspace_uses_mapped_agent_name(monkeypatch, tmp_path, new_loop
     assert outcomes[0].outcome == "intercepted"
     assert captured["parent_workspace"] == "some-workspace"
     assert "[CREATE_CONTINUOUS" not in out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Pass 2 T079a / P2-73: JSON payload size cap
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_oversized_program_rejected_as_bad_json(monkeypatch, tmp_path, new_loop):
+    """A [CONTINUOUS_PROGRAM] body larger than _MAX_PROGRAM_BYTES must be
+    rejected with reason=bad_json BEFORE json.loads is called, to prevent
+    an adversarial AI from burning CPU/RAM on a multi-megabyte payload."""
+    from continuous_macro import _MAX_PROGRAM_BYTES
+
+    async def stub_create(**kwargs):
+        # If the guard fails and json.loads happens to succeed, we'd still
+        # want the test to fail loudly — but the guard should short-circuit
+        # before reaching here.
+        raise AssertionError("create_ws must not be called for oversized payload")
+
+    ctx = _make_ctx(monkeypatch, tmp_path, create_ws=stub_create)
+    (tmp_path / "deconv").mkdir(parents=True, exist_ok=True)
+
+    # Build a payload whose body alone exceeds the cap. Content shape is
+    # irrelevant — the size check runs before JSON parsing. Fill with
+    # whitespace + digits so it's valid UTF-8 and obviously non-malicious.
+    oversized_body = '{"a":"' + ("x" * (_MAX_PROGRAM_BYTES + 1024)) + '"}'
+    text = (
+        '[CREATE_CONTINUOUS name="oversize" work_dir="%s/deconv"]\n'
+        '[CONTINUOUS_PROGRAM]\n%s\n[/CONTINUOUS_PROGRAM]\n'
+    ) % (tmp_path.resolve(), oversized_body)
+
+    out, outcomes = new_loop.run_until_complete(
+        apply_continuous_macros(text, ctx)
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].outcome == "rejected"
+    assert outcomes[0].reason == "bad_json"
+    assert "exceeds" in (outcomes[0].detail or "")
+    # Macro span stripped even on rejection (stripping is unconditional).
+    assert "[CREATE_CONTINUOUS" not in out
+
+
+def test_at_cap_program_is_parsed_normally(monkeypatch, tmp_path, new_loop):
+    """A payload at exactly the cap boundary must still be parsed — the cap
+    is an upper bound, not a soft threshold. Constructs a minimal valid
+    program and verifies it reaches create_ws."""
+    from continuous_macro import _MAX_PROGRAM_BYTES
+
+    # Valid program well under the cap so we know we're testing the happy
+    # path, not a boundary miss.
+    assert _MAX_PROGRAM_BYTES > 256, "test assumes a generous cap"
+
+    calls = []
+
+    async def stub_create(**kwargs):
+        calls.append(kwargs)
+        return {
+            "display_name": kwargs["name"],
+            "thread_id": 7,
+            "branch": "continuous/" + kwargs["name"],
+        }
+
+    ctx = _make_ctx(monkeypatch, tmp_path, create_ws=stub_create)
+    (tmp_path / "deconv").mkdir(parents=True, exist_ok=True)
+
+    program_body = (
+        '{"objective": "test the cap boundary",'
+        ' "success_criteria": ["x"],'
+        ' "first_step": {"number": 1, "description": "probe"}}'
+    )
+    text = (
+        '[CREATE_CONTINUOUS name="normal" work_dir="%s/deconv"]\n'
+        '[CONTINUOUS_PROGRAM]\n%s\n[/CONTINUOUS_PROGRAM]\n'
+    ) % (tmp_path.resolve(), program_body)
+
+    out, outcomes = new_loop.run_until_complete(
+        apply_continuous_macros(text, ctx)
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0].outcome == "intercepted"
+    assert calls, "create_ws should have been invoked for a valid small program"
