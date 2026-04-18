@@ -136,3 +136,41 @@ class TestIsAuthorisedAdder:
         store = CollabStore(tmp_path / "c.json")
         store.add(_make_ws())
         assert is_authorised_adder(222, store, owner_id=None) is True
+
+    def test_closed_workspace_does_not_grant_provisioning(self, tmp_path):
+        # P2-80: trust revoked via workspace closure must not leave
+        # operators with residual provisioning rights.
+        store = CollabStore(tmp_path / "c.json")
+        ws = _make_ws(status="closed")
+        store.add(ws)
+        # Global owner still passes — identity beats workspace state.
+        assert is_authorised_adder(777, store, owner_id=777) is True
+        # Operator of a CLOSED workspace is refused.
+        assert is_authorised_adder(222, store, owner_id=777) is False
+        # Owner of a CLOSED workspace is refused (role-based, not creator).
+        assert is_authorised_adder(111, store, owner_id=777) is False
+
+    def test_setup_workspace_grants_provisioning(self, tmp_path):
+        # Setup-phase workspaces represent in-flight trust; the creator
+        # needs to retain provisioning rights through the setup window.
+        store = CollabStore(tmp_path / "c.json")
+        ws = _make_ws(status="setup")
+        store.add(ws)
+        assert is_authorised_adder(111, store, owner_id=777) is True
+        assert is_authorised_adder(222, store, owner_id=777) is True
+
+    def test_pending_workspace_grants_provisioning(self, tmp_path):
+        # Pending workspaces are pre-announced by the creator and still
+        # awaiting bot-add; the creator must be able to add the bot.
+        store = CollabStore(tmp_path / "c.json")
+        ws = _make_ws(status="pending", chat_id=0)
+        store.add(ws)
+        assert is_authorised_adder(111, store, owner_id=777) is True
+
+    def test_mixed_active_and_closed_uses_active_only(self, tmp_path):
+        # An operator of a closed workspace who also operates an active
+        # one is authorised. The closed one alone would not suffice.
+        store = CollabStore(tmp_path / "c.json")
+        store.add(_make_ws(id="collab-closed", name="closed", chat_id=-1, status="closed"))
+        store.add(_make_ws(id="collab-open", name="open", chat_id=-2, status="active"))
+        assert is_authorised_adder(222, store, owner_id=777) is True
