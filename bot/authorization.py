@@ -81,6 +81,9 @@ def can_manage_roles(role: Role | None) -> bool:
     return role == Role.OWNER
 
 
+_ACTIVE_STATUSES = frozenset({"active", "setup", "pending"})
+
+
 def is_authorised_adder(
     user_id: int | None,
     collab_store: CollabStore,
@@ -91,9 +94,12 @@ def is_authorised_adder(
 
     Used by ``collab_bot_added`` to gate the "bot added to a new Telegram
     group" event. An adder is authorised when they are the bot's global
-    owner OR when they already hold an OWNER/OPERATOR role in any
-    existing collaborative workspace. Everyone else is refused — the
-    handler responds in the group, leaves it, and notifies HQ.
+    owner OR when they already hold an OWNER/OPERATOR role in a
+    non-closed collaborative workspace (``active``, ``setup``, or
+    ``pending``). Closed workspaces do NOT confer provisioning rights:
+    closing a workspace is the operator's explicit trust-revocation
+    signal; operators of closed workspaces must be re-invited to an
+    active one to regain the ability to add the bot elsewhere.
 
     Fails closed: ``user_id is None`` or ``owner_id is None`` with no
     existing ops role → False.
@@ -103,6 +109,8 @@ def is_authorised_adder(
     if owner_id is not None and user_id == owner_id:
         return True
     for ws in collab_store.list_all():
+        if ws.status not in _ACTIVE_STATUSES:
+            continue
         role = ws.get_role(user_id)
         if role in (Role.OWNER, Role.OPERATOR):
             return True
