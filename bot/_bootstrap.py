@@ -55,6 +55,30 @@ _REQUIREMENTS = _BOT_DIR / "requirements.txt"
 _VENV_DIR = _PROJECT_ROOT / ".venv"
 _DATA_DIR = _PROJECT_ROOT / "data"
 
+# Tokens / API keys stripped from the pip subprocess env, same list as
+# bot/updater.py::_CHILD_ENV_SCRUB. Pip doesn't need bot tokens or AI
+# provider keys; a malicious setup.py in a transitive dep (or a
+# PIP_INDEX_URL-redirected proxy) would otherwise have them in its
+# process environment. Pass 2 P2-86 — mirrors P2-71 on the updater.
+_CHILD_ENV_SCRUB = frozenset({
+    # Platform tokens
+    "ROBYX_BOT_TOKEN",
+    "KAELOPS_BOT_TOKEN",  # legacy alias
+    "DISCORD_BOT_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "SLACK_APP_TOKEN",
+    # AI provider keys
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+})
+
+
+def _scrubbed_child_env() -> dict[str, str]:
+    """Return a copy of ``os.environ`` with platform tokens / AI provider
+    keys removed. Used as the ``env=`` argument for the pip subprocess.
+    Stdlib-only — this file runs before third-party imports are safe."""
+    return {k: v for k, v in os.environ.items() if k not in _CHILD_ENV_SCRUB}
+
 
 def _compute_hash(path: Path) -> str:
     return hashlib.sha1(path.read_bytes()).hexdigest()
@@ -166,6 +190,7 @@ def ensure_dependencies() -> None:
         proc = subprocess.run(
             [str(pip), "install", "-r", str(_REQUIREMENTS)],
             cwd=str(_PROJECT_ROOT),
+            env=_scrubbed_child_env(),
             capture_output=True,
             text=True,
             timeout=600,

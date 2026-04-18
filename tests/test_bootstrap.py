@@ -89,6 +89,67 @@ class TestEnsureDependencies:
         marker = venv / ".robyx_deps_hash"
         assert not marker.exists()
 
+    def test_pip_subprocess_gets_scrubbed_env(self, fresh_bootstrap, monkeypatch):
+        """P2-86: pip must run with a scrubbed environment — platform
+        tokens and AI provider keys MUST NOT leak into the pip
+        subprocess, mirroring P2-71 on bot/updater.py. A malicious
+        setup.py in a transitive dep or a PIP_INDEX_URL-redirected
+        proxy would otherwise see our secrets."""
+        bs, root, req, venv = fresh_bootstrap
+        monkeypatch.setenv("ROBYX_BOT_TOKEN", "telegram-secret")
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "discord-secret")
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "slack-secret")
+        monkeypatch.setenv("SLACK_APP_TOKEN", "slack-app-secret")
+        monkeypatch.setenv("KAELOPS_BOT_TOKEN", "legacy-secret")
+        monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-secret")
+        # Operator-set env that MUST pass through unchanged.
+        monkeypatch.setenv("PIP_INDEX_URL", "https://proxy.example/simple")
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
+        monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+
+        with patch("_bootstrap.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            bs.ensure_dependencies()
+
+        mock_run.assert_called_once()
+        env = mock_run.call_args.kwargs.get("env")
+        assert env is not None, "env= must be explicitly passed to pip"
+        # Secrets scrubbed.
+        for key in (
+            "ROBYX_BOT_TOKEN", "DISCORD_BOT_TOKEN", "SLACK_BOT_TOKEN",
+            "SLACK_APP_TOKEN", "KAELOPS_BOT_TOKEN", "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+        ):
+            assert key not in env, (
+                "secret %s must be scrubbed from pip env" % key
+            )
+        # Operator env preserved.
+        assert env.get("PIP_INDEX_URL") == "https://proxy.example/simple"
+        assert env.get("HTTPS_PROXY") == "http://proxy.example:8080"
+        assert "PATH" in env
+
+    def test_scrubbed_env_returns_dict_without_secrets(self, fresh_bootstrap, monkeypatch):
+        """Unit test for the helper itself — documentation of the exact
+        scrub list, independent of the subprocess wiring."""
+        bs, _root, _req, _venv = fresh_bootstrap
+        monkeypatch.setenv("ROBYX_BOT_TOKEN", "x")
+        monkeypatch.setenv("SAFE_VAR", "keep-me")
+
+        env = bs._scrubbed_child_env()
+        assert "ROBYX_BOT_TOKEN" not in env
+        assert env.get("SAFE_VAR") == "keep-me"
+        # Scrub list must match updater.py for consistency.
+        assert bs._CHILD_ENV_SCRUB == frozenset({
+            "ROBYX_BOT_TOKEN",
+            "KAELOPS_BOT_TOKEN",
+            "DISCORD_BOT_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "SLACK_APP_TOKEN",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+        })
+
     def test_timeout_does_not_crash(self, fresh_bootstrap):
         import subprocess as _sp
         bs, root, req, venv = fresh_bootstrap
