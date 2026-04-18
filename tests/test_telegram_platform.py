@@ -306,3 +306,138 @@ class TestPersistentHttpxClient:
         await telegram_platform.aclose()
         assert closed_calls["n"] == 1
         assert telegram_platform._client is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# download_voice size-cap guard (Pass 2 P2-82). Telegram voice messages
+# are capped by the Bot API at 50 MB, but we further bound the adapter's
+# acceptance window to 25 MB so repeated-long-voice DoS cannot fill
+# operator disks. Mirrors Pass 2 P2-11 on discord.py. The cap MUST hold
+# both before download (via ``getFile`` file_size) and after download
+# (defense-in-depth against a server lying between getFile and the
+# download endpoint).
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestDownloadVoiceSizeCap:
+    @pytest.mark.asyncio
+    async def test_oversize_file_rejected_before_download(
+        self, telegram_platform, tmp_path,
+    ):
+        from messaging import telegram as tg_mod
+
+        voice_file = MagicMock()
+        voice_file.file_size = tg_mod._MAX_TELEGRAM_VOICE_BYTES + 1
+        voice_file.download_to_drive = AsyncMock()
+        telegram_platform._bot.get_file = AsyncMock(return_value=voice_file)
+
+        with pytest.raises(ValueError, match="exceeds"):
+            await telegram_platform.download_voice("file-id-huge")
+        voice_file.download_to_drive.assert_not_awaited(), (
+            "declared-oversize must refuse up-front, no bytes on disk"
+        )
+
+    @pytest.mark.asyncio
+    async def test_at_cap_file_is_accepted(
+        self, telegram_platform, tmp_path,
+    ):
+        from messaging import telegram as tg_mod
+
+        downloaded_paths: list[str] = []
+
+        async def _fake_download(path):
+            # Emulate a well-behaved server: write exactly 1 KB.
+            downloaded_paths.append(path)
+            with open(path, "wb") as f:
+                f.write(b"x" * 1024)
+
+        voice_file = MagicMock()
+        voice_file.file_size = tg_mod._MAX_TELEGRAM_VOICE_BYTES  # exactly at cap
+        voice_file.download_to_drive = AsyncMock(side_effect=_fake_download)
+        telegram_platform._bot.get_file = AsyncMock(return_value=voice_file)
+
+        out = await telegram_platform.download_voice("file-id-ok")
+        assert out == downloaded_paths[0]
+        # cleanup
+        try:
+            os_unlink = __import__("os").unlink
+            os_unlink(out)
+        except OSError:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_server_lies_about_size_post_download_cap_catches_it(
+        self, telegram_platform, tmp_path, monkeypatch,
+    ):
+        """getFile claims small; the actual download writes more. The
+        post-download size check must catch it and unlink the temp."""
+        from messaging import telegram as tg_mod
+
+        actual_path: dict[str, str] = {}
+
+        async def _fake_download(path):
+            actual_path["p"] = path
+            with open(path, "wb") as f:
+                f.write(b"y" * (tg_mod._MAX_TELEGRAM_VOICE_BYTES + 1))
+
+        voice_file = MagicMock()
+        voice_file.file_size = 100  # LIE — tiny declared size
+        voice_file.download_to_drive = AsyncMock(side_effect=_fake_download)
+        telegram_platform._bot.get_file = AsyncMock(return_value=voice_file)
+
+        with pytest.raises(ValueError, match="exceeds"):
+            await telegram_platform.download_voice("file-id-liar")
+        # The post-download guard must unlink the oversized temp file.
+        import os as _os
+        assert not _os.path.exists(actual_path["p"]), (
+            "oversized temp file must be unlinked on refusal"
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_file_size_attribute_does_not_crash(
+        self, telegram_platform, tmp_path,
+    ):
+        """Some telegram.File objects may lack ``file_size``. The code
+        must treat that as 'unknown' and fall through to the
+        post-download guard, not AttributeError."""
+
+        async def _fake_download(path):
+            with open(path, "wb") as f:
+                f.write(b"z" * 2048)
+
+        voice_file = MagicMock(spec=[])  # no file_size attribute
+        voice_file.download_to_drive = AsyncMock(side_effect=_fake_download)
+        telegram_platform._bot.get_file = AsyncMock(return_value=voice_file)
+
+        out = await telegram_platform.download_voice("file-id-no-size")
+        import os as _os
+        try:
+            _os.unlink(out)
+        except OSError:
+            pass
+
+    @pytest.mark.asyncio
+    async def test_download_error_cleans_up_tempfile(
+        self, telegram_platform, tmp_path,
+    ):
+        """A download error (network drop, PTB exception) must still
+        unlink the pre-created temp file. No on-disk residue for
+        failed downloads."""
+        created: dict[str, str] = {}
+
+        async def _fake_download(path):
+            created["p"] = path
+            # File exists (tempfile created it), now simulate download fail.
+            raise RuntimeError("transport error")
+
+        voice_file = MagicMock()
+        voice_file.file_size = 1024
+        voice_file.download_to_drive = AsyncMock(side_effect=_fake_download)
+        telegram_platform._bot.get_file = AsyncMock(return_value=voice_file)
+
+        with pytest.raises(RuntimeError, match="transport error"):
+            await telegram_platform.download_voice("file-id-transport-fail")
+        import os as _os
+        assert not _os.path.exists(created["p"]), (
+            "tempfile must be unlinked when download raises"
+        )
