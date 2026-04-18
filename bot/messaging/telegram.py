@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from typing import Any
 
@@ -11,6 +12,12 @@ import httpx
 from messaging.base import Platform, PlatformMessage, retry_send
 
 log = logging.getLogger("robyx.platform.telegram")
+
+# Hard ceiling for voice-message downloads. Telegram's own Bot API cap for
+# voice/audio is 50 MB, but we keep our acceptance window tight to bound
+# disk impact from repeated-long-voice DoS. Mirrors discord.py's
+# `_MAX_DISCORD_DOWNLOAD_BYTES`; see Pass 2 P2-82 / P2-11.
+_MAX_TELEGRAM_VOICE_BYTES = 25 * 1024 * 1024
 
 
 class TelegramPlatform(Platform):
@@ -173,10 +180,45 @@ class TelegramPlatform(Platform):
                     pass
 
     async def download_voice(self, file_id: str) -> str:
+        """Download a Telegram voice file to a local temp path.
+
+        Security:
+        * ``telegram.File.file_size`` (set by the ``getFile`` API response)
+          is checked against ``_MAX_TELEGRAM_VOICE_BYTES`` BEFORE any
+          bytes are read to disk — a declared-oversize file is refused
+          up-front with no download attempt.
+        * The temp file is unlinked on any failure (size refusal or
+          download error) so rejected requests leave no on-disk residue.
+        * After download, the actual file size is verified once more as
+          defense-in-depth against a server lying in ``getFile`` vs the
+          ``download`` endpoint. Mirrors Pass 2 P2-11 on discord.py.
+        """
         voice_file = await self._bot.get_file(file_id)
+        declared = getattr(voice_file, "file_size", None)
+        if declared is not None and declared > _MAX_TELEGRAM_VOICE_BYTES:
+            raise ValueError(
+                "Telegram voice file exceeds %d-byte cap (declared=%d)"
+                % (_MAX_TELEGRAM_VOICE_BYTES, declared)
+            )
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tmp_path = tmp.name
-        await voice_file.download_to_drive(tmp_path)
+        try:
+            await voice_file.download_to_drive(tmp_path)
+            try:
+                actual = os.path.getsize(tmp_path)
+            except OSError:
+                actual = 0
+            if actual > _MAX_TELEGRAM_VOICE_BYTES:
+                raise ValueError(
+                    "Telegram voice file exceeds %d-byte cap (actual=%d)"
+                    % (_MAX_TELEGRAM_VOICE_BYTES, actual)
+                )
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         return tmp_path
 
     async def create_channel(self, name: str) -> int | None:
