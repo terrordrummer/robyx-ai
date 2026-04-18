@@ -64,11 +64,47 @@ def _save_state(state: dict):
     UPDATES_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
 
 
+# ── Child-process env hygiene (Pass 2 T067 / P2-71) ─────────────────
+# pip and migration steps are spawned from updater.apply_update. Neither
+# needs any platform tokens or AI provider keys — scrubbing them closes
+# a hostile-setup.py / malicious-PIP_INDEX_URL class of attacks where a
+# transitive dep could read our secrets from the inherited env. Mirrors
+# the pattern T066 added to bot/ai_invoke.py, with a broader scrub list
+# (pip/migrations don't need AI keys either; the AI CLI does).
+_CHILD_ENV_SCRUB = frozenset({
+    # Platform tokens
+    "ROBYX_BOT_TOKEN",
+    "KAELOPS_BOT_TOKEN",  # legacy alias
+    "DISCORD_BOT_TOKEN",
+    "SLACK_BOT_TOKEN",
+    "SLACK_APP_TOKEN",
+    # AI provider keys (pip doesn't need; author-controlled migrations
+    # shouldn't rely on them either — if one ever must, it can re-read
+    # from a dedicated config)
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+})
+
+
+def _scrubbed_child_env() -> dict[str, str]:
+    """Return a copy of ``os.environ`` with platform tokens / AI provider
+    keys removed. Used as the ``env=`` argument when spawning pip or
+    migration steps during ``apply_update``."""
+    return {k: v for k, v in os.environ.items() if k not in _CHILD_ENV_SCRUB}
+
+
 # ── Pre-update data backup + post-update smoke test ──
 
 BACKUPS_DIR_NAME = "backups"
 SNAPSHOT_RETENTION = 3
 SNAPSHOT_PREFIX = "pre-update-"
+
+# Defense-in-depth cap for the restore path (Pass 2 T067 / P2-72). A
+# hostile or accidentally-massive snapshot would otherwise fill the
+# disk during extraction. 5 GiB covers realistic DATA_DIR sizes
+# (SQLite memory.db + media cache) with generous headroom while still
+# refusing a zip-bomb-style archive.
+MAX_RESTORE_TOTAL_BYTES = 5 * 1024**3
 
 
 def _snapshot_data_dir(from_version: str, to_version: str) -> Path | None:
@@ -151,9 +187,11 @@ def _restore_data_dir(snapshot: Path) -> bool:
     try:
         with tarfile.open(str(snapshot), "r:gz") as tf:
             # Validate members before extraction to avoid half-restoring a
-            # corrupt archive on top of DATA_DIR. Reject absolute paths and
-            # path-traversal attempts; flag suspicious sizes.
+            # corrupt archive on top of DATA_DIR. Reject absolute paths,
+            # path-traversal attempts, and cumulative uncompressed size
+            # above MAX_RESTORE_TOTAL_BYTES (Pass 2 P2-72 zip-bomb guard).
             data_dir_resolved = DATA_DIR.resolve()
+            total_uncompressed = 0
             for member in tf.getmembers():
                 if member.issym() or member.islnk():
                     log.error(
@@ -174,6 +212,13 @@ def _restore_data_dir(snapshot: Path) -> bool:
                     log.error(
                         "Refusing to restore snapshot %s: member %s escapes data dir",
                         snapshot, member.name,
+                    )
+                    return False
+                total_uncompressed += max(member.size, 0)
+                if total_uncompressed > MAX_RESTORE_TOTAL_BYTES:
+                    log.error(
+                        "Refusing to restore snapshot %s: uncompressed size exceeds %d bytes",
+                        snapshot, MAX_RESTORE_TOTAL_BYTES,
                     )
                     return False
             tf.extractall(str(DATA_DIR))
@@ -648,6 +693,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                     proc = await asyncio.create_subprocess_exec(
                         *step.split(),
                         cwd=str(PROJECT_ROOT),
+                        env=_scrubbed_child_env(),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
@@ -690,6 +736,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             str(pip_path),
             "install", "-r", str(PROJECT_ROOT / "bot" / "requirements.txt"),
             cwd=str(PROJECT_ROOT),
+            env=_scrubbed_child_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
