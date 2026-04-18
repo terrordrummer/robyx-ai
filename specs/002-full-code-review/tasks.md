@@ -221,9 +221,11 @@
 - `[P2-UX]`  — Ease of use / discoverability (User Story: Pass 2, Ease of use)
 - `[P2-NI]`  — Natural interaction / tone / i18n (User Story: Pass 2, Natural interaction)
 
-**Baseline at Pass 2 start**: 1086 tests collected, 12 329 LOC under `bot/`, 53 modules, v0.21.0.
+**Baseline at Pass 2 start** (2026-04-16): 1086 tests collected, 12 329 LOC under `bot/`, 53 modules, v0.21.0.
 
-**Close-out gate**: `pytest tests/ -q` ≥ 1086 passing with new regression tests, every `P2-*` finding marked `fixed` or `deferred with rationale`, Pass 1 deferred findings (F12, F13, F14, F17, F20, P1–P5) re-evaluated, release notes drafted.
+**Baseline refreshed 2026-04-18** (after 003 external-group wiring + 004 continuous-macro merged to main via v0.22.1): **1451 tests collected, 14 576 LOC under `bot/`, 59 modules, v0.22.1**. Net additions: +365 tests, +2 247 LOC, +6 modules (incl. new `bot/continuous_macro.py`, migrations `v0_22_0`, `v0_22_1`). Several Pass 2 audit targets were modified in-between — affected tasks carry a `⚠` drift marker below and must read the current file state, not the Pass-2-start state.
+
+**Close-out gate**: `pytest tests/ -q` ≥ 1451 passing with new regression tests, every `P2-*` finding marked `fixed` or `deferred with rationale`, Pass 1 deferred findings (F12, F13, F14, F17, F20, P1–P5) re-evaluated, release notes drafted.
 
 ---
 
@@ -262,15 +264,15 @@
 - [X] T065 [P2-SEC] Security-audit `bot/handlers.py` against `trust-boundaries.md`: auth-before-mutation, AI-controlled path validation, command-injection residuals, secret-in-error-reply; file findings, fix, add tests under `tests/test_handlers.py` — **audit clean**: owner_only correctly applied to every cmd_* and gated before collab bypass in handle_message; WORKSPACE allowlist for continuous task work_dir (Pass 1 S1) + SEND_IMAGE allowlist (Pass 1 S2) still in place; no shell injection primitives in use; `str(e)` echoed to users is all controlled ValueError messages from create_workspace/create_specialist (one marginal case at line 485 for generic `_process_and_send` exceptions, flagged as low-priority hardening — not a verified gap given the AI CLI tools we support don't echo secrets)
 - [X] T066 [P2-SEC] Security-audit `bot/ai_invoke.py`: argv-only subprocess, env scrubbing, timeout enforcement, output size limits, orphan cleanup under SIGKILL; fix findings, add tests under `tests/test_ai_invoke.py` — closed P2-70 (env scrubbing gap): AI CLI subprocess now spawns with `_scrubbed_child_env()` that denylists ROBYX_BOT_TOKEN, KAELOPS_BOT_TOKEN, DISCORD_BOT_TOKEN, SLACK_BOT_TOKEN, SLACK_APP_TOKEN. +7 regression tests. Provider API keys (OPENAI, ANTHROPIC) + basic env (PATH, HOME) preserved
 - [ ] T067 [P2-SEC] Security-audit `bot/updater.py`: re-verify Pass 1 tarball symlink/hardlink rejection, add size caps, validate pip subprocess env, confirm rollback doesn't leave executable permissions wider than before; tests under `tests/test_updater.py`
-- [ ] T068 [P2-SEC] Security-audit `bot/bot.py` startup/shutdown: PID-lock race window, signal handler secret-echo, atexit ordering leaks; tests under `tests/test_bot.py`
+- [ ] T068 [P2-SEC] Security-audit `bot/bot.py` startup/shutdown: PID-lock race window, signal handler secret-echo, atexit ordering leaks; tests under `tests/test_bot.py` — ⚠ file modified by 003/004 since Pass 2 baseline (+93 lines); re-read current state before auditing
 - [ ] T069 [P2-SEC] Security-audit `bot/scheduler.py`: attacker-controllable queue fields, path-traversal in `work_dir`, retry amplification DoS; tests under `tests/test_scheduler.py`
 
 ### Group B — Platform adapters (security lens, parity-aware)
 
-- [ ] T070 [P] [P2-SEC] Security-audit `bot/messaging/telegram.py`: size caps before download, filename path-traversal, token never in error replies, message-length bounds propagated; tests under `tests/test_telegram.py`
+- [ ] T070 [P] [P2-SEC] Security-audit `bot/messaging/telegram.py`: size caps before download, filename path-traversal, token never in error replies, message-length bounds propagated; tests under `tests/test_telegram.py` — ⚠ file modified by 003/004 since Pass 2 baseline (+15 lines); re-read current state before auditing
 - [X] T071 [P] [P2-SEC] Security-audit `bot/messaging/discord.py`: extend Pass 1 domain allow-list from voice to ALL attachment fetches, thread-mutation auth race, token scrubbing; tests under `tests/test_discord.py` — closed P2-11 (unbounded read, 25 MB cap + streaming) and P2-12 (allow-list generalized into `_validate_discord_url`); token scrubbing/thread-auth race deferred as not actionable — no current gap
 - [X] T072 [P] [P2-SEC] Security-audit `bot/messaging/slack.py`: Socket Mode dedup store size bound, `url_private` token scrubbing in error paths, `event_id` replay protection; tests under `tests/test_slack.py` — P2-10 (bearer-token redirect exfiltration, High) fixed in v0.21.0; residual items re-scoped to "no action" after review: dedup is handled inside `slack-bolt` (not our code); `_bot_token` never appears in error/log output
-- [ ] T073 [P] [P2-SEC] Security-audit `bot/messaging/base.py`: confirm ABC contract enforces validation hooks uniformly across adapters; tests under `tests/test_messaging_base.py`
+- [ ] T073 [P] [P2-SEC] Security-audit `bot/messaging/base.py`: confirm ABC contract enforces validation hooks uniformly across adapters; tests under `tests/test_messaging_base.py` — ⚠ file modified by 003/004 since Pass 2 baseline (+13 lines, new lifecycle/announce hooks); re-read current state and confirm new hooks are uniformly implemented in each adapter
 
 ### Group D — Config & support (security lens)
 
@@ -281,8 +283,12 @@
 
 ### Group E — Infrastructure (security lens)
 
-- [ ] T078 [P] [P2-SEC] Security-audit `bot/authorization.py`: every permission check reachable, no bypass via unset field, collaborative auth path; tests under `tests/test_authorization.py`
+- [ ] T078 [P] [P2-SEC] Security-audit `bot/authorization.py`: every permission check reachable, no bypass via unset field, collaborative auth path; tests under `tests/test_authorization.py` — ⚠ file modified by 003/004 since Pass 2 baseline (+28 lines, new external-group auth paths); re-read current state and pay specific attention to the collaborative/external-group permission boundary
 - [ ] T079 [P] [P2-SEC] Security-audit `bot/_bootstrap.py` + `bot/process.py`: import-time side effects, subprocess lifecycle guarantees, zombie reaping; tests under `tests/test_bootstrap.py` and `tests/test_process.py`
+
+### Group C — Agents & tasks (security lens, new scope after 004)
+
+- [ ] T079a [P] [P2-SEC] **Added 2026-04-18 after rebase onto main.** Security-audit NEW module `bot/continuous_macro.py` (introduced by feature 004, 704 LOC): (1) regex-DoS resistance of macro-extraction patterns on adversarial AI output; (2) JSON parse size/depth limits on macro payload; (3) path-traversal and WORKSPACE allow-list enforcement on any `work_dir`/program-path field consumed downstream; (4) schema-field sanitization before handler dispatch; (5) idempotency of parse → reject → quarantine path so malformed macros can't crash the continuous-task loop. Tests under `tests/test_continuous_macro.py` (already 583 lines of fixture-driven coverage; extend with adversarial cases only if a gap is found). Cross-reference `specs/004-fix-continuous-task-macro/contracts/continuous-macro-grammar.md` for the intended grammar invariants.
 
 **Checkpoint P2-SEC**: all listed modules audited; every finding closed or explicitly deferred with rationale; test count increased by at least one per fix.
 
@@ -306,13 +312,13 @@
 - [ ] T084 [P] [P2-STB] Stability-audit `bot/continuous.py`: step boundary atomicity, resume-from-last-committed-step under SIGKILL; tests under `tests/test_continuous.py`
 - [X] T085 [P] [P2-STB] Stability-audit `bot/agents.py` + `bot/task_runtime.py`: atomic `agents.json` write (tmp+rename+fsync), partial-load handling for malformed JSON (Pass 1 F17 deferred — fix now); tests under `tests/test_agents.py` — closed P2-30 (JSON/Unicode corruption now quarantined to `*.corrupt-<UTC>` before falling back to empty state; also closes Pass 1 F17 on `collaborative.py`); tmp+rename+fsync + `task_runtime.py` audit deferred to a later slice
 - [ ] T086 [P] [P2-STB] Stability-audit `bot/scheduled_delivery.py`: silent-delivery policy verified per adapter; tests under `tests/test_scheduled_delivery.py`
-- [ ] T087 [P] [P2-STB] Stability-audit `bot/topics.py` + `bot/collaborative.py`: crash mid-topic-creation, partial workspace state recovery; tests under `tests/test_topics.py` and `tests/test_collaborative.py`
+- [ ] T087 [P] [P2-STB] Stability-audit `bot/topics.py` + `bot/collaborative.py`: crash mid-topic-creation, partial workspace state recovery; tests under `tests/test_topics.py` and `tests/test_collaborative.py` — ⚠ `collaborative.py` modified by 003/004 since Pass 2 baseline (+172 lines, new external-group lifecycle hooks + atomic JSON writes already hardened by T085); re-read current state, extend the audit to cover crash mid-announce and crash mid-setup-complete
 
 ### Group F — Migration framework (stability lens)
 
 - [X] T088 [P] [P2-STB] Stability-audit `bot/migrations/runner.py` + `bot/migrations/tracker.py`: idempotency re-verify (apply twice = no-op), version-advance-only-after-fsync, interrupted-migration recovery; tests under `tests/test_migrations.py` — closed P2-40 (tracker.save now uses tmp + fsync + os.replace); interrupted-migration recovery relies on per-migration idempotency (existing contract, tested per-migration)
 - [ ] T089 [P] [P2-STB] Stability-audit `bot/migrations/base.py` + `bot/migrations/legacy.py`: legacy chain handoff, missing-migration detection; tests under `tests/test_migrations.py`
-- [ ] T090 [P] [P2-STB] Stability-audit latest 5 migration files (`v0_20_25` … `v0_21_0`): each idempotent, each has test covering re-run; tests under `tests/test_migration_v*.py`
+- [ ] T090 [P] [P2-STB] Stability-audit latest 5 migration files (`v0_21_1`, `v0_21_2`, `v0_21_3`, `v0_22_0`, `v0_22_1` — re-scoped 2026-04-18 after rebase; was `v0_20_25 … v0_21_0`): each idempotent, each has test covering re-run; tests under `tests/test_migration_v*.py`
 
 ### Cross-cutting stability infrastructure
 
@@ -328,7 +334,7 @@
 
 **Independent Test**: manual onboarding walkthrough against `quickstart.md` §2 works on Telegram, Discord, Slack using a fresh `data/` dir; `/help` output covers every registered command.
 
-- [ ] T092 [P2-UX] Audit `bot/handlers.py` for every registered command: is it listed in `/help`? Does the error path produce an actionable message? Does a destructive command require confirmation? Fix gaps; tests under `tests/test_handlers.py`
+- [ ] T092 [P2-UX] Audit `bot/handlers.py` for every registered command: is it listed in `/help`? Does the error path produce an actionable message? Does a destructive command require confirmation? Fix gaps; tests under `tests/test_handlers.py` — ⚠ file modified by 003/004 since Pass 2 baseline (+703 lines, new collab/continuous commands); re-check `/help` parity was extended to new commands (T097 parity test should already cover this) and that new destructive commands have confirmation
 - [ ] T093 [P2-UX] Audit `bot/bot.py` startup: missing env vars produce actionable messages (not tracebacks); `.env.example` file is current and complete
 - [ ] T094 [P] [P2-UX] Audit `bot/ai_backend.py`: missing AI CLI binary surfaces as a readable user-visible message via `i18n`, not a Python traceback; tests under `tests/test_ai_backend.py`
 - [ ] T095 [P] [P2-UX] Audit `bot/config.py` + `bot/config_updates.py`: every failure path produces a user-visible error with remediation hint; tests under `tests/test_config.py`
@@ -354,8 +360,8 @@
 
 ### Tone audit per module
 
-- [ ] T102 [P2-NI] Tone-audit `bot/handlers.py` replies: no `Error:` / `Exception:` prefixes, every error has an actionable next step, voice is first-person plural or second-person (per contract §3.1); fix in-place by updating `i18n` keys
-- [ ] T103 [P] [P2-NI] Tone-audit `bot/messaging/telegram.py`, `discord.py`, `slack.py`: replies differ only due to platform capability, never wording; parity test under `tests/test_messaging_parity.py`
+- [ ] T102 [P2-NI] Tone-audit `bot/handlers.py` replies: no `Error:` / `Exception:` prefixes, every error has an actionable next step, voice is first-person plural or second-person (per contract §3.1); fix in-place by updating `i18n` keys — ⚠ file modified by 003/004 (+703 lines of new user-visible strings from collab/continuous features); scope now includes the new `STRINGS` keys added by 003/004 in `bot/i18n.py` (+83 lines)
+- [ ] T103 [P] [P2-NI] Tone-audit `bot/messaging/telegram.py`, `discord.py`, `slack.py`: replies differ only due to platform capability, never wording; parity test under `tests/test_messaging_parity.py` — ⚠ all three adapters modified by 003/004 (new lifecycle/announce/setup-complete hooks); parity must be verified on the new hooks too
 - [ ] T104 [P] [P2-NI] Tone-audit `bot/voice.py` user-facing strings (transcription failure, key-missing, file-too-large)
 - [ ] T105 [P] [P2-NI] Tone-audit `bot/continuous.py` + `bot/scheduled_delivery.py`: silence-policy compliance (per contract §4) — no progress messages unless user requested them
 - [ ] T106 [P] [P2-NI] Tone-audit `bot/updater.py`: pre/post-update messages are conversational, not release-engineer-speak
@@ -376,12 +382,12 @@
 - [ ] T109 Re-evaluate Pass 1 deferred finding F12 (`telegram.py` Markdown behavioral change): decide fix or keep deferred with updated rationale; record under `## Pass 2 Findings`
 - [ ] T110 [P] Re-evaluate Pass 1 F13 (`discord.py download_voice` error handling): fix or re-defer with rationale
 - [ ] T111 [P] Re-evaluate Pass 1 F14 (`slack.py` reply/edit_message error handling): fix or re-defer with rationale
-- [ ] T112 [P] Re-evaluate Pass 1 F17 (`collaborative.py` malformed JSON partial load): likely closed by T085 — confirm and mark
+- [X] T112 [P] Re-evaluate Pass 1 F17 (`collaborative.py` malformed JSON partial load): likely closed by T085 — confirm and mark — **closed 2026-04-18**: T085's completion note explicitly states "also closes Pass 1 F17 on `collaborative.py`" via the shared quarantine-to-`*.corrupt-<UTC>` path; no further action required (finding status in `findings.md` already reflected via P2-30). 003/004 added further `collaborative.py` features but reused the same hardened JSON load path.
 - [ ] T113 [P] Re-evaluate Pass 1 F20 (`voice.py` `%` formatting TypeError): fix or re-defer with rationale
 - [ ] T114 [P] Re-evaluate Pass 1 performance finding P1 (`scheduler.py` redundant `queue.json` read)
 - [ ] T115 [P] Re-evaluate Pass 1 performance finding P2 (`scheduler.py` blocking sync I/O in async) — if stability work in T080 already moved to `asyncio.to_thread`, close here
 - [ ] T116 [P] Re-evaluate Pass 1 performance findings P3, P4, P5: fix or re-defer with updated rationale
-- [ ] T117 Run full `pytest tests/ -q` and confirm count ≥ 1086; diagnose any regression before proceeding
+- [ ] T117 Run full `pytest tests/ -q` and confirm count ≥ 1451 (refreshed baseline 2026-04-18; was ≥ 1086 at Pass 2 start); diagnose any regression before proceeding
 - [ ] T118 Finalize `specs/002-full-code-review/findings.md`: every `P2-NN` row has status `fixed` or `deferred (rationale: ...)`; every Pass 1 deferred row has a Pass 2 status update
 - [ ] T119 Bump `VERSION` (patch bump unless a migration was introduced) and add a migration entry under `bot/migrations/` via `scripts/new_migration.py` only if a schema change was actually made
 - [ ] T120 Create `releases/vX.Y.Z.md` summarizing Pass 2: findings fixed count, deferred-with-rationale count, test-count delta, LOC delta
