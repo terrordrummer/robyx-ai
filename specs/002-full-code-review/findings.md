@@ -135,3 +135,60 @@ Close-out gate threshold (T117) correspondingly lifted from ≥ 1086 to ≥ 1451
 | P2-86 | _bootstrap.py:142 (`ensure_dependencies`) | Security | Med | `ensure_dependencies` spawned `pip install -r bot/requirements.txt` via `subprocess.run([str(pip), "install", "-r", str(_REQUIREMENTS)], ..., capture_output=True, text=True, timeout=600)` without an explicit `env=` argument, so the pip subprocess inherited the full parent environment — including platform tokens (`ROBYX_BOT_TOKEN`, `KAELOPS_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`) and AI provider keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`). Same class as P2-71 (updater.py), but on the **startup** path: the bootstrap pip install fires whenever `bot/requirements.txt` changes between bot restarts. A malicious `setup.py` in a newly-added transitive dep, a compromised wheel that execs during install, or a `PIP_INDEX_URL`-redirected proxy could read those secrets from `os.environ`. | Added module-level `_CHILD_ENV_SCRUB` frozenset (same 7 keys as `bot/updater.py::_CHILD_ENV_SCRUB`: the 5 platform tokens + 2 AI provider keys) and a stdlib-only `_scrubbed_child_env()` helper at the top of `bot/_bootstrap.py`. `ensure_dependencies` now passes `env=_scrubbed_child_env()` to `subprocess.run`. Operator-set env (`PATH`, `HOME`, `PIP_INDEX_URL`, `HTTPS_PROXY`, cert trust vars) passes through unchanged. Keeps the file's stdlib-only constraint intact. +2 regression tests (`test_pip_subprocess_gets_scrubbed_env` verifies each secret key is stripped and operator env survives; `test_scrubbed_env_returns_dict_without_secrets` asserts the scrub list matches `updater.py` verbatim so divergence surfaces as a test failure). | **fixed** |
 | T079 | _bootstrap.py + process.py | Security | — | Pass 2 audit of the startup safety-net (`_bootstrap.py`) and the cross-platform process utility (`process.py`): import-time side effects, subprocess lifecycle guarantees, zombie reaping. | **Audit clean apart from P2-86 (fixed above)**. (1) **Import-time side effects**: both modules are side-effect free at import. `_bootstrap.py` only defines constants + helpers at import; `ensure_dependencies` and `migrate_personal_data_if_needed` are explicitly called from `bot.py`. `process.py` defines a constant tuple and a logger — nothing more. (2) **Subprocess argv safety**: every spawn uses argv lists (no `shell=True`). `process.py` formats `pid` via `%d` / `str(pid)` — `pid` is always an int from internal state (not user-reachable); `_bootstrap.py`'s pip invocation uses `str(pip)` + `str(_REQUIREMENTS)` which are module-derived Path objects. (3) **Timeouts**: `_bootstrap.py` uses a 600 s ceiling on pip; `process.py` uses 5 s on each `ps`/`tasklist` probe. (4) **Zombie reaping**: `subprocess.run` and `asyncio.wait_for(proc.communicate())` both wait for the child and reap — no orphan PIDs. (5) **Exception handling**: every public function in `process.py` catches a broad exception set and returns a safe default (empty string / False). (6) **Env scrub (pip)**: P2-86 fix above. **Low-priority observation (noted, no action)**: `_bootstrap.py` uses `capture_output=True` on pip which buffers the full stdout/stderr in memory before truncating to the last 1 KB at log time; a pathologically verbose wheel install (multi-GB progress bars) could briefly balloon bootstrap memory. Real-world pip output is line-oriented and small; not worth the streaming refactor. | fixed |
 
+---
+
+## Pass 2 SEC-only point-release close-out (2026-04-19)
+
+This Pass 2 cycle ships as a **security-hardening point release** per the
+"MVP First: P2-SEC only" option in `plan.md` → Implementation Strategy.
+P2-SEC and P2-STB/P2-UX/P2-NI overlap on some modules, but the security
+lens is complete and self-contained, so releasing it independently does
+not block the remaining phases.
+
+### Shipped in this release (23 findings closed)
+
+All 23 `P2-NN` rows above carry a final status:
+
+| Category | Count | IDs |
+|----------|:-----:|-----|
+| Security (High) | 2 | P2-10, P2-20 |
+| Security (Med) | 11 | P2-11, P2-50, P2-70, P2-71, P2-80, P2-81, P2-82, P2-83, P2-84, P2-86, + P2-12 |
+| Security (Low) | 3 | P2-72, P2-73, P2-85 (noted / test-guarded) |
+| Stability (Med) | 2 | P2-30, P2-40 |
+| Natural-Interaction (Low) | 4 | P2-00, P2-01, P2-02, P2-03, P2-60 (1 Low parity) |
+
+Every module-level audit row (T065, T067–T070, T073, T076–T079, T079a, T081 partial, T085, T088) is recorded above with either `fixed` / `audit clean` / `noted / test-guarded`.
+
+### Deferred to a future Pass 2 cycle (with rationale)
+
+The following Pass 1 deferred findings and Pass 2 non-SEC tasks are
+explicitly **deferred** to a subsequent cycle. None of them is a
+blocker for the security point release:
+
+| ID / Task | Rationale |
+|-----------|-----------|
+| **F12** (telegram.py Markdown) | Behavioural-change risk; needs a separate opt-in plan and parse-mode audit across callers. Not a security regression. |
+| **F13** (discord.py download_voice error handling) | Error paths are covered by Pass 2 P2-11 (streaming + 25 MB cap); the remaining items are UX polish that belong to P2-UX. |
+| **F14** (slack.py reply/edit error handling) | P2-NI scope (tone + retry_send parity), tracked under T111. |
+| **F20** (voice.py `%` TypeError) | Covered by P2-60 (i18n substitution test now iterates every key with representative arguments). Reopen only if a new format string slips past the parity test. |
+| **All-adapters reply/edit unprotected** | `retry_send` parity is a P2-NI task (T103). |
+| **T080** scheduler monotonic time | Deferred with rationale already recorded at T080 in `tasks.md` — needs its own spec because most scheduler timestamps are legitimately wall-clock. |
+| **T082–T091** (P2-STB remainder) | Stability audit continues the P2-SEC work on the same modules; shipping SEC first lets operators deploy immediately. |
+| **T092–T098** (P2-UX) | User-facing polish; handlers.py gained +703 LOC from 003/004 and needs its own pass. |
+| **T102–T108** (P2-NI tone / templates) | String inventory drift after 003/004 needs a full resweep. |
+| **T109–T116** (Pass 1 re-evaluations + P1-P5 perf) | Covered either by new P2-NN rows above or by the STB/UX/NI deferrals. No action in this release. |
+
+### Test + LOC delta
+
+| Metric | Start (2026-04-16) | This release | Delta |
+|--------|--------------------|--------------|-------|
+| Tests (pytest passing) | 1085 | 1532 | +447 |
+| LOC under `bot/` | 12 329 | ~14 770 | +~2 440 (includes 003/004) |
+| Modules under `bot/` | 53 | 59 | +6 |
+| Version | 0.21.0 | **0.22.2** | +0.1.2 (includes 003/004 at 0.22.0 / 0.22.1) |
+
+### Close-out gate (T117)
+
+`pytest tests/ -q` ≥ 1451 required → **1532 passing**, 1 skipped,
+zero failures. Gate satisfied.
+
