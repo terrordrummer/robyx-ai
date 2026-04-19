@@ -53,6 +53,7 @@ class TestDeliverTaskOutput:
             "name": "nightly-cleanup",
             "description": "Nightly cleanup",
             "thread_id": "903",
+            "type": "continuous",
         }
 
         ok = await deliver_task_output(
@@ -67,7 +68,9 @@ class TestDeliverTaskOutput:
         assert ok is True
         mock_platform.send_to_channel.assert_awaited_once()
         sent_text = mock_platform.send_to_channel.await_args.args[1]
-        assert "Nightly cleanup" in sent_text
+        # Spec 005: delivery layer prefixes every scheduled output with
+        # <icon> [<task-name>]; continuous tasks carry 🔄.
+        assert sent_text.startswith("🔄 [nightly-cleanup]")
         assert "did not produce any visible output" in sent_text
 
     @pytest.mark.asyncio

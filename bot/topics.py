@@ -314,30 +314,39 @@ async def create_continuous_workspace(
     model: str,
     manager: AgentManager,
     platform=None,
+    parent_thread_id=None,
 ) -> dict | None:
-    """Create a continuous task workspace: topic + branch + state + queue entry.
+    """Create a continuous task: git branch + state + plan.md + queue entry.
 
-    The git branch is created in the target project's work_dir (not in Robyx).
-    If git is not available or the repo can't be set up, the task proceeds
-    without versioning.
+    Spec 005 (unified workspace chat): this function no longer creates a
+    dedicated sub-topic. The continuous task reports into the *parent*
+    workspace chat identified by ``parent_thread_id``. The agent is
+    registered with ``thread_id=None`` so the parent workspace's routing
+    is not hijacked (interrupts go through the primary agent's lifecycle
+    macros, not through a dedicated thread).
 
     Returns dict with workspace info or None on failure.
     """
-    from continuous import create_continuous_task, state_file_path
+    from continuous import (
+        create_continuous_task,
+        state_file_path,
+        write_plan_md,
+    )
 
     display_name = _validate_table_safe_display_name(name, "continuous workspace")
     safe_name = _sanitize_task_name(display_name)
     _validate_new_agent_name(safe_name, manager, "continuous workspace")
 
-    branch = "continuous/%s" % safe_name
-
-    # 1. Create channel/topic
-    topic_name = "🔄 %s" % display_name
-    thread_id = await platform.create_channel(topic_name)
-    if not thread_id:
+    if parent_thread_id is None:
+        log.error(
+            "create_continuous_workspace '%s' called without parent_thread_id "
+            "(spec 005 removed the dedicated sub-topic model)", safe_name,
+        )
         return None
 
-    # 2. Set up git branch in the target project's work_dir
+    branch = "continuous/%s" % safe_name
+
+    # 1. Set up git branch in the target project's work_dir
     git_info = await _setup_git_branch(work_dir, branch)
     branch = git_info["branch"]
     versioning = git_info["versioning"]
@@ -346,7 +355,7 @@ async def create_continuous_workspace(
         safe_name, git_info["message"], versioning,
     )
 
-    # 3. Write agent instructions
+    # 2. Write agent instructions
     agent_file = AGENTS_DIR / ("%s.md" % safe_name)
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
     setup_template_path = __import__("pathlib").Path(__file__).parent.parent / "templates" / "CONTINUOUS_SETUP.md"
@@ -357,72 +366,110 @@ async def create_continuous_workspace(
     full_instructions = "# %s (Continuous Task)\n\n%s\n" % (display_name, setup_instructions)
     agent_file.write_text(full_instructions)
 
+    # 3. Persist the per-task plan.md (spec 005). Readable by the primary
+    # agent on demand via [GET_PLAN] and by the secondary step agent in its
+    # prompt context. See contracts/lifecycle-macros.md and data-model.md.
+    plan_md = _render_plan_markdown(display_name, program)
+    plan_path = write_plan_md(safe_name, plan_md)
+
     # 4. Create state file
     state = create_continuous_task(
         name=safe_name,
         parent_workspace=parent_workspace,
         program=program,
-        thread_id=thread_id,
+        thread_id=parent_thread_id,
         branch=branch,
         work_dir=work_dir,
     )
-    # Store versioning info in state for the step agent
     state["versioning"] = versioning
+    # Relative path from repo root for portability across machines (spec 005).
+    from pathlib import Path as _Path
+    repo_root = _Path(__file__).resolve().parents[1]
+    try:
+        state["plan_path"] = str(plan_path.resolve().relative_to(repo_root))
+    except ValueError:
+        state["plan_path"] = str(plan_path)
     from continuous import save_state, state_file_path as _sfp
     save_state(_sfp(safe_name), state)
 
     # 5. Create data directory
     (DATA_DIR / safe_name).mkdir(parents=True, exist_ok=True)
 
-    # 6. Add to unified queue
+    # 6. Add to unified queue (delivery target = parent workspace thread).
     _add_task({
         "name": safe_name,
         "type": "continuous",
         "agent_file": "agents/%s.md" % safe_name,
         "model": model,
-        "thread_id": str(thread_id),
+        "thread_id": str(parent_thread_id),
         "state_file": str(state_file_path(safe_name)),
         "description": "Continuous: %s" % display_name,
     })
 
-    # 7. Register agent
-    agent = manager.add_agent(
+    # 7. Register agent with thread_id=None so it does not displace the
+    # parent workspace agent in the thread→agent routing map.
+    manager.add_agent(
         name=safe_name,
         work_dir=work_dir,
         description="[Continuous] %s" % display_name,
         agent_type="workspace",
         model=model,
-        thread_id=thread_id,
-    )
-
-    # 8. Welcome message
-    versioning_note = ""
-    if versioning == "git-branch":
-        versioning_note = "Working on branch `%s`." % branch
-    elif versioning == "git-init":
-        versioning_note = "Initialized git repo, working on branch `%s`." % branch
-    else:
-        versioning_note = "No git versioning (git not available)."
-
-    await platform.send_to_channel(
-        thread_id,
-        "*🔄 %s* continuous workspace is ready.\n"
-        "Agent *%s* will work autonomously.\n"
-        "%s\n\n"
-        "**Objective:** %s\n\n"
-        "Send a message here to interrupt and interact."
-        % (display_name, safe_name, versioning_note, program.get("objective", "N/A")),
+        thread_id=None,
     )
 
     return {
         "name": safe_name,
         "display_name": display_name,
-        "thread_id": thread_id,
+        "thread_id": parent_thread_id,
         "branch": branch,
         "versioning": versioning,
         "state_file": str(state_file_path(safe_name)),
+        "plan_path": str(plan_path),
         "type": "continuous",
     }
+
+
+def _render_plan_markdown(display_name: str, program: dict) -> str:
+    """Render a continuous-task plan.md body from the program payload.
+
+    The output is the authoritative per-task plan consulted by the primary
+    agent (via [GET_PLAN]) and by the secondary step agent's prompt
+    template. Structure matches ``data-model.md``.
+    """
+    def _section(title: str, body: str) -> str:
+        return "## %s\n%s\n" % (title, body.rstrip() if body else "_n/a_")
+
+    def _bullets(items) -> str:
+        if not items:
+            return "_n/a_"
+        out = []
+        for item in items:
+            out.append("- %s" % str(item).strip())
+        return "\n".join(out)
+
+    objective = program.get("objective") or ""
+    success = program.get("success_criteria") or []
+    constraints = program.get("constraints") or []
+    checkpoint = program.get("checkpoint_policy") or "on-demand"
+    context = program.get("context") or ""
+    first_step = program.get("first_step") or {}
+    first_step_desc = ""
+    if isinstance(first_step, dict):
+        first_step_desc = first_step.get("description") or ""
+    elif isinstance(first_step, str):
+        first_step_desc = first_step
+
+    parts: list[str] = [
+        "# Plan: %s\n" % display_name,
+        _section("Objective", objective),
+        _section("Success criteria", _bullets(success)),
+        _section("Constraints", _bullets(constraints)),
+        _section("Checkpoint policy", checkpoint),
+        _section("First step", first_step_desc or "_n/a_"),
+    ]
+    if context:
+        parts.append(_section("Context", context))
+    return "\n".join(parts).rstrip() + "\n"
 
 
 async def create_specialist(
