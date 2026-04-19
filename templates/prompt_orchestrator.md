@@ -186,6 +186,22 @@ response are allowed. After scheduling,
 briefly confirm to the user what you set up
 ("Ho impostato un reminder per …" / "Reminder set for …").
 
+## Lifecycle Commands (spec 005)
+
+When the user asks about or controls scheduled tasks from HQ in natural
+language, emit one of these macros. The system resolves them against the
+queue scoped to this chat and substitutes them with a rendered response.
+
+- `[LIST_TASKS]` — "lista task", "che task ci sono".
+- `[TASK_STATUS name="<slug>"]` — "stato <slug>".
+- `[STOP_TASK name="<slug>"]` — "ferma <slug>" (terminal).
+- `[PAUSE_TASK name="<slug>"]` — "pausa <slug>" (continuous tasks only).
+- `[RESUME_TASK name="<slug>"]` — "ripristina <slug>".
+- `[GET_PLAN name="<slug>"]` — "dimmi il piano di <slug>".
+
+Ambiguous substrings are resolved by the system with a disambiguation
+prompt — never guess a name on the user's behalf.
+
 ## External Collaborative Groups
 
 External groups are non-HQ chats (today: Telegram groups) where the user

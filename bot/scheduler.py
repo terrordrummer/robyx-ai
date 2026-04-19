@@ -275,6 +275,40 @@ def cancel_tasks_for_agent_file(
 cancel_tasks_for_agent = cancel_tasks_for_agent_file
 
 
+def cancel_task_by_name(name: str, *, reason: str = "stopped by user") -> bool:
+    """Cancel pending/active queue entries whose ``name`` matches exactly.
+
+    Used by the lifecycle-macro handlers (spec 005, US2) to stop a
+    periodic, one-shot, or continuous task by user request. Returns True
+    if at least one entry was canceled. Reminders do not carry a ``name``
+    field so this helper skips them — callers that need reminder
+    cancellation should match by ``id`` via their own flow.
+    """
+    if not name:
+        return False
+
+    canceled = 0
+    canceled_at = datetime.now(timezone.utc).isoformat()
+    with _queue_mutex():
+        entries = _load_queue_unlocked()
+        for entry in entries:
+            if entry.get("name") != name:
+                continue
+            if entry.get("status") in ("canceled", "dispatched", "completed"):
+                continue
+            entry["status"] = "canceled"
+            entry["canceled_at"] = canceled_at
+            entry["canceled_reason"] = reason
+            canceled += 1
+        if canceled:
+            _save_queue_unlocked(entries)
+            log.info(
+                "Canceled %d queue entr%s for name=%r (%s)",
+                canceled, "y" if canceled == 1 else "ies", name, reason,
+            )
+    return canceled > 0
+
+
 # ── Startup cleanup ──────────────────────────────────────────────────────────
 
 
