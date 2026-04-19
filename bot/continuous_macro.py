@@ -568,6 +568,7 @@ async def apply_continuous_macros(
                 model="powerful",
                 manager=ctx.manager,
                 platform=ctx.platform,
+                parent_thread_id=ctx.thread_id,
             )
         except ValueError as exc:
             msg = str(exc)
@@ -696,18 +697,43 @@ def _log_outcome(ctx: ApplyContext, outcome: ContinuousMacroOutcome) -> None:
         )
 
 
-# ── Scheduled-delivery helper ───────────────────────────────────────────────
+# ── User-facing control-token scrub (spec 005) ──────────────────────────────
+
+
+# Canonical ``[STATUS …]`` pattern lives here so every user-facing chokepoint
+# imports the same source of truth. Mirrors ``scheduled_delivery.STATUS_PATTERN``
+# (kept as a compat alias there).
+_STATUS_PATTERN = re.compile(r"\[STATUS\s+(.+?)\]")
+
+
+def strip_control_tokens_for_user(text: str) -> str:
+    """Canonical scrub for any user-visible final output.
+
+    Removes continuous-task macros (``[CREATE_CONTINUOUS …]`` /
+    ``[CONTINUOUS_PROGRAM]…[/CONTINUOUS_PROGRAM]``), ``[STATUS …]`` tokens,
+    and collapses runs of ≥3 newlines to 2. Used at the interactive
+    response chokepoint, scheduled delivery, and any platform-specific
+    renderer (TTS, embed builders) that wants a clean body.
+
+    Pure, idempotent: safe to call twice.
+    """
+    if not text:
+        return ""
+    stripped, _tokens = extract_continuous_macros(text)
+    stripped = _STATUS_PATTERN.sub("", stripped)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+    return stripped
+
+
+# ── Scheduled-delivery helper (legacy; prefer strip_control_tokens_for_user) ─
 
 
 def strip_continuous_macros_for_log(text: str) -> tuple[str, int]:
     """Defense-in-depth stripping for non-interactive paths.
 
-    Scheduled subprocess output may contain a leaked macro. Those paths have
-    no interactive agent context (no ``ApplyContext``), so they MUST NOT
-    dispatch a new continuous task — but they MUST still scrub the tokens
-    so the macro does not reach the chat. Returns ``(stripped_text, count)``
-    where ``count`` is the number of tokens detected (for log-level
-    decisions).
+    Kept for backward compatibility with callers that also want the token
+    count (for log-level decisions). New code should call
+    ``strip_control_tokens_for_user`` instead.
     """
     stripped, tokens = extract_continuous_macros(text)
     if tokens:
@@ -727,4 +753,5 @@ __all__ = [
     "extract_continuous_macros",
     "apply_continuous_macros",
     "strip_continuous_macros_for_log",
+    "strip_control_tokens_for_user",
 ]

@@ -48,7 +48,7 @@ And **four task types**, all handled by a single 60-second scheduler:
 | `interactive` | You talk, it answers | Everyday chat with any agent |
 | `one-shot` | Fire once at a future time | "Deploy tonight at 23:00" |
 | `scheduled` / `periodic` | Runs on a recurring timer | "Every hour check BTC price" |
-| `continuous` | Iterative autonomous work in its own topic, with git branch and state file, until an objective is reached | "Run a research loop training variants until SSIM > 0.98" |
+| `continuous` | Iterative autonomous work with its own git branch, state file, and per-task plan, running step-by-step until an objective is reached | "Run a research loop training variants until SSIM > 0.98" |
 
 ---
 
@@ -60,7 +60,7 @@ The control room is a group chat with topics. Each topic is an agent. You talk, 
 2. **Robyx creates it on the fly.** A new topic appears, Robyx writes the agent's brief from your description, registers it in the scheduler, and spawns it. Zero config files.
 3. **You talk to the new agent in its topic.** It owns the work. Every message is contextually its own. If it needs a cross-functional skill, it asks a specialist via `[REQUEST @name: …]`.
 4. **You can delegate, focus, or jump topics.** `[FOCUS @agent]` routes your next messages straight to it; `[FOCUS off]` returns to Robyx.
-5. **Long-running work gets its own channel.** Ask any workspace for an iterative research or optimization loop and it spins up a **continuous task**: dedicated 🔄 topic, git branch, state file, automatic step-by-step execution. Write in that topic to interrupt — the running step is killed instantly and your message is processed.
+5. **Long-running work stays in the workspace chat.** Ask any workspace for an iterative research or optimization loop and it spins up a **continuous task**: git branch, state file, per-task `plan.md`, automatic step-by-step execution. Every step report comes back here with a `🔄 [<task-name>]` prefix — no separate channel to watch. Talk to the primary workspace agent to list, stop, pause, resume, or ask about the plan of any task.
 6. **Reminders and timers are native.** Any agent can emit `[REMIND in="1h" text="…"]` or `[REMIND at="…" agent="…" text="…"]` to schedule a message or an autonomous run. No code, no external cron.
 7. **Everything survives restarts.** State, queue, continuous task progress, scheduled jobs — all persisted under `data/`. Late-firing on recovery means no event is lost if the bot was offline.
 

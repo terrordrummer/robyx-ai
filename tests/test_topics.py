@@ -1,6 +1,7 @@
 """Tests for bot.topics — channel/topic management via Platform abstraction."""
 
 import json
+from pathlib import Path
 
 import pytest
 from unittest.mock import AsyncMock, patch
@@ -830,3 +831,178 @@ class TestHealDetachedWorkspaces:
     async def test_no_platform_returns_empty_list(self, agent_manager):
         result = await topics.heal_detached_workspaces(agent_manager, platform=None)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# create_continuous_workspace — spec 005 (no sub-topic, parent-chat delivery)
+# ---------------------------------------------------------------------------
+
+
+class TestCreateContinuousWorkspaceSpec005:
+    """US1 acceptance: continuous tasks do NOT open a sub-topic; delivery
+    target is the parent workspace chat's thread; plan.md is persisted.
+    """
+
+    @pytest.fixture
+    def program(self):
+        return {
+            "objective": "Improve docs coverage for the handlers module.",
+            "success_criteria": ["All public helpers documented", "No TODOs remain"],
+            "constraints": ["Do not rewrite existing docstrings"],
+            "checkpoint_policy": "on-demand",
+            "context": "See ROB-123 for background.",
+            "first_step": {
+                "number": 1,
+                "description": "List undocumented public helpers.",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_does_not_create_subtopic(
+        self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
+    ):
+        monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous")
+        work_dir = tmp_path / "project"
+        work_dir.mkdir()
+
+        result = await topics.create_continuous_workspace(
+            name="Docs Hunt",
+            program=program,
+            work_dir=str(work_dir),
+            parent_workspace="ops",
+            model="powerful",
+            manager=agent_manager,
+            platform=mock_platform,
+            parent_thread_id=42,
+        )
+
+        assert result is not None
+        # Core spec 005 assertion: no new sub-topic opened.
+        mock_platform.create_channel.assert_not_awaited()
+        # Delivery target is the parent thread.
+        assert result["thread_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_persists_plan_md(
+        self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
+    ):
+        monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous")
+        work_dir = tmp_path / "project"
+        work_dir.mkdir()
+
+        result = await topics.create_continuous_workspace(
+            name="Docs Hunt",
+            program=program,
+            work_dir=str(work_dir),
+            parent_workspace="ops",
+            model="powerful",
+            manager=agent_manager,
+            platform=mock_platform,
+            parent_thread_id=42,
+        )
+
+        assert result is not None
+        plan_path = Path(result["plan_path"])
+        assert plan_path.exists()
+        content = plan_path.read_text(encoding="utf-8")
+        assert "# Plan: Docs Hunt" in content
+        assert program["objective"] in content
+        assert "All public helpers documented" in content
+        assert "Do not rewrite existing docstrings" in content
+
+    @pytest.mark.asyncio
+    async def test_state_thread_id_is_parent_thread(
+        self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
+    ):
+        monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous")
+        work_dir = tmp_path / "project"
+        work_dir.mkdir()
+
+        await topics.create_continuous_workspace(
+            name="Docs Hunt",
+            program=program,
+            work_dir=str(work_dir),
+            parent_workspace="ops",
+            model="powerful",
+            manager=agent_manager,
+            platform=mock_platform,
+            parent_thread_id=42,
+        )
+
+        state_file = tmp_path / "data" / "continuous" / "docs-hunt" / "state.json"
+        state = json.loads(state_file.read_text())
+        assert state["workspace_thread_id"] == 42
+        assert state["plan_path"].endswith("data/continuous/docs-hunt/plan.md")
+
+    @pytest.mark.asyncio
+    async def test_queue_entry_uses_parent_thread(
+        self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
+    ):
+        monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous")
+        work_dir = tmp_path / "project"
+        work_dir.mkdir()
+
+        await topics.create_continuous_workspace(
+            name="Docs Hunt",
+            program=program,
+            work_dir=str(work_dir),
+            parent_workspace="ops",
+            model="powerful",
+            manager=agent_manager,
+            platform=mock_platform,
+            parent_thread_id=42,
+        )
+
+        queue_file = tmp_path / "data" / "queue.json"
+        queue = json.loads(queue_file.read_text())
+        entries = queue.get("entries") if isinstance(queue, dict) else queue
+        continuous_entries = [e for e in entries if e.get("type") == "continuous"]
+        assert len(continuous_entries) == 1
+        assert continuous_entries[0]["thread_id"] == "42"
+        assert continuous_entries[0]["name"] == "docs-hunt"
+
+    @pytest.mark.asyncio
+    async def test_agent_registered_with_no_thread_id(
+        self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
+    ):
+        monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous")
+        work_dir = tmp_path / "project"
+        work_dir.mkdir()
+
+        await topics.create_continuous_workspace(
+            name="Docs Hunt",
+            program=program,
+            work_dir=str(work_dir),
+            parent_workspace="ops",
+            model="powerful",
+            manager=agent_manager,
+            platform=mock_platform,
+            parent_thread_id=42,
+        )
+
+        # Agent must NOT claim the parent workspace's thread_id in the
+        # routing map — the parent agent owns thread 42.
+        agent = agent_manager.get("docs-hunt")
+        assert agent is not None
+        assert agent.thread_id is None
+
+    @pytest.mark.asyncio
+    async def test_missing_parent_thread_id_returns_none(
+        self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
+    ):
+        monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous")
+        work_dir = tmp_path / "project"
+        work_dir.mkdir()
+
+        result = await topics.create_continuous_workspace(
+            name="Docs Hunt",
+            program=program,
+            work_dir=str(work_dir),
+            parent_workspace="ops",
+            model="powerful",
+            manager=agent_manager,
+            platform=mock_platform,
+            parent_thread_id=None,
+        )
+        assert result is None
+        mock_platform.create_channel.assert_not_awaited()

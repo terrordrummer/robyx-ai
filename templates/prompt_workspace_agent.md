@@ -198,14 +198,44 @@ Once the program is agreed upon, emit:
   quotes are tolerated but plain ASCII is preferred and makes logs readable.
 
 The system will:
-- create a dedicated topic prefixed with `🔄`;
 - create a git branch `continuous/<slug>` in `work_dir`;
 - write the state file at `data/continuous/<slug>/state.json`;
+- write the plan to `data/continuous/<slug>/plan.md` (readable by you via `[GET_PLAN]`);
 - register a `continuous` entry in `data/queue.json`;
 - spawn the first step automatically.
 
-From that moment, **all interaction about the task happens in the 🔄 topic**
-— not here. Tell the user where to continue the conversation.
+All step reports flow back **into this workspace chat** with a `🔄 [<slug>]`
+prefix — the user reads them here, not in a separate channel. Never tell
+the user to "go to the 🔄 topic"; there is no topic.
+
+## Lifecycle Commands (spec 005)
+
+When the user asks about or controls scheduled tasks in natural language,
+emit one of the following macros. The system resolves them against the
+authoritative queue + state scoped to this workspace, and substitutes the
+macro with a rendered markdown response before the user sees it.
+
+- `[LIST_TASKS]` — recognise phrases like "lista task", "che task ci
+  sono", "what tasks are running".
+- `[TASK_STATUS name="<slug>"]` — "stato daily-report", "come va
+  nightly-cleanup".
+- `[STOP_TASK name="<slug>"]` — "ferma daily-report", "stop
+  nightly-cleanup" (terminal: marks completed / cancels pending).
+- `[PAUSE_TASK name="<slug>"]` — "pausa daily-report" (continuous only;
+  other types return a friendly not-supported message).
+- `[RESUME_TASK name="<slug>"]` — "ripristina daily-report", "resume
+  daily-report".
+- `[GET_PLAN name="<slug>"]` — "dimmi il piano di daily-report", "show
+  me the plan for ...".
+
+If the user's phrasing is ambiguous (multiple active tasks match the
+substring), the system handles disambiguation automatically — it will
+render a numbered list and ask which one. Your next turn should re-emit
+the macro with the exact name the user picks. **Never guess** a name on
+the user's behalf.
+
+If no active task matches, the system replies "Nessun task attivo
+chiamato `<query>`" — you do not need to apologise or search further.
 
 ## Scheduling Tasks
 

@@ -553,6 +553,62 @@ def test_strip_for_log_returns_stripped_and_count():
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# spec 005 T011: strip_control_tokens_for_user is the canonical user-facing
+# scrub and MUST remove every leak pathway uniformly.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_strip_control_tokens_removes_macro_and_status():
+    from continuous_macro import strip_control_tokens_for_user
+
+    text = (
+        "Starting the task.\n"
+        '[CREATE_CONTINUOUS name="docs-hunt" work_dir="/tmp/x"]\n'
+        "[CONTINUOUS_PROGRAM]\n{\"objective\": \"stub\"}\n[/CONTINUOUS_PROGRAM]\n"
+        "[STATUS scanning repo]\n"
+        "Done."
+    )
+    out = strip_control_tokens_for_user(text)
+    assert "[CREATE_CONTINUOUS" not in out
+    assert "[CONTINUOUS_PROGRAM" not in out
+    assert "[STATUS" not in out
+    assert "Starting the task." in out
+    assert "Done." in out
+
+
+def test_strip_control_tokens_is_idempotent():
+    from continuous_macro import strip_control_tokens_for_user
+
+    text = 'x [CREATE_CONTINUOUS name="a" work_dir="/tmp"] y'
+    once = strip_control_tokens_for_user(text)
+    twice = strip_control_tokens_for_user(once)
+    assert once == twice
+
+
+def test_strip_control_tokens_handles_empty_and_none():
+    from continuous_macro import strip_control_tokens_for_user
+
+    assert strip_control_tokens_for_user("") == ""
+    assert strip_control_tokens_for_user(None) == ""
+
+
+def test_strip_control_tokens_preserves_clean_text():
+    from continuous_macro import strip_control_tokens_for_user
+
+    text = "Just a normal response with **markdown** and a [link](http://x)."
+    assert strip_control_tokens_for_user(text) == text
+
+
+def test_strip_control_tokens_collapses_newlines():
+    from continuous_macro import strip_control_tokens_for_user
+
+    text = "one\n\n\n\n\ntwo"
+    out = strip_control_tokens_for_user(text)
+    assert "\n\n\n" not in out
+    assert "one" in out and "two" in out
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # Parent-workspace resolution uses the mapped agent's name when available
 # ─────────────────────────────────────────────────────────────────────────
 

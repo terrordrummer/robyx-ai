@@ -96,10 +96,17 @@ Scheduled and one-shot runs post their result back into the target workspace top
 Continuous tasks are iterative, autonomous work programs that run step-by-step
 until an objective is reached or the user intervenes. Each continuous task gets:
 
-- A **dedicated workspace topic** (auto-created, prefixed with 🔄)
 - A **git branch** (`continuous/<name>`)
 - A **state file** (`data/continuous/<name>/state.json`)
+- A **plan file** (`data/continuous/<name>/plan.md`) — the authoritative
+  intent document, readable by the primary agent on demand
 - An entry in `data/queue.json` (type: `continuous`)
+
+Step reports flow back into the **parent workspace chat** with a
+`🔄 [<task-name>]` prefix applied by the delivery layer — there is no
+dedicated sub-topic. The user interacts with the primary workspace
+agent to list / inspect / stop / pause / resume / read the plan of
+any task (see *Lifecycle Commands* below).
 
 ### Creating a Continuous Task
 
