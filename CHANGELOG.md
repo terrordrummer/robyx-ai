@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.23.0
+
+Feature `005-unified-workspace-chat` — **unified workspace chat for
+scheduled and continuous tasks**.
+
+### Changed
+
+- Continuous tasks no longer open a dedicated Telegram / Discord / Slack
+  sub-topic. Every task (continuous, periodic, one-shot, reminder) now
+  reports into the parent workspace chat with a type-specific icon
+  marker (🔄 / ⏰ / 📌 / 🔔) applied by a single delivery-layer chokepoint.
+- Primary workspace agents recognise natural-language lifecycle intents
+  and emit one of six new macros (`[LIST_TASKS]`, `[TASK_STATUS]`,
+  `[STOP_TASK]`, `[PAUSE_TASK]`, `[RESUME_TASK]`, `[GET_PLAN]`); the
+  server resolves them against authoritative queue + state scoped to
+  the invoking workspace. Ambiguous substrings always trigger a
+  disambiguation prompt — never a silent guess.
+- Secondary step agents now inherit the parent workspace's
+  `agents/<name>.md` instructions and a task-specific
+  `data/continuous/<name>/plan.md` so behaviour stays consistent with
+  the primary.
+
+### Fixed
+
+- Closed the `[CREATE_CONTINUOUS …]` / `[CONTINUOUS_PROGRAM]` macro
+  leak on every remaining interactive path by adding a defense-in-depth
+  scrub at `bot/handlers._send_response` via the new canonical
+  `strip_control_tokens_for_user` helper. Continues the spec 004 P1
+  closure.
+
+### Added
+
+- `data/continuous/<name>/plan.md` per-task plan artifact, written at
+  creation time and readable via the `[GET_PLAN]` macro.
+- Idempotent `bot/migrations/v0_23_0.py` repoints every pre-existing
+  continuous task at the parent workspace thread, generates a missing
+  `plan.md`, closes the legacy sub-topic best-effort (with a fallback
+  notice where close is unsupported), and posts a single transition
+  notice per task in the parent workspace chat. Re-runs are safe
+  (per-task `migrated_v0_23_0` marker + process-wide
+  `data/migrations/v0_23_0.done`).
+
+### Tests
+
+- +91 new tests (topics spec-005, lifecycle macros, delivery markers,
+  migration, secondary-agent prompt). Total 1611 / 1 skipped.
+
 ## 0.22.2
 
 Feature `002-full-code-review` — **Pass 2 security hardening** point
