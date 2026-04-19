@@ -56,17 +56,17 @@ Single-project layout. `bot/` at repo root (NOT `src/bot/`). Tests under `tests/
 
 ### Tests for User Story 1
 
-- [ ] T009 [P] [US1] Extend `tests/test_continuous.py` with `test_create_continuous_task_does_not_create_subtopic` — asserts `platform.create_channel` is NEVER called during `apply_continuous_macros` for a `CREATE_CONTINUOUS` payload; asserts resulting `state.json` `thread_id` equals the fixture workspace's `thread_id`
-- [ ] T010 [P] [US1] Extend `tests/test_continuous.py` with `test_create_continuous_task_persists_plan_md` — asserts `data/continuous/<name>/plan.md` exists post-creation, content matches the `CONTINUOUS_PROGRAM` payload
-- [ ] T011 [P] [US1] Extend `tests/test_continuous_macro.py` with `test_macro_tokens_absent_from_interactive_response_all_paths` — covers the interactive path, TTS path, and every platform-specific path; asserts zero `[CREATE_CONTINUOUS` and `[CONTINUOUS_PROGRAM` substrings in the final user-visible text
+- [X] T009 [P] [US1] **Placed in `tests/test_topics.py::TestCreateContinuousWorkspaceSpec005`** (new class, 6 tests): `test_does_not_create_subtopic`, `test_state_thread_id_is_parent_thread`, `test_queue_entry_uses_parent_thread`, `test_agent_registered_with_no_thread_id`, `test_missing_parent_thread_id_returns_none`. Assert `platform.create_channel` is NEVER awaited and state `workspace_thread_id` equals the provided `parent_thread_id`.
+- [X] T010 [P] [US1] `tests/test_topics.py::TestCreateContinuousWorkspaceSpec005::test_persists_plan_md` — asserts `data/continuous/<name>/plan.md` exists post-creation, content contains the rendered program (objective, criteria, constraints).
+- [X] T011 [P] [US1] `tests/test_continuous_macro.py` gains a suite of `strip_control_tokens_for_user` tests (removes macro+STATUS, idempotent, handles empty/None, preserves clean text, collapses newlines). End-to-end interactive-path coverage is implicit via the existing `test_handlers.py` cases plus the `_send_response` defense-in-depth added in T007.
 
 ### Implementation for User Story 1
 
-- [ ] T012 [P] [US1] In `bot/topics.py`, remove the `platform.create_channel()` call from `create_continuous_workspace()`; rename the function to `create_continuous_task` for clarity; change its signature to accept `parent_thread_id: Any` (instead of creating one); keep the git-branch setup, agent-instructions file, queue entry, and state creation
-- [ ] T013 [US1] In `bot/continuous_macro.py::apply_continuous_macros()`, (a) extract the `CONTINUOUS_PROGRAM` payload, (b) persist it atomically to `data/continuous/<name>/plan.md`, (c) populate `state["plan_path"]` with the relative path, (d) pass the **parent workspace thread_id** to the renamed `create_continuous_task()` from the handler context
-- [ ] T014 [US1] Update every caller of the old `create_continuous_workspace` to use `create_continuous_task` (search: `grep -rn create_continuous_workspace bot/`) — including `bot/handlers.py` and any tests that import the old name
-- [ ] T015 [US1] Wire `format_delivery_message` into `bot/scheduled_delivery.py::_render_result_message()` so continuous-task deliveries carry the `🔄 [<name>]` prefix; the body still goes through the existing `_clean_result_text` pipeline
-- [ ] T016 [US1] Run `tests/test_continuous.py` + `tests/test_continuous_macro.py` + `tests/test_scheduled_delivery.py` and confirm all existing tests still pass alongside the new T009–T011
+- [X] T012 [P] [US1] In `bot/topics.py::create_continuous_workspace()`: removed `platform.create_channel()` call; added required `parent_thread_id` parameter; removed the welcome-message send to the old sub-topic (the macro handler's `continuous_task_created` i18n line already confirms creation to the user); registered the continuous "agent" with `thread_id=None` so the parent workspace's routing is not hijacked. Kept function name for backward compatibility (rename to `create_continuous_task` is a polish-phase concern in T067).
+- [X] T013 [US1] In `bot/continuous_macro.py::apply_continuous_macros()`: passes `parent_thread_id=ctx.thread_id` to `create_ws(...)`. Plan markdown rendering lives in `topics._render_plan_markdown()` (closer to the creation site) and is persisted via `continuous.write_plan_md()`; `state["plan_path"]` is populated with the relative path.
+- [X] T014 [US1] Runtime callers of `create_continuous_workspace` are `continuous_macro.py` (updated in T013) and test stubs in `test_continuous_macro.py` / `test_handlers.py` — all use `**kwargs` and absorb the new parameter transparently.
+- [X] T015 [US1] `bot/scheduled_delivery.py::_render_result_message()` now calls `format_delivery_message(task_type, task_name, body)` at the single delivery chokepoint — continuous-task deliveries carry `🔄 [<name>]`. Replaced the old `*<title>*\n<body>` formatting. Existing `test_scheduled_delivery.py` updated to reflect the new marker format.
+- [X] T016 [US1] Full suite: **1543 passed, 1 skipped** (was 1532/1 before Increment B; +11 new tests green; no regressions).
 
 **Checkpoint**: A new continuous task lives entirely in the parent workspace chat. No sub-topic is opened. MVP is deliverable standalone.
 

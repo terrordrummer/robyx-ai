@@ -12,23 +12,37 @@
 
 ## ContinuousTask state.json
 
-### Current shape (from `bot/continuous.py`, pre-0.23.0)
+### Current shape (from `bot/continuous.py::create_continuous_task`, pre-0.23.0)
+
+> **Note**: the authoritative field names come from the running codebase. The
+> delivery target is `workspace_thread_id` (NOT `thread_id`); the program
+> body is a nested `program` dict; step state lives in `next_step` /
+> `current_step` / `history`.
 
 ```jsonc
 {
+  "id": "uuid…",
   "name": "daily-report",
-  "status": "running",                  // pending | running | paused | error | completed
-  "objective": "...",
-  "success_criteria": ["..."],
-  "constraints": ["..."],
-  "first_step": "...",
-  "history": [ /* step objects */ ],
-  "chat_id": 1234567890,
-  "thread_id": 18,                      // TODAY: legacy sub-topic thread id (🔄 <name>)
-  "workspace_name": "ops",              // parent workspace for this task
-  "work_dir": "/abs/path",
+  "status": "running",                  // pending | running | paused | awaiting-input | completed | error | rate-limited
+  "parent_workspace": "ops",
+  "workspace_thread_id": 18,            // TODAY: legacy sub-topic thread id (🔄 <name>)
   "branch": "continuous/daily-report",
-  "created_at": "2026-04-13T09:00:00Z"
+  "work_dir": "/abs/path",
+  "created_at": "2026-04-13T09:00:00Z",
+  "updated_at": "2026-04-13T09:00:00Z",
+  "program": {
+    "objective": "...",
+    "success_criteria": ["..."],
+    "constraints": ["..."],
+    "checkpoint_policy": "on-demand",
+    "context": "..."
+  },
+  "current_step": null,
+  "next_step": { "number": 1, "description": "..." },
+  "history": [ /* step objects */ ],
+  "total_steps_completed": 0,
+  "rate_limited_until": null,
+  "versioning": "git-branch"
 }
 ```
 
@@ -36,32 +50,21 @@
 
 ```jsonc
 {
-  "name": "daily-report",
-  "status": "running",
-  "objective": "...",
-  "success_criteria": ["..."],
-  "constraints": ["..."],
-  "first_step": "...",
-  "history": [ /* step objects */ ],
-  "chat_id": 1234567890,
-  "thread_id": 2,                       // CHANGED: parent workspace thread id
-  "legacy_thread_id": 18,               // NEW: preserves old sub-topic id for audit
-  "workspace_name": "ops",
-  "work_dir": "/abs/path",
-  "branch": "continuous/daily-report",
-  "created_at": "2026-04-13T09:00:00Z",
-  "plan_path": "data/continuous/daily-report/plan.md",   // NEW: relative path from repo root
-  "migrated_v0_23_0": "2026-04-19T14:22:10Z"             // NEW: idempotency marker
+  // all existing fields preserved, plus:
+  "workspace_thread_id": 2,              // CHANGED: now the parent workspace thread
+  "legacy_workspace_thread_id": 18,      // NEW: preserves old sub-topic id for audit
+  "plan_path": "data/continuous/daily-report/plan.md",   // NEW: per-task plan artifact
+  "migrated_v0_23_0": "2026-04-19T14:22:10Z"              // NEW: idempotency marker
 }
 ```
 
 ### Validation rules
 
-- `thread_id` MUST reference an open channel/thread on the target platform. If unresolvable at dispatch time, the scheduler logs an error and SKIPS the step (does NOT delete state).
-- `legacy_thread_id` is read-only after migration.
+- `workspace_thread_id` MUST reference an open channel/thread on the target platform. If unresolvable at dispatch time, the scheduler logs an error and SKIPS the step (does NOT delete state).
+- `legacy_workspace_thread_id` is read-only after migration.
 - `plan_path` MUST be a relative path (anchored at repo root) to ensure portability across machines.
 - `migrated_v0_23_0` is an ISO-8601 UTC timestamp; its presence implies all previous fields are in the post-0.23.0 shape.
-- `status ∈ {pending, running, paused, error, completed}`. `stop` command transitions to `completed` (explicit user stop); `pause` transitions to `paused`; `resume` transitions back to `pending` (next tick picks it up).
+- `status ∈ {pending, running, paused, awaiting-input, completed, error, rate-limited}`. `stop` command transitions to `completed` (explicit user stop); `pause` transitions to `paused`; `resume` uses the existing `resume_task()` helper which clears rate-limit state and transitions back to `pending`.
 
 ### State transitions
 

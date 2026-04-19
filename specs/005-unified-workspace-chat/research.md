@@ -21,7 +21,7 @@
 
 ## R3. Interactive path macro strip parity
 
-**Decision**: The final strip for the primary agent's interactive response happens in `bot/ai_invoke.py` at the point the response text is handed to `handlers.py` for sending. The existing `strip_continuous_macros_for_log()` (from `bot/continuous_macro.py`) is already called on the scheduled path; we introduce `strip_control_tokens_for_user()` as the canonical user-facing scrub, used by (a) interactive path in `ai_invoke.py` and (b) the scheduled path in `scheduled_delivery.py`.
+**Decision** (revised during implementation): The single interactive-send chokepoint is `bot/handlers.py::_send_response` (not `bot/ai_invoke.py` — that module has no single "final-response processor"). We introduce `strip_control_tokens_for_user()` as the canonical user-facing scrub and call it at the top of `_send_response`, on top of the existing `apply_continuous_macros` dispatch earlier in `_process_and_send`. The scheduled path in `bot/scheduled_delivery.py::_clean_result_text` uses the same helper.
 
 **Rationale**: FR-006 requires strip on ALL user-visible paths. Spec 004 P1 observed that the strip was missing on interactive and TTS paths. A single named helper used at both chokepoints closes the gap and makes missing calls easy to spot in code review.
 

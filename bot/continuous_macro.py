@@ -568,6 +568,7 @@ async def apply_continuous_macros(
                 model="powerful",
                 manager=ctx.manager,
                 platform=ctx.platform,
+                parent_thread_id=ctx.thread_id,
             )
         except ValueError as exc:
             msg = str(exc)

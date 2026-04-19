@@ -106,21 +106,26 @@ def _error_excerpt(raw_output: str, max_chars: int = 800) -> str:
 
 def _render_result_message(task: dict, parsed_text: str, returncode: int, raw_output: str) -> str:
     title = task.get("description") or task.get("name") or "Scheduled task"
+    task_type = task.get("type") or "continuous"
+    task_name = task.get("name") or title
     clean = _clean_result_text(parsed_text)
+
     if clean:
-        return "*%s*\n%s" % (title, clean)
+        body = clean
+    elif returncode == 0:
+        body = (
+            "_Task completed, but it did not produce any visible output. "
+            "See logs for details._"
+        )
+    else:
+        body = "_Task failed with exit code %d._" % returncode
+        excerpt = _clean_result_text(_error_excerpt(raw_output))
+        if excerpt:
+            body += "\n\n" + excerpt
 
-    if returncode == 0:
-        return (
-            "*%s*\n"
-            "_Task completed, but it did not produce any visible output. See logs for details._"
-        ) % title
-
-    message = "*%s*\n_Task failed with exit code %d._" % (title, returncode)
-    excerpt = _clean_result_text(_error_excerpt(raw_output))
-    if excerpt:
-        message += "\n\n" + excerpt
-    return message
+    # Spec 005: the delivery layer is the single chokepoint for the
+    # type-specific icon marker. Agents do not format this themselves.
+    return format_delivery_message(task_type, task_name, body)
 
 
 async def deliver_task_output(
