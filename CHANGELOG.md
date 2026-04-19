@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.22.2
+
+Feature `002-full-code-review` — **Pass 2 security hardening** point
+release. SEC-only slice of the full Pass 2 review; P2-STB / P2-UX /
+P2-NI remainders carry over to a subsequent cycle.
+
+22 of 23 P2-NN findings closed (1 noted/test-guarded). No schema
+change. Upgrade is drop-in.
+
+### Security — Fixed
+
+- **P2-80** — `is_authorised_adder` now scopes to non-closed
+  workspaces. Closing a collaborative workspace via `/close` genuinely
+  revokes the operator's provisioning rights; previously an operator
+  of a closed workspace kept the ability to drag the bot into new
+  Telegram groups (`bot/authorization.py`).
+- **P2-81** — AI-emitted `[COLLAB_ANNOUNCE name="…"]` attributes are
+  validated by the new `validate_collab_name(name)` helper before any
+  agent-file write. Prevents a prompt-injection path where a crafted
+  `name` containing `../` would write AI-controllable markdown
+  outside `AGENTS_DIR`. Wired into both `_handle_collab_announce` and
+  `CollabStore.create_pending` (`bot/collaborative.py`,
+  `bot/handlers.py`).
+- **P2-82** — `TelegramPlatform.download_voice` enforces a 25 MB
+  `_MAX_TELEGRAM_VOICE_BYTES` ceiling via a pre-download check on
+  `voice_file.file_size` plus a post-download byte-count re-check; the
+  temp file is unlinked on every failure path. Mirrors the 25 MB cap
+  already in place on the Discord adapter (`bot/messaging/telegram.py`).
+- **P2-83** — `voice.transcribe_voice` refuses audio larger than 25 MB
+  up-front (matches OpenAI Whisper's own cap) via a new
+  `voice_too_large` i18n string, so oversize input never hits the
+  network. The caller in `bot/handlers.py` now wraps the transcribe
+  call in `try/finally` so the `.ogg` tempfile is unlinked on every
+  exit path including `asyncio.CancelledError` (`bot/voice.py`,
+  `bot/handlers.py`, `bot/i18n.py`).
+- **P2-84** — `resolve_db_path` and `get_memory_dir` reject specialist
+  `agent_name` values containing path separators (`/`, `\`), control
+  characters, or the `.` / `..` segments. Upstream call sites already
+  sanitise via `_sanitize_task_name`, so this is a defense-in-depth
+  guard for future call sites and the migration-from-state.json path
+  (`bot/memory_store.py`, `bot/memory.py`).
+- **P2-86** — `_bootstrap.ensure_dependencies` spawns pip with an
+  explicit `env=_scrubbed_child_env()`. Platform tokens
+  (`ROBYX_BOT_TOKEN`, `KAELOPS_BOT_TOKEN`, `DISCORD_BOT_TOKEN`,
+  `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`) and AI provider keys
+  (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`) are stripped from the pip
+  subprocess environment — a malicious `setup.py` in a transitive dep
+  or a `PIP_INDEX_URL`-redirected proxy can no longer read bot
+  secrets. Scrub list matches `bot/updater.py::_CHILD_ENV_SCRUB`
+  verbatim (startup-path analogue of 0.22.0's P2-71) (`bot/_bootstrap.py`).
+
+### Audit closures (no code change)
+
+- **T068** — `bot/bot.py` startup/shutdown audit clean against the
+  003/004 drift; P2-20 lock fix already in place.
+- **T069** — `bot/scheduler.py` queue validation, `work_dir`
+  path-traversal, retry amplification DoS: audit clean.
+- **T073** — `bot/messaging/base.py` ABC contract uniformity across
+  the three adapters after 003/004 added `leave_chat`,
+  `get_invite_link`, `bot_username`, `rename_main_channel`.
+- **T079** — `bot/_bootstrap.py` + `bot/process.py`: side-effect free
+  at import, every subprocess uses argv lists with timeouts, zombies
+  reaped.
+
+### Added
+
+- `voice_too_large` — i18n string surfaced when a voice message
+  exceeds the 25 MB transcription cap.
+- `validate_collab_name(name)` — shared workspace-name validator in
+  `bot/collaborative.py` enforcing `^[a-z0-9][a-z0-9-]{0,63}$`.
+- `_scrubbed_child_env()` / `_CHILD_ENV_SCRUB` — stdlib-only
+  environment scrub helper in `bot/_bootstrap.py` that mirrors the
+  updater's scrub list.
+- `_validated_db_name_segment()` — defense-in-depth path-traversal
+  guard in `bot/memory_store.py`.
+
+### Deferred to a future Pass 2 cycle
+
+- **P2-STB**: T082–T084, T086, T087, T089–T091.
+- **P2-UX**: T092–T096, T098.
+- **P2-NI**: T102–T108.
+- **Pass 1 re-evaluations**: T109, T110, T111, T113, T114, T115, T116.
+
+Rationale for every deferred item is recorded in
+`specs/002-full-code-review/findings.md` under "Pass 2 SEC-only
+point-release close-out".
+
+### Tests
+
+`pytest tests/ -q` → **1532 passed**, 1 skipped, 0 failed (was 1451
+at the Pass 2 refreshed baseline; +81 after this release). No
+migration required.
+
 ## 0.22.1
 
 Feature `004-fix-continuous-task-macro` — close the continuous-task macro
