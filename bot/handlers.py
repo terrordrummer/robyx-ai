@@ -40,7 +40,11 @@ from ai_invoke import (
     parse_remind_when,
     split_message,
 )
-from continuous_macro import ApplyContext, apply_continuous_macros
+from continuous_macro import (
+    ApplyContext,
+    apply_continuous_macros,
+    strip_control_tokens_for_user,
+)
 
 
 _EXECUTIVE_MARKERS = (
@@ -1304,6 +1308,13 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             tag = "*%s* [specialist]" % agent.name
         else:
             tag = "*%s*" % agent.name
+
+        # Defense-in-depth final-output scrub (spec 005 T007): every
+        # interactive send passes through this single chokepoint, so even
+        # if a future code path bypasses apply_continuous_macros the raw
+        # [CREATE_CONTINUOUS …] / [CONTINUOUS_PROGRAM] / [STATUS …] tokens
+        # cannot reach the user. Idempotent with upstream stripping.
+        response = strip_control_tokens_for_user(response)
 
         if not response or not response.strip():
             log.warning("Empty response from [%s] after stripping patterns", agent.name)
