@@ -681,11 +681,21 @@ async def _dispatch_reminders(
             })
             continue
 
+        # Spec 005: prefix reminders with the 🔔 marker via the single
+        # delivery-layer chokepoint. Reminders today carry no per-item
+        # "name" field — fall back to a friendly label so the marker
+        # remains readable without exposing internal UUIDs.
+        from scheduled_delivery import format_delivery_message
+        reminder_label = reminder.get("name") or "promemoria"
+        marked_text = format_delivery_message(
+            "reminder", reminder_label, reminder["message"],
+        )
+
         try:
             sent = await asyncio.wait_for(
                 platform.send_message(
                     chat_id=chat_id,
-                    text=reminder["message"],
+                    text=marked_text,
                     thread_id=reminder["thread_id"],
                     parse_mode="markdown",
                 ),

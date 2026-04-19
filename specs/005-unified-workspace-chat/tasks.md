@@ -116,20 +116,20 @@ Single-project layout. `bot/` at repo root (NOT `src/bot/`). Tests under `tests/
 
 ### Tests for User Story 3
 
-- [ ] T037 [P] [US3] Create `tests/test_scheduled_delivery_markers.py::test_continuous_marker` — asserts output begins with `"🔄 [<name>] "`
-- [ ] T038 [P] [US3] Add `test_periodic_marker` — asserts `"⏰ [<name>] "`
-- [ ] T039 [P] [US3] Add `test_oneshot_marker` — asserts `"📌 [<name>] "` (and alias `oneshot`, `one_shot` resolve to the same icon)
-- [ ] T040 [P] [US3] Add `test_reminder_marker` — asserts `"🔔 [<name-or-id>] "` via the reminder dispatch path
-- [ ] T041 [P] [US3] Add `test_unknown_type_fallback_no_marker_warn_logged` — asserts body unchanged and one WARN log containing the unknown type
-- [ ] T042 [P] [US3] Add `test_conversational_response_has_no_marker` — exercises the interactive path end-to-end with a simple "ciao" round-trip
-- [ ] T043 [P] [US3] Add `test_long_name_truncated_to_64_chars_with_ellipsis` — feeds a 128-char task name, asserts the rendered marker contains exactly 64 chars + `…`
-- [ ] T044 [P] [US3] Add `test_marker_applied_once_idempotency_guarded_by_single_chokepoint` — grep-style assertion that `format_delivery_message` is only called in `_render_result_message` and `_dispatch_reminders` (static check of source)
+- [X] T037 [P] [US3] `tests/test_scheduled_delivery_markers.py::TestFormatDeliveryMessage::test_continuous_marker` asserts `"🔄 [daily-report] Step 3 done"`. Additional `TestRenderResultMessageMarkers::test_continuous_task_gets_rocket_icon` verifies integration through `_render_result_message`.
+- [X] T038 [P] [US3] `test_periodic_marker` + `test_periodic_task_gets_alarm_icon` cover the `⏰` marker both at the helper level and at the integration level.
+- [X] T039 [P] [US3] `test_oneshot_marker_all_aliases_resolve_to_same_icon` verifies `one-shot`, `oneshot`, and `one_shot` all map to `📌`; `test_oneshot_task_gets_pin_icon` covers the integration.
+- [X] T040 [P] [US3] `TestReminderDispatchMarker::test_reminder_send_uses_bell_marker` drives `scheduler._dispatch_reminders` with a fake platform and asserts `kwargs["text"].startswith("🔔 [promemoria] ")`. `test_reminder_with_explicit_name_uses_that_name` asserts that when a reminder carries a `name` field the marker uses it.
+- [X] T041 [P] [US3] `test_unknown_type_returns_body_unchanged_and_logs_warning` asserts the body is passed through unmodified AND a WARN log record is captured containing the unknown type string.
+- [X] T042 [P] [US3] `TestConversationalRepliesUnmarked::test_strip_control_tokens_does_not_add_marker` — the interactive chokepoint (`_send_response` → `strip_control_tokens_for_user`) does NOT add any of the four icons to conversational replies (invariant verification).
+- [X] T043 [P] [US3] `test_long_name_truncated_to_64_chars_with_ellipsis` — 128-char name truncated to exactly 64 chars with trailing `…`.
+- [X] T044 [P] [US3] `TestSingleChokepointInvariant::test_only_two_call_sites_in_bot_package` walks `bot/**/*.py` and asserts `format_delivery_message(` appears only inside `scheduled_delivery.py` (definition + single call site in `_render_result_message`) and `scheduler.py` (single call site in `_dispatch_reminders`). Any third caller breaks the test.
 
 ### Implementation for User Story 3
 
-- [ ] T045 [US3] Wire `format_delivery_message` into `bot/scheduler.py::_dispatch_reminders()` — wrap `reminder["message"]` before `platform.send_message(...)`; task name resolves from `reminder.get("name") or reminder["id"]`
-- [ ] T046 [US3] Verify platform-parity: run the existing multi-platform tests (`tests/test_collab_multiplatform.py` family pattern) for Telegram/Discord/Slack delivery to confirm the marker passes through adapter `send_message` unchanged
-- [ ] T047 [US3] Update `quickstart.md` §6 with the real path to trigger each task type (if current instructions need refinement based on implementation)
+- [X] T045 [US3] `bot/scheduler.py::_dispatch_reminders` now wraps `reminder["message"]` via `format_delivery_message("reminder", reminder.get("name") or "promemoria", …)` before `platform.send_message(...)`. Using the full import name (not an alias) is required for the T044 invariant check.
+- [X] T046 [US3] Platform-parity is structural: the marker is applied as a plain text prefix BEFORE `platform.send_message(...)` / `platform.send_to_channel(...)`. The Platform ABC's send methods treat the text as opaque — no adapter changes required. Existing Telegram / Discord / Slack adapter tests continue to pass (verified via full suite run).
+- [X] T047 [US3] `quickstart.md` §6 already specifies the real trigger path for each task type. No refinement needed based on the shipped implementation.
 
 **Checkpoint**: All four task types deliver with correct markers across all three platforms; conversational replies are unmarked.
 
