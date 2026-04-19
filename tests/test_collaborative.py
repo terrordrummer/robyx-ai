@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bot"))
 
-from collaborative import CollabStore, CollabWorkspace, Role
+from collaborative import CollabStore, CollabWorkspace, Role, validate_collab_name
 
 
 def _make_ws(**overrides):
@@ -22,6 +22,49 @@ def _make_ws(**overrides):
     }
     defaults.update(overrides)
     return CollabWorkspace(**defaults)
+
+
+class TestValidateCollabName:
+    """P2-81 / T078a unit tests for the workspace-name validator."""
+
+    import pytest as _pytest
+
+    @_pytest.mark.parametrize("good", [
+        "nebula",
+        "astro-research",
+        "collab-42",
+        "a",  # single char lower bound
+        "a" * 64,  # at the 64-char ceiling
+        "x9-y-z",
+    ])
+    def test_accepts_valid_names(self, good):
+        assert validate_collab_name(good) == good
+
+    @_pytest.mark.parametrize("bad", [
+        "",
+        " ",  # whitespace only
+        "..",
+        ".",
+        "../evil",
+        "../../etc/passwd",
+        "/absolute",
+        "sub/dir",
+        "sub\\dir",
+        "UPPERCASE",
+        "MixedCase",
+        "with space",
+        "with.dot",
+        "with_underscore",
+        "-leading-hyphen",
+        "a" * 65,  # one over the ceiling
+        "has\nnewline",
+        "has\ttab",
+        "has\x00null",
+    ])
+    def test_rejects_invalid_names(self, bad):
+        import pytest
+        with pytest.raises(ValueError, match="invalid collaborative workspace name"):
+            validate_collab_name(bad)
 
 
 class TestCollabWorkspace:
@@ -315,11 +358,24 @@ class TestCreatePending:
     def test_empty_name_raises(self, tmp_path):
         store = CollabStore(tmp_path / "collab.json")
         import pytest
-        with pytest.raises(ValueError, match="name"):
+        with pytest.raises(ValueError, match="invalid collaborative workspace name"):
             store.create_pending(
                 name="", display_name="X", agent_name="x",
                 parent_workspace=None, inherit_memory=True, creator_id=777,
             )
+
+    def test_path_traversal_name_raises(self, tmp_path):
+        """P2-81 defense-in-depth: create_pending must reject names that
+        escape AGENTS_DIR, in case a future caller bypasses the handler-
+        layer validation."""
+        store = CollabStore(tmp_path / "collab.json")
+        import pytest
+        for bad in ("../evil", "sub/dir", "UPPER", ".", "..", "with space"):
+            with pytest.raises(ValueError, match="invalid collaborative workspace name"):
+                store.create_pending(
+                    name=bad, display_name="X", agent_name="x",
+                    parent_workspace=None, inherit_memory=True, creator_id=777,
+                )
 
     def test_survives_roundtrip(self, tmp_path):
         path = tmp_path / "collab.json"
