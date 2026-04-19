@@ -301,6 +301,8 @@
 
 **Independent Test**: a stability test harness (see T085) exercises each scenario; all pass.
 
+> **v0.22.2 deferral (2026-04-19)**: This release ships as a P2-SEC-only point release (Implementation Strategy "MVP First" in `plan.md`). Remaining P2-STB tasks below are deferred-with-rationale to a subsequent Pass 2 cycle; see the `## Pass 2 SEC-only point-release close-out` block in `findings.md` for the rationale table. T080, T081 (partial), T085, T088 were already closed in-cycle; T082–T084, T086, T087, T089–T091 carry over unchanged.
+
 ### Group A — Core modules (stability lens)
 
 - [~] T080 [P2-STB] Stability-audit `bot/scheduler.py`: `time.monotonic()` for intervals, tmp+rename on `queue.json` writes, late-fire dedup on restart, retry amplification cap; fix findings, tests under `tests/test_scheduler.py` — **deferred** with rationale (see P2-80 in findings.md): scheduler uses `datetime.now()` (not `time.time()`) and most usages are legitimately wall-clock; a correct monotonic split needs its own spec
@@ -335,6 +337,8 @@
 
 **Independent Test**: manual onboarding walkthrough against `quickstart.md` §2 works on Telegram, Discord, Slack using a fresh `data/` dir; `/help` output covers every registered command.
 
+> **v0.22.2 deferral (2026-04-19)**: P2-UX remainder deferred-with-rationale to a subsequent Pass 2 cycle (see close-out block in `findings.md`). T097 closed in-cycle (help ⟷ handler parity via `TestHelpParity`). T092–T096, T098 carry over — `handlers.py` gained +703 LOC from 003/004 and warrants its own pass after the SEC release ships.
+
 - [ ] T092 [P2-UX] Audit `bot/handlers.py` for every registered command: is it listed in `/help`? Does the error path produce an actionable message? Does a destructive command require confirmation? Fix gaps; tests under `tests/test_handlers.py` — ⚠ file modified by 003/004 since Pass 2 baseline (+703 lines, new collab/continuous commands); re-check `/help` parity was extended to new commands (T097 parity test should already cover this) and that new destructive commands have confirmation
 - [ ] T093 [P2-UX] Audit `bot/bot.py` startup: missing env vars produce actionable messages (not tracebacks); `.env.example` file is current and complete
 - [ ] T094 [P] [P2-UX] Audit `bot/ai_backend.py`: missing AI CLI binary surfaces as a readable user-visible message via `i18n`, not a Python traceback; tests under `tests/test_ai_backend.py`
@@ -352,6 +356,8 @@
 **Goal**: Every user-visible string passes the 8-question checklist in `contracts/conversation-contract.md` §8.
 
 **Independent Test**: `string-inventory.md` shows zero literals outside `bot/i18n.py` (excluding debug logs); every `i18n` key has IT + EN; automated test verifies locale parity.
+
+> **v0.22.2 deferral (2026-04-19)**: P2-NI remainder deferred-with-rationale to a subsequent Pass 2 cycle. T099/T100 (re-scoped to single-locale)/T101 already closed in-cycle. T102–T108 carry over — 003/004 added +83 lines of user-visible strings in `i18n.py` plus the new collab/continuous STRINGS, so the string inventory sweep + tone audit need to run against the refreshed baseline.
 
 ### String relocation & i18n parity
 
@@ -380,6 +386,8 @@
 
 **Purpose**: Re-evaluate Pass 1 deferred findings, finalize documentation, version bump.
 
+> **v0.22.2 close-out (2026-04-19)**: This release executes Phase 13 in SEC-only mode. T112 closed in-cycle (F17 covered by P2-30). T117–T122 are the active close-out sequence for v0.22.2. T109/T110/T111/T113/T114/T115/T116 — Pass 1 re-evaluations — are **deferred** to a subsequent cycle; see the dispositions in `findings.md` → "Deferred to a future Pass 2 cycle" table. Each deferred item already has a documented rationale that does not require code changes for this point release.
+
 - [ ] T109 Re-evaluate Pass 1 deferred finding F12 (`telegram.py` Markdown behavioral change): decide fix or keep deferred with updated rationale; record under `## Pass 2 Findings`
 - [ ] T110 [P] Re-evaluate Pass 1 F13 (`discord.py download_voice` error handling): fix or re-defer with rationale
 - [ ] T111 [P] Re-evaluate Pass 1 F14 (`slack.py` reply/edit_message error handling): fix or re-defer with rationale
@@ -388,8 +396,8 @@
 - [ ] T114 [P] Re-evaluate Pass 1 performance finding P1 (`scheduler.py` redundant `queue.json` read)
 - [ ] T115 [P] Re-evaluate Pass 1 performance finding P2 (`scheduler.py` blocking sync I/O in async) — if stability work in T080 already moved to `asyncio.to_thread`, close here
 - [ ] T116 [P] Re-evaluate Pass 1 performance findings P3, P4, P5: fix or re-defer with updated rationale
-- [ ] T117 Run full `pytest tests/ -q` and confirm count ≥ 1451 (refreshed baseline 2026-04-18; was ≥ 1086 at Pass 2 start); diagnose any regression before proceeding
-- [ ] T118 Finalize `specs/002-full-code-review/findings.md`: every `P2-NN` row has status `fixed` or `deferred (rationale: ...)`; every Pass 1 deferred row has a Pass 2 status update
+- [X] T117 Run full `pytest tests/ -q` and confirm count ≥ 1451 (refreshed baseline 2026-04-18; was ≥ 1086 at Pass 2 start); diagnose any regression before proceeding — **closed 2026-04-19**: `pytest tests/ -q` reports **1532 passed, 1 skipped, 0 failed**; gate satisfied with +81 headroom.
+- [X] T118 Finalize `specs/002-full-code-review/findings.md`: every `P2-NN` row has status `fixed` or `deferred (rationale: ...)`; every Pass 1 deferred row has a Pass 2 status update — **closed 2026-04-19**: all 23 P2-NN rows carry a final status (22 `fixed` + 1 `noted / test-guarded`); Pass 1 F12/F13/F14/F17/F20 and the "All adapters retry_send parity" row have explicit dispositions under the new `## Pass 2 SEC-only point-release close-out` section in `findings.md`; STB/UX/NI/perf tasks marked deferred-with-rationale below for a subsequent cycle.
 - [ ] T119 Bump `VERSION` (patch bump unless a migration was introduced) and add a migration entry under `bot/migrations/` via `scripts/new_migration.py` only if a schema change was actually made
 - [ ] T120 Create `releases/vX.Y.Z.md` summarizing Pass 2: findings fixed count, deferred-with-rationale count, test-count delta, LOC delta
 - [ ] T121 Append Pass 2 section to `CHANGELOG.md`
