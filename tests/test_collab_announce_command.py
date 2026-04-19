@@ -141,6 +141,50 @@ class TestHandleCollabAnnounce:
         )
         assert out == response
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_name", [
+        "../../etc/passwd",
+        "../evil",
+        "/absolute",
+        "sub/dir",
+        "sub\\dir",
+        "UPPERCASE",
+        "with space",
+        "with.dot",
+        "with_underscore",
+        "-leading-hyphen",
+        "",
+        ".",
+        "..",
+    ])
+    async def test_rejects_path_traversal_or_invalid_name(
+        self, handlers, store, hq_platform, tmp_path, bad_name,
+    ):
+        """P2-81 / T078a: AI-emitted ``name`` attributes must be
+        rejected by ``validate_collab_name`` BEFORE any agent-file write.
+        A traversal-crafted name must not touch AGENTS_DIR at all, nor
+        create a pending record, nor appear in the outgoing trailer."""
+        from config import AGENTS_DIR
+        response = (
+            '[COLLAB_ANNOUNCE name="%s" display="X" purpose="p" '
+            'inherit="" inherit_memory="true"]' % bad_name
+        )
+        out = await handlers["_handle_collab_announce"](
+            response, chat_id=-100999, platform=hq_platform, thread_id=None,
+        )
+        # Invalid-name error trailer surfaced.
+        assert "error" in out
+        assert "invalid name" in out or "missing required attribute" in out, (
+            "expected either invalid-name or missing-attr error for %r" % bad_name
+        )
+        # NO pending record persisted.
+        assert store.list_pending_for_creator(12345) == []
+        # NO stray .md file under AGENTS_DIR from this announce.
+        for f in AGENTS_DIR.glob("*.md"):
+            assert bad_name.strip("./") not in f.stem, (
+                "path-traversal name %r leaked into %s" % (bad_name, f)
+            )
+
 
 class TestFlowAUsesPreAnnouncedPurpose:
     @pytest.mark.asyncio

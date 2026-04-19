@@ -23,6 +23,7 @@ import enum
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -44,6 +45,45 @@ from config import DATA_DIR
 log = logging.getLogger("robyx.collaborative")
 
 COLLAB_FILE = DATA_DIR / "collaborative_workspaces.json"
+
+# Shape that a collaborative workspace name is allowed to take. Names are
+# used as filename segments (``data/agents/<name>.md``) and as the suffix
+# of the workspace id (``collab-<name>``); Flow B ad-hoc setup already
+# sanitises via ``re.sub(r'[^a-z0-9-]', '-', …)`` at ``handlers.py``, but
+# Flow A (``[COLLAB_ANNOUNCE name="…"]``) previously received AI-emitted
+# names verbatim, so a name like ``../../evil`` would have written AI
+# content outside ``AGENTS_DIR``. Pass 2 P2-81.
+_VALID_COLLAB_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+def validate_collab_name(name: str) -> str:
+    """Return ``name`` if it is a safe workspace name, or raise ``ValueError``.
+
+    Enforces the invariant that collaborative workspace names are
+    lowercase alphanumeric plus hyphens, 1–64 characters, starting with
+    an alphanumeric character. This is the same alphabet Flow B produces
+    via ``_sanitize_task_name`` / ``re.sub(r'[^a-z0-9-]', '-', …)`` — so
+    tightening Flow A to pass through this validator does not reject any
+    legitimate Flow-B name.
+
+    Rejects empty / whitespace-only strings, path separators (``/``,
+    ``\\``), control characters (newline, tab, null), `..`, `.`, mixed
+    case, underscores, dots, spaces, and anything longer than 64 chars.
+
+    Called from:
+    * ``handlers._handle_collab_announce`` — before the AI-controlled
+      attrs reach ``AGENTS_DIR / (name + ".md")`` for ``write_text``.
+    * ``CollabStore.create_pending`` — defense-in-depth (in case a
+      future caller bypasses the handler).
+    """
+    value = str(name or "").strip()
+    if not _VALID_COLLAB_NAME_RE.match(value):
+        raise ValueError(
+            "invalid collaborative workspace name %r: must match "
+            "[a-z0-9][a-z0-9-]{0,63} (lowercase alphanumeric + hyphens, "
+            "1-64 chars, starting alphanumeric)" % name
+        )
+    return value
 
 
 class Role(enum.Enum):
@@ -349,8 +389,10 @@ class CollabStore:
         that closes the "agent registered but file missing" race; see
         ``bot/handlers.py:1468-1506``).
         """
-        if not name:
-            raise ValueError("name must not be empty")
+        # validate_collab_name raises on blank / path-traversal / mixed-case;
+        # handlers._handle_collab_announce is expected to reject up-front, but
+        # this guard is defense-in-depth in case a future caller bypasses it.
+        name = validate_collab_name(name)
         if creator_id == 0:
             raise ValueError("creator_id must not be zero")
         with self._mutex():

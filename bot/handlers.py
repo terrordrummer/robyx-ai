@@ -600,6 +600,21 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 )
                 continue
 
+            # Reject AI-emitted names that would escape AGENTS_DIR via
+            # path traversal (../..) or otherwise violate the workspace
+            # naming invariant. Pass 2 P2-81 / T078a.
+            from collaborative import validate_collab_name
+            try:
+                name = validate_collab_name(name)
+            except ValueError as e:
+                log.warning("[COLLAB_ANNOUNCE] rejected invalid name %r: %s", name, e)
+                out = out.replace(
+                    match.group(0),
+                    STRINGS["collab_announce_error"] % ("invalid name: %s" % e),
+                    1,
+                )
+                continue
+
             # Write the seed agent file BEFORE persisting the workspace
             # (same ordering rule as Flow B at handlers.py:1468-1506 —
             # if the agent file write fails we roll back cleanly).
