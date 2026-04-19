@@ -80,29 +80,30 @@ Single-project layout. `bot/` at repo root (NOT `src/bot/`). Tests under `tests/
 
 ### Tests for User Story 2
 
-- [ ] T017 [P] [US2] Create `tests/test_lifecycle_macros.py::test_list_tasks_empty_workspace` — asserts render `"Nessun task attivo nel workspace."` when no tasks match the workspace scope
-- [ ] T018 [P] [US2] Add `test_list_tasks_grouped_summary` — seed queue with one task per type; assert output contains `🔄`, `⏰`, `📌`, `🔔` in order and each group lists the correct names
-- [ ] T019 [P] [US2] Add `test_task_status_single_match` — asserts detailed render (objective, status, last step, history length, constraints)
-- [ ] T020 [P] [US2] Add `test_stop_task_transitions_status_to_completed` — asserts state file updated atomically, scheduler skips the task on the next cycle
-- [ ] T021 [P] [US2] Add `test_pause_resume_roundtrip` — asserts `paused` → dispatch skipped → `resume` → next tick picks up
-- [ ] T022 [P] [US2] Add `test_ambiguous_match_triggers_disambiguation` — seed two tasks matching same substring, assert numbered list + "Quale intendi?" prompt, assert NO mutation applied
-- [ ] T023 [P] [US2] Add `test_disambiguation_followup_resolves_unique_name` — simulate second-turn macro with exact name, assert action applied
-- [ ] T024 [P] [US2] Add `test_workspace_scoping_isolates_other_workspaces` — seed tasks belonging to workspace B; assert workspace A's LIST/STATUS never sees them
-- [ ] T025 [P] [US2] Add `test_unknown_task_name_reports_not_found` — assert polite `"Nessun task …"` message, no error state, no log ERROR
-- [ ] T026 [P] [US2] Add `test_lifecycle_action_logged` — asserts one INFO log line per mutation with `{ts, workspace, macro, name, resolved_to, outcome}`
+- [X] T017 [P] [US2] `tests/test_lifecycle_macros.py::TestListTasks::test_empty_workspace` — asserts `"Nessun task attivo nel workspace."` for an empty scoped queue.
+- [X] T018 [P] [US2] `test_grouped_summary_includes_icons_and_names` — seeds one task per type; asserts 🔄/⏰/📌/🔔 appear in order and each named task is listed.
+- [X] T019 [P] [US2] `TestTaskStatus::test_single_match_returns_detailed_status` — asserts objective, status, icon, and name in the detailed render.
+- [X] T020 [P] [US2] `TestStopTask::test_stop_continuous_transitions_status_to_completed` (continuous) + `test_stop_non_continuous_cancels_queue_entry` (periodic) — both mutate authoritative storage atomically.
+- [X] T021 [P] [US2] `TestPauseResume::test_pause_then_resume_continuous` — roundtrip via `pause_task` / `resume_task` helpers verifies `paused` → `pending`.
+- [X] T022 [P] [US2] `TestDisambiguation::test_ambiguous_substring_triggers_disambiguation_not_mutation` — two "*-report" tasks; ambiguous stop renders numbered list + "Quale intendi?" and leaves BOTH states untouched.
+- [X] T023 [P] [US2] `TestDisambiguation::test_exact_match_preferred_over_substring` — exact match "foo" resolves unambiguously when "foobar" also contains "foo"; simulates the follow-up turn path.
+- [X] T024 [P] [US2] `TestWorkspaceIsolation::test_other_workspace_tasks_are_invisible` — another workspace's tasks never appear in LIST or TASK_STATUS.
+- [X] T025 [P] [US2] `TestTaskStatus::test_zero_match_returns_not_found` — polite "Nessun task attivo chiamato `<query>`" message.
+- [X] T026 [P] [US2] `TestLogging::test_action_logged_with_resolution` — asserts one INFO log line under `robyx.lifecycle_macros` with `macro=stop_task`, task name, and outcome.
+- [X] Bonus: `TestGrammar::test_parse_*` (6 tests) cover the regex grammar; `TestSubstituteMacros::*` (3 tests) cover the in-place splice used by the handlers.py wiring.
 
 ### Implementation for User Story 2
 
-- [ ] T027 [P] [US2] Implement `[LIST_TASKS]` handler in `bot/lifecycle_macros.py` — reads `data/queue.json` under the existing lock, filters by workspace, groups by type in spec order, renders the markdown block per `contracts/lifecycle-macros.md`
-- [ ] T028 [P] [US2] Implement `[TASK_STATUS name=...]` handler in `bot/lifecycle_macros.py` — loads referenced `state.json` for continuous tasks, returns detailed render; handles 0/1/≥2 match cases
-- [ ] T029 [P] [US2] Implement `[STOP_TASK name=...]` handler in `bot/lifecycle_macros.py` — atomically writes `status=completed` to state, removes entry from queue (or marks terminal per scheduler semantics), returns confirmation
-- [ ] T030 [P] [US2] Implement `[PAUSE_TASK name=...]` handler in `bot/lifecycle_macros.py` — sets `status=paused`, keeps queue entry, returns confirmation
-- [ ] T031 [P] [US2] Implement `[RESUME_TASK name=...]` handler in `bot/lifecycle_macros.py` — transitions paused → pending; suggests active tasks if nothing paused matches
-- [ ] T032 [P] [US2] Implement `[GET_PLAN name=...]` handler in `bot/lifecycle_macros.py` — reads `data/continuous/<name>/plan.md`, summarizes to ≤2000 chars, returns verbatim otherwise
-- [ ] T033 [US2] Implement shared disambiguation renderer `render_ambiguous_candidates(matches, query)` in `bot/lifecycle_macros.py` used by T028–T032; honors "annulla" and numeric replies
-- [ ] T034 [US2] Wire lifecycle macro dispatch into `bot/handlers.py` — invoke `parse_lifecycle_macros` + `handle_lifecycle_macros` at the same pre-delivery chokepoint that processes `CREATE_CONTINUOUS`, substituting the macro with the rendered text before the response is passed through `strip_control_tokens_for_user`
-- [ ] T035 [US2] Add INFO-level logging in each handler: task name, macro, resolved_to, outcome, timestamp
-- [ ] T036 [US2] Update primary agent system-instruction template (in `bot/agents.py` or `AGENTS.md` if that's the source of instructions) to document the five macros and when to emit them — wording is non-prescriptive: "recognize Italian/English natural-language lifecycle intents, emit the corresponding macro, let the server render the response"
+- [X] T027 [P] [US2] `_handle_list_tasks` + `render_list` — reads queue via `ctx.queue_reader` (test seam) or `scheduler.load_queue`, filters via `scope_to_workspace`, loads continuous state where applicable, groups by type in spec order with icons.
+- [X] T028 [P] [US2] `_handle_task_status` + `render_status` — handles 0/1/≥2 match; detailed render for continuous tasks pulls objective / history tail / step counter from state.json.
+- [X] T029 [P] [US2] `_handle_stop_task` → `_stop_task` — continuous: `continuous.complete_task` + `save_state` AND `scheduler.cancel_task_by_name`; periodic/one-shot: `cancel_task_by_name` alone. New helper `scheduler.cancel_task_by_name` added for clean queue mutation.
+- [X] T030 [P] [US2] `_handle_pause_task` → `_pause_task` — continuous: `pause_task` + save; other types: friendly "non supportata" message.
+- [X] T031 [P] [US2] `_handle_resume_task` → `_resume_task` — guards on status ∈ {paused, rate-limited}; uses `resume_task` helper.
+- [X] T032 [P] [US2] `_handle_get_plan` → `_get_plan` — reads `data/continuous/<name>/plan.md` via `continuous.read_plan_md`; truncates to 2000 chars with "[…troncato]" tail; non-continuous types get the friendly "solo per task continuativi" message.
+- [X] T033 [US2] `render_ambiguous_candidates` — shared numbered-list renderer used by stop/pause/resume/get_plan via the `_handle_mutating` higher-order wrapper.
+- [X] T034 [US2] Wired into `bot/handlers.py::_process_and_send` right after `apply_continuous_macros` — lifecycle-macro handling runs on the already-stripped response; the `substitute_macros` helper performs reverse-order span splicing.
+- [X] T035 [US2] `_log_action` emits INFO lines under `robyx.lifecycle_macros` with `ts=<iso>`, `workspace_thread=<thread_id>`, `macro=<kind>`, `name=<query>`, `resolved_to=<name>`, `outcome=<verb>`.
+- [X] T036 [US2] Updated `templates/prompt_workspace_agent.md` (replaces the "🔄 topic" language with the new plan.md + parent-chat flow, documents the six lifecycle macros) AND `templates/prompt_orchestrator.md` (adds a matching lifecycle section). Both emphasise "never guess a name" so ambiguous queries are routed through the disambiguation prompt.
 
 **Checkpoint**: Primary agent is the single lifecycle control point; ambiguity always resolved before mutation.
 

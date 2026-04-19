@@ -45,6 +45,12 @@ from continuous_macro import (
     apply_continuous_macros,
     strip_control_tokens_for_user,
 )
+from lifecycle_macros import (
+    DispatchContext as LifecycleDispatchContext,
+    handle_lifecycle_macros,
+    parse_lifecycle_macros,
+    substitute_macros as substitute_lifecycle_macros,
+)
 
 
 _EXECUTIVE_MARKERS = (
@@ -466,6 +472,24 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                         is_executive=True,
                     ),
                 )
+
+                # Spec 005 US2: after continuous-task dispatch, resolve
+                # lifecycle macros (LIST_TASKS, TASK_STATUS, STOP_TASK,
+                # PAUSE_TASK, RESUME_TASK, GET_PLAN). Scoped to the
+                # invoking workspace via (chat_id, thread_id); mutations
+                # are authoritative against queue.json + state.json.
+                lifecycle_invocations = parse_lifecycle_macros(response)
+                if lifecycle_invocations:
+                    subs = await handle_lifecycle_macros(
+                        lifecycle_invocations,
+                        LifecycleDispatchContext(
+                            chat_id=chat_id,
+                            thread_id=thread_id,
+                            platform=platform,
+                            manager=manager,
+                        ),
+                    )
+                    response = substitute_lifecycle_macros(response, subs)
 
                 if is_robyx:
                     response = await handle_delegations(
