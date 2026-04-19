@@ -144,22 +144,22 @@ Single-project layout. `bot/` at repo root (NOT `src/bot/`). Tests under `tests/
 
 ### Tests for User Story 4
 
-- [ ] T048 [P] [US4] Create `tests/test_migration_v0_23_0.py::test_fresh_migration_happy_path_three_tasks` — fixture with 3 continuous tasks (2 resolvable, 1 unknown workspace); assert 2 migrated, 1 skipped, 2 transition notices via fake platform, 2 `close_channel` calls
-- [ ] T049 [P] [US4] Add `test_rerun_is_noop` — rerun the same migration on already-migrated state; assert 0 new notices, 0 new `close_channel` calls, all `migrated_v0_23_0` unchanged
-- [ ] T050 [P] [US4] Add `test_close_channel_failure_triggers_fallback_notice` — fake platform's `close_channel` returns `False`; assert fallback notice posted in legacy sub-topic, migration still succeeds
-- [ ] T051 [P] [US4] Add `test_corrupted_state_json_is_skipped_not_fatal` — one malformed state file; assert migration logs ERROR for that task, processes remaining, returns normally
-- [ ] T052 [P] [US4] Add `test_missing_workspace_skipped_with_error` — unknown `workspace_name` on one task; assert that task is skipped with ERROR log, others proceed
-- [ ] T053 [P] [US4] Add `test_legacy_thread_id_equals_new_thread_id_edge` — task already on parent thread; assert no `close_channel` call, no fallback notice, transition notice still posted once, marker still stamped
-- [ ] T054 [P] [US4] Add `test_offline_mode_platform_none` — `ctx.platform is None`; assert state is still repointed and marker stamped, no platform calls attempted
-- [ ] T055 [P] [US4] Add `test_done_marker_file_written_after_loop` — assert `data/migrations/v0_23_0.done` exists after a completed run
+- [X] T048 [P] [US4] `TestHappyPath::test_fresh_migration_repoints_state_and_posts_notices` — 2 tasks, both resolvable; asserts state repointed, 2 close_channel calls, 2 transition notices in parent thread, done marker written.
+- [X] T049 [P] [US4] `TestIdempotency::test_rerun_is_noop_per_task_marker` + `test_rerun_without_done_marker_still_skips_per_task` — both idempotency layers verified.
+- [X] T050 [P] [US4] `TestCloseChannelFailure::test_close_channel_false_triggers_fallback_notice` + `test_close_channel_raising_is_swallowed` — both fallback paths (False return and raised exception) verified non-fatal.
+- [X] T051 [P] [US4] `TestCorruptedState::test_corrupted_json_is_skipped_not_fatal` — malformed state.json is logged and skipped; good siblings still migrate.
+- [X] T052 [P] [US4] `TestMissingWorkspace::test_unknown_parent_workspace_skipped` — unresolved workspace leaves state untouched (no marker) and no platform side effects for that task.
+- [X] T053 [P] [US4] `TestLegacyEqualsNew::test_no_close_when_legacy_thread_equals_new_thread` — task already on parent thread: no close_channel call, transition notice still posted once, marker still stamped.
+- [X] T054 [P] [US4] `TestOfflineMode::test_platform_none_still_repoints_state` — `ctx.platform is None` still repoints state, no platform calls attempted.
+- [X] T055 [P] [US4] `TestDoneMarker::test_done_marker_written_on_empty_continuous_dir` + `test_done_marker_written_after_loop` — done marker written in both scenarios.
 
 ### Implementation for User Story 4
 
-- [ ] T056 [US4] Implement `bot/migrations/v0_23_0.py::upgrade(ctx)` per `contracts/migration-v0_23_0.md` algorithm — per-task loop with idempotency guard, workspace resolution, atomic state write, best-effort close, fallback notice, transition notice, summary log
-- [ ] T057 [P] [US4] Add workspace-resolution helper in `bot/migrations/v0_23_0.py` (or reuse existing one from `bot/topics.py::load_workspaces()`) — returns workspace dict or None; handles both `workspace_name` and legacy `parent_workspace_name` fields
-- [ ] T058 [US4] Ensure `bot/migrations/runner.py` picks up the new migration (should be automatic via module registration — verify and add an explicit import if needed)
-- [ ] T059 [US4] Add `data/migrations/` directory creation to the migration routine (idempotent `Path.mkdir(parents=True, exist_ok=True)`)
-- [ ] T060 [US4] Implement ISO-8601 UTC timestamp helper `_now_iso_utc()` in the migration (or import from existing utility if present)
+- [X] T056 [US4] `bot/migrations/v0_23_0.py::upgrade(ctx)` implements the full algorithm: per-task idempotency guard via `migrated_v0_23_0`, parent-workspace resolution, atomic state write, best-effort `close_channel` with fallback notice, transition notice post, summary log. Handles corrupted state JSON by skipping with ERROR log.
+- [X] T057 [P] [US4] `_resolve_parent_thread_id(state, manager, log)` helper — reads `state["parent_workspace"]` (with fallback to legacy `parent_workspace_name` field), calls `manager.get(ws_name)`, returns `agent.thread_id` or `None`.
+- [X] T058 [US4] The migration runner discovers modules via `pkgutil.iter_modules` (per the scaffold script output) so `v0_23_0.py` is auto-registered. `MIGRATION` metadata validated by `TestMigrationMetadata::test_version_chain_entries`; chain-continuity test in `tests/test_migrations_framework.py` already passes.
+- [X] T059 [US4] `_write_done_marker` calls `path.parent.mkdir(parents=True, exist_ok=True)` so `data/migrations/` is created on demand. Verified by `TestDoneMarker` suite.
+- [X] T060 [US4] `_now_iso_utc()` helper at the top of the module returns `datetime.now(timezone.utc).isoformat()` — used for both the per-task `migrated_v0_23_0` marker and the done-marker timestamp body.
 
 **Checkpoint**: All pre-existing continuous tasks flow to the parent workspace chat after a single migration run; re-runs are safe.
 
