@@ -275,6 +275,40 @@ def cancel_tasks_for_agent_file(
 cancel_tasks_for_agent = cancel_tasks_for_agent_file
 
 
+def cancel_task_by_name(name: str, *, reason: str = "stopped by user") -> bool:
+    """Cancel pending/active queue entries whose ``name`` matches exactly.
+
+    Used by the lifecycle-macro handlers (spec 005, US2) to stop a
+    periodic, one-shot, or continuous task by user request. Returns True
+    if at least one entry was canceled. Reminders do not carry a ``name``
+    field so this helper skips them — callers that need reminder
+    cancellation should match by ``id`` via their own flow.
+    """
+    if not name:
+        return False
+
+    canceled = 0
+    canceled_at = datetime.now(timezone.utc).isoformat()
+    with _queue_mutex():
+        entries = _load_queue_unlocked()
+        for entry in entries:
+            if entry.get("name") != name:
+                continue
+            if entry.get("status") in ("canceled", "dispatched", "completed"):
+                continue
+            entry["status"] = "canceled"
+            entry["canceled_at"] = canceled_at
+            entry["canceled_reason"] = reason
+            canceled += 1
+        if canceled:
+            _save_queue_unlocked(entries)
+            log.info(
+                "Canceled %d queue entr%s for name=%r (%s)",
+                canceled, "y" if canceled == 1 else "ies", name, reason,
+            )
+    return canceled > 0
+
+
 # ── Startup cleanup ──────────────────────────────────────────────────────────
 
 
@@ -681,11 +715,21 @@ async def _dispatch_reminders(
             })
             continue
 
+        # Spec 005: prefix reminders with the 🔔 marker via the single
+        # delivery-layer chokepoint. Reminders today carry no per-item
+        # "name" field — fall back to a friendly label so the marker
+        # remains readable without exposing internal UUIDs.
+        from scheduled_delivery import format_delivery_message
+        reminder_label = reminder.get("name") or "promemoria"
+        marked_text = format_delivery_message(
+            "reminder", reminder_label, reminder["message"],
+        )
+
         try:
             sent = await asyncio.wait_for(
                 platform.send_message(
                     chat_id=chat_id,
-                    text=reminder["message"],
+                    text=marked_text,
                     thread_id=reminder["thread_id"],
                     parse_mode="markdown",
                 ),
@@ -957,6 +1001,55 @@ async def _dispatch_agent_tasks(
 # ── Dispatch: continuous tasks ────────────────────────────────────────────────
 
 
+def _load_parent_workspace_instructions(state: dict) -> str:
+    """Load the parent workspace's ``agents/<name>.md`` instructions.
+
+    Spec 005 US5: the secondary step agent inherits the same workspace-
+    level instructions as the primary so behaviour does not drift. When
+    the parent workspace has no file yet (freshly-created workspace,
+    missing migration, tests), we return a short placeholder so the
+    template still renders cleanly.
+    """
+    parent_name = state.get("parent_workspace") or state.get("parent_workspace_name")
+    if not parent_name:
+        return "_(no parent workspace recorded for this task)_"
+    try:
+        from config import AGENTS_DIR
+        path = AGENTS_DIR / ("%s.md" % parent_name)
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        log.warning(
+            "continuous: failed to load parent workspace instructions for %r: %s",
+            parent_name, exc,
+        )
+    return "_(parent workspace instructions file not found)_"
+
+
+def _load_plan_md_for_prompt(name: str) -> str:
+    """Load ``data/continuous/<name>/plan.md`` for inclusion in the prompt.
+
+    Spec 005 US5: tasks created post-0.23.0 always have a plan.md;
+    migrated pre-0.23.0 tasks have one materialised by the v0_23_0
+    migration. If nothing is found we still render a short placeholder
+    so the step agent understands the absence is expected, not a bug.
+    """
+    try:
+        from continuous import read_plan_md
+        body = read_plan_md(name)
+    except Exception as exc:
+        log.warning(
+            "continuous: failed to read plan.md for '%s': %s", name, exc,
+        )
+        body = None
+    if not body:
+        return (
+            "_(no plan.md available for this task — refer to the Program "
+            "section below for intent)_"
+        )
+    return body.strip()
+
+
 async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple[list[tuple[str, int]], list[str]]:
     """Check continuous entries in the queue and dispatch next steps if ready.
 
@@ -1040,6 +1133,13 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
         constraints_text = "\n".join("- %s" % c for c in program.get("constraints", []))
         history_text = build_step_context(state)
 
+        # Spec 005 US5: secondary agent shares primary workspace knowledge.
+        # Load (a) the parent workspace's agent instructions file and (b)
+        # the task-specific plan.md; substitute both into the prompt so
+        # behaviour stays consistent with the primary that set the task up.
+        parent_instructions = _load_parent_workspace_instructions(state)
+        plan_md_body = _load_plan_md_for_prompt(name)
+
         lock_file = DATA_DIR / name / "lock"
 
         # Build versioning instructions based on git availability
@@ -1062,6 +1162,8 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
 
         prompt = (
             template
+            .replace("{{PARENT_WORKSPACE_INSTRUCTIONS}}", parent_instructions)
+            .replace("{{PLAN_MD}}", plan_md_body)
             .replace("{{OBJECTIVE}}", program.get("objective", ""))
             .replace("{{SUCCESS_CRITERIA}}", criteria_text or "(none specified)")
             .replace("{{CONSTRAINTS}}", constraints_text or "(none specified)")

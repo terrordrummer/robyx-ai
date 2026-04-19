@@ -13,9 +13,10 @@ Robyx has a **unified scheduler** that runs every 60 seconds (configurable via `
 **Periodic tasks** — recurring agent invocations on an interval (hourly, daily, etc.). A system monitor that checks server health every 6 hours, a price tracker that runs every 30 minutes — the scheduler keeps firing them until the workspace is closed or paused.
 
 **Continuous tasks (agentic loop)** — autonomous, iterative work that the scheduler keeps alive step-by-step until the objective is reached or the user intervenes. Each continuous task gets:
-- A **dedicated workspace topic** (prefixed with 🔄)
 - A **git branch** in the target project's repo
 - A **state file** tracking progress, completed steps, and the plan for the next step
+- A **plan file** (`data/continuous/<name>/plan.md`) capturing the objective, success criteria, and intent
+- Step reports delivered into the **parent workspace chat** with a `🔄 [<task-name>]` prefix (no dedicated sub-topic — the user talks to the primary workspace agent to control the task lifecycle)
 
 The scheduler dispatches one step at a time. Each step: executes, commits its changes, updates the state, and plans the next step. The scheduler picks up the next step on the following cycle. This is how you can say "refactor the auth module into smaller files" and walk away — the agent works through it methodically, one step at a time.
 
