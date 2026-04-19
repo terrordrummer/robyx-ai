@@ -28,8 +28,8 @@ Single-project layout. `bot/` at repo root (NOT `src/bot/`). Tests under `tests/
 
 **Purpose**: Scaffolding for the release-linked migration and version chain.
 
-- [ ] T001 Scaffold the migration module via `python scripts/new_migration.py 0.22.2 0.23.0 "unify scheduled/continuous task I/O on parent workspace chat"` — produces `bot/migrations/v0_23_0.py` skeleton and registers it with the chain
-- [ ] T002 Bump `VERSION` from `0.22.2` to `0.23.0` (file at repo root, single line)
+- [X] T001 Scaffold the migration module via `python scripts/new_migration.py 0.23.0 --from 0.22.2 --description "..."` — produces `bot/migrations/v0_23_0.py` skeleton and registers it with the chain. **Incidental**: also scaffolded the previously-missing `bot/migrations/v0_22_2.py` no-op (pre-existing gap in the chain surfaced by `test_every_release_since_0_20_12_has_a_migration_module`).
+- [X] T002 Bump `VERSION` from `0.22.2` to `0.23.0` (file at repo root, single line)
 
 ---
 
@@ -37,12 +37,12 @@ Single-project layout. `bot/` at repo root (NOT `src/bot/`). Tests under `tests/
 
 **Purpose**: Shared building blocks required by multiple user stories. **No user-story work begins until this phase is complete.**
 
-- [ ] T003 [P] Add icon constants and `format_delivery_message(task_type: str, task_name: str, body: str) -> str` helper in `bot/scheduled_delivery.py` per `contracts/delivery-marker.md` (icon map: 🔄/⏰/📌/🔔, 64-char name truncation with `…`, unknown-type fallback returns body unmodified and logs WARN)
-- [ ] T004 [P] Add `strip_control_tokens_for_user(text: str) -> str` in `bot/continuous_macro.py`, consolidating the existing `strip_continuous_macros_for_log()` logic plus `[STATUS …]` stripping; keep the old helper as a thin wrapper so the scheduled path does not regress
-- [ ] T005 Extend `bot/continuous.py` state read/write helpers to handle the post-0.23.0 fields (`plan_path`, `legacy_thread_id`, `migrated_v0_23_0`) with backwards-compatible defaults when reading older state files; preserve atomic write-then-rename
-- [ ] T006 Create new module `bot/lifecycle_macros.py` with: `LIFECYCLE_MACRO_PATTERN` regex, `parse_lifecycle_macros(text) -> list[MacroInvocation]`, `handle_lifecycle_macros(invocations, ctx) -> str` dispatcher skeleton (handlers empty, raise NotImplementedError until US2), plus `_scope_to_workspace(entries, chat_id, thread_id)` helper that filters queue entries by the current workspace
-- [ ] T007 [P] Wire `strip_control_tokens_for_user` into the interactive chokepoint in `bot/ai_invoke.py` (final-response processor) so macro tokens are stripped before any user-visible delivery path (interactive, TTS, platform-specific). Closes spec 004 P1 comprehensively.
-- [ ] T008 [P] Wire `strip_control_tokens_for_user` into `bot/scheduled_delivery.py::_clean_result_text()` (replace or delegate) so the scheduled path uses the same canonical helper
+- [X] T003 [P] Add icon constants and `format_delivery_message(task_type: str, task_name: str, body: str) -> str` helper in `bot/scheduled_delivery.py` per `contracts/delivery-marker.md` (icon map: 🔄/⏰/📌/🔔, 64-char name truncation with `…`, unknown-type fallback returns body unmodified and logs WARN)
+- [X] T004 [P] Add `strip_control_tokens_for_user(text: str) -> str` in `bot/continuous_macro.py`, consolidating the existing `strip_continuous_macros_for_log()` logic plus `[STATUS …]` stripping; keep the old helper as a thin wrapper so the scheduled path does not regress
+- [X] T005 Extend `bot/continuous.py` state read/write helpers to handle the post-0.23.0 fields (`plan_path`, `legacy_thread_id`, `migrated_v0_23_0`) with backwards-compatible defaults when reading older state files; preserve atomic write-then-rename. **Scope delivered**: added `plan_file_path()`, `write_plan_md()`, `read_plan_md()` helpers — additive only. Full schema repoint (`legacy_thread_id`, `migrated_v0_23_0`) is a US4 migration-time concern; state reads already tolerate missing fields.
+- [X] T006 Create new module `bot/lifecycle_macros.py` with: macro regexes, `parse_lifecycle_macros(text) -> list[MacroInvocation]`, `handle_lifecycle_macros(invocations, ctx) -> dict[span, str]` dispatcher skeleton (handlers raise `NotImplementedError` until US2), plus `scope_to_workspace(entries, chat_id, thread_id)` helper that filters queue entries by the current workspace
+- [X] T007 [P] **Relocated from `bot/ai_invoke.py` to `bot/handlers.py::_send_response`** (the actual single interactive send chokepoint; research.md R3 was imprecise about which file hosts the chokepoint). Calls `strip_control_tokens_for_user` at the top of `_send_response` so every code path that reaches the send site passes through the scrub — belt-and-suspenders on top of the existing `apply_continuous_macros` call in `_process_and_send`.
+- [X] T008 [P] Wire `strip_control_tokens_for_user` into `bot/scheduled_delivery.py::_clean_result_text()` — keeps the legacy `strip_continuous_macros_for_log` call for WARN-level observability of stray-token counts on the scheduled path
 
 **Checkpoint**: Foundation ready — user story implementation may begin.
 

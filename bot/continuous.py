@@ -32,6 +32,45 @@ def state_file_path(name: str) -> Path:
     return _state_dir(name) / "state.json"
 
 
+def plan_file_path(name: str) -> Path:
+    """Path to the task-specific plan markdown (spec 005).
+
+    The plan is produced at continuous-task creation time from the
+    ``CONTINUOUS_PROGRAM`` payload and is read by (a) the primary agent on
+    demand via ``[GET_PLAN]`` and (b) the secondary step agent's prompt
+    template as shared knowledge.
+    """
+    return _state_dir(name) / "plan.md"
+
+
+def write_plan_md(name: str, content: str) -> Path:
+    """Atomically persist the continuous task's plan.md (spec 005).
+
+    Uses the same write-then-rename + fsync pattern as ``save_state``.
+    """
+    path = plan_file_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content or "")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def read_plan_md(name: str) -> str | None:
+    """Read the continuous task's plan.md, or None if not present."""
+    path = plan_file_path(name)
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.error("Failed to read plan.md for '%s': %s", name, exc)
+        return None
+
+
 def load_state(path: Path) -> dict | None:
     """Load a continuous task state file. Returns None if missing or corrupt."""
     if not path.exists():

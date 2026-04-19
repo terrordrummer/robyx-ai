@@ -10,9 +10,57 @@ from typing import Any
 
 from ai_backend import AIBackend
 from ai_invoke import SILENT_PATTERN, split_message
-from continuous_macro import strip_continuous_macros_for_log
+from continuous_macro import (
+    strip_continuous_macros_for_log,
+    strip_control_tokens_for_user,
+)
+
+log = logging.getLogger("robyx.scheduled_delivery")
 
 STATUS_PATTERN = re.compile(r"\[STATUS\s+(.+?)\]")
+
+
+# ── Delivery markers (spec 005) ──────────────────────────────────────────────
+
+# Icon per task type. Aliases for one-shot variants collapse to the same glyph
+# so callers can read `type` from the queue without pre-normalisation.
+TASK_TYPE_ICONS: dict[str, str] = {
+    "continuous": "🔄",
+    "periodic": "⏰",
+    "one-shot": "📌",
+    "oneshot": "📌",
+    "one_shot": "📌",
+    "reminder": "🔔",
+}
+
+_MAX_TASK_NAME_CHARS = 64
+
+
+def format_delivery_message(task_type: str, task_name: str, body: str) -> str:
+    """Prefix a scheduled-delivery body with its type icon + task name.
+
+    Contract: ``contracts/delivery-marker.md``. Single chokepoint — agents
+    MUST NOT format this themselves. Unknown ``task_type`` yields the body
+    unmodified plus a WARN log (spec FR-004 fallback).
+    """
+    key = (task_type or "").lower().strip()
+    icon = TASK_TYPE_ICONS.get(key)
+    safe_body = body or ""
+    if icon is None:
+        log.warning(
+            "format_delivery_message: unknown task_type=%r (name=%r) — "
+            "delivering without marker",
+            task_type, task_name,
+        )
+        return safe_body
+
+    name = (task_name or "").strip() or "?"
+    if len(name) > _MAX_TASK_NAME_CHARS:
+        name = name[: _MAX_TASK_NAME_CHARS - 1] + "…"
+
+    if not safe_body.strip():
+        return "%s [%s]" % (icon, name)
+    return "%s [%s] %s" % (icon, name, safe_body)
 
 
 def _normalize_backend_text(parsed_response: Any) -> str:
@@ -35,14 +83,15 @@ def _coerce_target_id(raw_target: Any) -> Any:
 
 
 def _clean_result_text(text: str) -> str:
-    # Scrub any stray continuous-task macro tokens. Scheduled subprocess
-    # output has no interactive agent context, so we MUST NOT dispatch a
-    # new continuous task from here — but we MUST still strip the tokens
-    # so a leaked macro cannot reach the chat (feature 004, FR-001/FR-011).
-    clean, _ = strip_continuous_macros_for_log(text or "")
-    clean = STATUS_PATTERN.sub("", clean).strip()
-    clean = re.sub(r"\n{3,}", "\n\n", clean)
-    return clean.strip()
+    # Scrub any stray continuous-task macro tokens and [STATUS …] tokens.
+    # Scheduled subprocess output has no interactive agent context, so we
+    # MUST NOT dispatch a new continuous task from here — but we MUST still
+    # strip the tokens so a leaked macro cannot reach the chat (spec 004
+    # FR-001/FR-011; spec 005 T008 consolidates to the canonical helper).
+    # We still log stray-token counts via the legacy wrapper for WARN-level
+    # observability on the scheduled path.
+    strip_continuous_macros_for_log(text or "")
+    return strip_control_tokens_for_user(text or "")
 
 
 def _error_excerpt(raw_output: str, max_chars: int = 800) -> str:
