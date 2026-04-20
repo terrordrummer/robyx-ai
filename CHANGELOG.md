@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.24.2
+
+**Continuous-task fire-and-forget invariant.** Bugfix release addressing
+tasks that stopped after the first step, refused to resume, and
+reported a spurious "stopped by user" message without the user actually
+having asked. Three reinforcing defects are fixed end-to-end.
+
+### Fixed
+
+- **`bot/lifecycle_macros.py::_resume_task`** now accepts
+  `awaiting-input` alongside `paused` and `rate-limited`. The primary
+  workspace agent's contract (documented in `bot/ai_invoke.py`) has
+  always told it to emit `[RESUME_TASK]` for `awaiting-input` tasks; the
+  handler was rejecting that exact state, stranding every resume
+  attempt.
+- **`bot/continuous.py::resume_task`** clears any stale
+  `awaiting_question` on resume so the next scheduler tick sees a clean
+  `pending` state.
+- **`bot/scheduler.py`** auto-demotes `awaiting-input` tasks whose
+  declared `checkpoint_policy` is `on-demand` back to `pending`. The
+  step template always forbade this transition under `on-demand`; the
+  scheduler is now belt-and-suspenders in case a step agent drifts
+  (stale prompt, model misbehaviour, prompt injection). Tasks under
+  `on-uncertainty`, `on-milestone`, or `every-N-steps` are left alone.
+- **Stop/pause reason attribution.** `DispatchContext` grows an
+  optional `user_message` field; `bot/handlers.py` propagates the
+  originating user message into the lifecycle dispatch; `_stop_task` /
+  `_pause_task` record `"stopped by user: <snippet>"` instead of the
+  constant `"stopped by user"`. Audits can now distinguish user-driven
+  from agent-driven stops.
+
+### Added
+
+- **Fire-and-forget invariant (explicit).** `templates/prompt_workspace_agent.md`
+  now states directly that once a continuous task is running, user chat
+  messages do NOT touch it unless the user explicitly asks, or the step
+  agent itself needs input within the agreed `checkpoint_policy`. This
+  section is always present in the system prompt.
+- **Confirmation gate for STOP / PAUSE.** A new section in the
+  workspace-agent prompt mandates a two-turn confirmation gate:
+  recognise intent via reasoning (not keyword matching), identify the
+  target (ask if ambiguous), ask "do you confirm?" in a dedicated turn,
+  and only emit `[STOP_TASK]` / `[PAUSE_TASK]` on an unambiguous
+  affirmative reply. Status queries, scope changes, frustration with a
+  step, and the agent's own judgement are explicitly listed as NOT
+  grounds to stop. `[RESUME_TASK]` does not require confirmation.
+
+### Tests
+
+- `tests/test_lifecycle_macros.py::test_resume_from_awaiting_input_clears_question`
+  pins down the extended resume whitelist + `awaiting_question` cleanup.
+- `tests/test_lifecycle_macros.py::test_stop_reason_includes_user_message_snippet`
+  covers the reason-enrichment path.
+- `tests/test_scheduler.py::TestOnDemandAutoDemote` covers
+  `_maybe_demote_on_demand_awaiting_input` across all four checkpoint
+  policies and non-awaiting states.
+
+### Migration
+
+- `bot/migrations/v0_24_2.py` is a no-op; it exists only to keep the
+  version chain continuous (0.24.1 → 0.24.2). No schema change.
+
 ## 0.24.1
 
 **Documentation patch.** Removes residual references to the pre-0.23.0

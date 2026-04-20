@@ -577,3 +577,71 @@ class TestSystemPrompts:
     def test_focused_prompt_has_reminders(self):
         from config import FOCUSED_AGENT_SYSTEM_PROMPT
         assert "## Reminders" in FOCUSED_AGENT_SYSTEM_PROMPT
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Continuous-task on-demand policy enforcement (v0.24.2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestOnDemandAutoDemote:
+    """Regression coverage for v0.24.2 fire-and-forget invariant.
+
+    A step agent running under the default ``on-demand`` policy must
+    never leave its task parked in ``awaiting-input``. If it does (model
+    drift, stale template cached in a subprocess, prompt injection), the
+    scheduler auto-demotes the state so the loop keeps running. Other
+    policies (``on-uncertainty``, ``on-milestone``, ``every-N-steps``)
+    legitimately support awaiting-input and must be left alone.
+    """
+
+    def _state(self, policy: str | None, question: str = "still unsure?"):
+        return {
+            "name": "daily-report",
+            "status": "awaiting-input",
+            "program": {"checkpoint_policy": policy} if policy else {},
+            "awaiting_question": question,
+        }
+
+    def test_on_demand_awaiting_input_is_demoted_to_pending(self):
+        state = self._state("on-demand")
+        mutated = sched_mod._maybe_demote_on_demand_awaiting_input(
+            state, "daily-report",
+        )
+        assert mutated is True
+        assert state["status"] == "pending"
+        assert "awaiting_question" not in state
+
+    def test_missing_policy_defaults_to_on_demand_and_is_demoted(self):
+        state = self._state(None)
+        assert sched_mod._maybe_demote_on_demand_awaiting_input(
+            state, "daily-report",
+        ) is True
+        assert state["status"] == "pending"
+
+    def test_on_uncertainty_awaiting_input_is_left_alone(self):
+        state = self._state("on-uncertainty")
+        assert sched_mod._maybe_demote_on_demand_awaiting_input(
+            state, "daily-report",
+        ) is False
+        assert state["status"] == "awaiting-input"
+        assert state["awaiting_question"] == "still unsure?"
+
+    def test_on_milestone_awaiting_input_is_left_alone(self):
+        state = self._state("on-milestone")
+        assert sched_mod._maybe_demote_on_demand_awaiting_input(
+            state, "daily-report",
+        ) is False
+        assert state["status"] == "awaiting-input"
+
+    def test_non_awaiting_states_are_no_op(self):
+        for status in ("pending", "running", "paused", "completed", "error"):
+            state = {
+                "name": "x",
+                "status": status,
+                "program": {"checkpoint_policy": "on-demand"},
+            }
+            assert sched_mod._maybe_demote_on_demand_awaiting_input(
+                state, "x",
+            ) is False
+            assert state["status"] == status

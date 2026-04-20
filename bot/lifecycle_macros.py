@@ -114,6 +114,10 @@ class DispatchContext:
     thread_id: Any
     platform: Any = None
     manager: Any = None
+    # Snippet of the user message that triggered this dispatch (if any).
+    # Propagated into STOP/PAUSE reason strings so audit logs distinguish
+    # "user asked explicitly" from "agent decided on its own".
+    user_message: str | None = None
     # Injection seams for tests — bypass the scheduler / continuous
     # modules with in-memory doubles.
     queue_reader: Any = None
@@ -413,10 +417,21 @@ def _log_action(
     )
 
 
+def _stop_reason(ctx: DispatchContext, verb: str) -> str:
+    """Build a reason string that includes a user-message snippet when
+    available, so we can later audit whether the stop was user-driven.
+    """
+    snippet = _shorten((ctx.user_message or "").strip(), 120)
+    if snippet:
+        return "%s by user: %s" % (verb, snippet)
+    return "%s by user" % verb
+
+
 def _stop_task(t: dict, ctx: DispatchContext) -> str:
     entry = t["entry"]
     name = entry.get("name") or "?"
     tk = _type_key(entry)
+    reason = _stop_reason(ctx, "stopped")
     if tk == "continuous" and t["state"] is not None:
         from continuous import complete_task, save_state, state_file_path
         state = complete_task(t["state"])
@@ -425,13 +440,13 @@ def _stop_task(t: dict, ctx: DispatchContext) -> str:
         # re-picks it (belt + suspenders on top of the status=completed).
         try:
             from scheduler import cancel_task_by_name
-            cancel_task_by_name(name, reason="stopped by user")
+            cancel_task_by_name(name, reason=reason)
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("stop_task: cancel_task_by_name failed for %s: %s", name, exc)
     else:
         # Periodic / one-shot: cancel the queue entry.
         from scheduler import cancel_task_by_name
-        cancel_task_by_name(name, reason="stopped by user")
+        cancel_task_by_name(name, reason=reason)
     _log_action(ctx, "stop_task", name, name, "stopped")
     return "Task `%s` fermato." % name
 
@@ -466,7 +481,7 @@ def _resume_task(t: dict, ctx: DispatchContext) -> str:
             "Resume non supportato per task di tipo `%s`." % tk
         )
     state = t["state"]
-    if state.get("status") not in ("paused", "rate-limited"):
+    if state.get("status") not in ("paused", "rate-limited", "awaiting-input"):
         _log_action(ctx, "resume_task", name, name, "noop")
         return (
             "Task `%s` non è in pausa (status: %s)." % (name, state.get("status"))

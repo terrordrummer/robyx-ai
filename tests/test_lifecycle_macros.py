@@ -75,7 +75,7 @@ def _state(
     }
 
 
-def _ctx(entries, state_map=None):
+def _ctx(entries, state_map=None, user_message=None):
     state_map = state_map or {}
 
     def queue_reader():
@@ -89,6 +89,7 @@ def _ctx(entries, state_map=None):
         thread_id=42,
         queue_reader=queue_reader,
         state_reader=state_reader,
+        user_message=user_message,
     )
 
 
@@ -322,6 +323,33 @@ class TestStopTask:
         assert data[0]["status"] == "canceled"
         assert data[0]["canceled_reason"] == "stopped by user"
 
+    def test_stop_reason_includes_user_message_snippet(
+        self, tmp_path, monkeypatch,
+    ):
+        """When the dispatch context carries the user message, the
+        recorded ``canceled_reason`` must include a snippet of it so
+        later audits can distinguish user-driven stops from agent-driven
+        stops.
+        """
+        queue_file = tmp_path / "queue.json"
+        queue_file.write_text('[{"name": "check-metrics", '
+                              '"type": "periodic", "status": "pending", '
+                              '"thread_id": "42"}]')
+        monkeypatch.setattr("scheduler.QUEUE_FILE", queue_file)
+
+        entries = [_entry("check-metrics", "periodic", status="pending")]
+        ctx = _ctx(entries, user_message="ferma il task, non mi serve più")
+        asyncio.run(handle_lifecycle_macros(
+            [MacroInvocation("stop_task", "check-metrics", (0, 0))], ctx,
+        ))
+
+        import json
+        data = json.loads(queue_file.read_text())
+        assert data[0]["status"] == "canceled"
+        reason = data[0]["canceled_reason"]
+        assert reason.startswith("stopped by user:")
+        assert "ferma il task" in reason
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # PAUSE_TASK / RESUME_TASK
@@ -356,6 +384,39 @@ class TestPauseResume:
         assert "ripreso" in list(subs.values())[0].lower()
         reloaded = cont.load_state(cont.state_file_path("daily-report"))
         assert reloaded["status"] == "pending"
+
+    def test_resume_from_awaiting_input_clears_question(
+        self, tmp_path, monkeypatch,
+    ):
+        """Regression for v0.24.2 fire-and-forget bug.
+
+        Pre-v0.24.2 the resume handler accepted only {paused, rate-limited}
+        and rejected ``awaiting-input`` with a "non è in pausa" message,
+        even though the primary-agent contract told the workspace to emit
+        [RESUME_TASK] exactly for that state. The task would then get
+        stuck forever. This verifies the whitelist now includes
+        ``awaiting-input`` AND that the stale ``awaiting_question`` key
+        is cleared when resuming.
+        """
+        monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "continuous")
+        import continuous as cont
+
+        state = _state("daily-report", "awaiting-input")
+        state["awaiting_question"] = "Should I use option A or B?"
+        cont.save_state(cont.state_file_path("daily-report"), state)
+
+        entries = [_entry("daily-report", "continuous")]
+        state_map = {"daily-report": state}
+        ctx = _ctx(entries, state_map)
+        subs = asyncio.run(handle_lifecycle_macros(
+            [MacroInvocation("resume_task", "daily-report", (0, 0))], ctx,
+        ))
+        body = list(subs.values())[0]
+        assert "ripreso" in body.lower()
+
+        reloaded = cont.load_state(cont.state_file_path("daily-report"))
+        assert reloaded["status"] == "pending"
+        assert "awaiting_question" not in reloaded
 
     def test_pause_periodic_is_unsupported_message(self, tmp_path, monkeypatch):
         entries = [_entry("check-metrics", "periodic")]
