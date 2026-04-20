@@ -69,7 +69,8 @@ or requires multiple cycles of execution and evaluation — or explicitly
 writes `/loop` — suggest setting it up as a continuous task:
 
 > This kind of work benefits from an agentic loop. I can set it up as a
-> continuous task with a dedicated topic and branch. Want me to proceed?
+> continuous task with a dedicated git branch and structured state;
+> step reports arrive here in this chat with a `🔄` prefix. Want me to proceed?
 
 **Do NOT execute long iterative work inline.** The continuous task
 mechanism gives each step a clean context, versioned artifacts, and

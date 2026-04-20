@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.24.1
+
+**Documentation patch.** Removes residual references to the pre-0.23.0
+"dedicated workspace topic per continuous task" model from files that
+workspace agents read at setup time. No runtime behaviour change.
+
+### Changed
+
+- `templates/CONTINUOUS_SETUP.md` — the `[CREATE_CONTINUOUS]` emission
+  section no longer claims the system will "create a dedicated
+  workspace topic". It now documents the actual lifecycle: git branch
+  in `work_dir`, queue registration, step reports routed back into the
+  parent workspace chat with the `🔄 [<slug>]` prefix.
+- `docs/architecture.md` — workspace-agent section's "agentic loop"
+  paragraph realigned to the unified-chat model (spec 005).
+- `templates/prompt_workspace_agent.md` — the "when NOT to use"
+  overhead-cost bullet and the conversational "I can set it up as a
+  continuous task with …" suggestion template now describe branch +
+  state file, not a dedicated topic.
+- `templates/prompt_focused_agent.md` — same suggestion template
+  realigned.
+
+### Not changed
+
+- Historical CHANGELOG entries (≤ 0.22.x), release notes
+  (`releases/0.20.0.md`, `releases/0.23.0.md`), and planning artefacts
+  under `specs/004-*`, `specs/005-*` are intentionally preserved — they
+  document the decision that *removed* the sub-topic model and the
+  legacy migration that implemented the cutover.
+- `bot/migrations/v0_23_0.py` and its tests continue to reference
+  legacy sub-topics by design (that migration is what *closes* them).
+
+### Migration
+
+- `bot/migrations/v0_24_1.py` is a no-op; it exists only to keep the
+  version chain continuous (0.24.0 → 0.24.1).
+
 ## 0.24.0
 
 **Continuous-task lifecycle hardening.** Three coordinated fixes remove
