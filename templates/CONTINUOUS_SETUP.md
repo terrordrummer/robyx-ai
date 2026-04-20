@@ -69,8 +69,11 @@ continuous task:
 [/CONTINUOUS_PROGRAM]
 ```
 
-The system will create a dedicated workspace topic, a git branch, and start
-the first step automatically.
+The system will create a git branch (`continuous/<slug>` in `work_dir`),
+register the task in the queue, and start the first step automatically.
+No dedicated sub-topic is created: step reports flow back into **this same
+workspace chat** with a `🔄 [<slug>]` prefix. Never tell the user to "go to
+the 🔄 topic" — there is none.
 
 Use ASCII straight quotes (`"`) around attribute values. Curly/typographic
 quotes are tolerated but plain ASCII is preferred.
