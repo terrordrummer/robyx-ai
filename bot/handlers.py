@@ -508,6 +508,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                             thread_id=thread_id,
                             platform=platform,
                             manager=manager,
+                            user_message=message,
                         ),
                     )
                     response = substitute_lifecycle_macros(response, subs)

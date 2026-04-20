@@ -1050,6 +1050,33 @@ def _load_plan_md_for_prompt(name: str) -> str:
     return body.strip()
 
 
+def _maybe_demote_on_demand_awaiting_input(state: dict, name: str) -> bool:
+    """Server-side enforcement of the ``on-demand`` checkpoint policy.
+
+    A step agent running under ``on-demand`` has no legitimate reason to
+    park its task in ``awaiting-input`` — the template is explicit about
+    this. If it happens anyway (stale instructions, model misbehaviour,
+    prompt injection) the task would stall forever because the scheduler
+    skips ``awaiting-input`` entries. Auto-demote to ``pending`` so the
+    loop keeps running; the policy violation is logged.
+
+    Returns True if the state was mutated (caller should persist it).
+    """
+    if state.get("status") != "awaiting-input":
+        return False
+    policy = (state.get("program") or {}).get("checkpoint_policy") or "on-demand"
+    if policy != "on-demand":
+        return False
+    log.warning(
+        "Continuous task '%s': on-demand policy violated "
+        "(step parked in awaiting-input); auto-demoting to pending",
+        name,
+    )
+    state["status"] = "pending"
+    state.pop("awaiting_question", None)
+    return True
+
+
 async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple[list[tuple[str, int]], list[str]]:
     """Check continuous entries in the queue and dispatch next steps if ready.
 
@@ -1097,6 +1124,10 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                 log.info("Continuous task '%s': rate limit recovered, resuming", name)
             else:
                 continue
+
+        # Server-side enforcement of on-demand checkpoint policy.
+        if _maybe_demote_on_demand_awaiting_input(state, name):
+            save_state(Path(sf), state)
 
         # Skip if not ready
         if state["status"] in ("completed", "paused", "awaiting-input"):

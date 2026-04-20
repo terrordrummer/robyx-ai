@@ -229,9 +229,14 @@ def pause_task(state: dict) -> dict:
 
 
 def resume_task(state: dict) -> dict:
-    """Resume a paused or rate-limited task."""
+    """Resume a paused, rate-limited, or awaiting-input task.
+
+    Clears ``awaiting_question`` so the next scheduler tick sees a clean
+    ``pending`` state with no stale question attached.
+    """
     state["status"] = "pending"
     state["rate_limited_until"] = None
+    state.pop("awaiting_question", None)
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     return state
 
