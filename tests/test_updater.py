@@ -524,6 +524,98 @@ class TestApplyUpdate:
         assert "git pull --ff-only failed" in msg
 
     @pytest.mark.asyncio
+    @patch("updater._git")
+    async def test_preflight_refuses_when_unmerged_paths_exist(self, mock_git):
+        """Regression for the 2026-04-21 field incident: a prior failed
+        stash pop left the index in a merge-conflict state with no
+        ``MERGE_HEAD``. Every subsequent update would then fail on
+        ``git pull`` and roll back, leaving the user stuck in a loop.
+        The pre-flight gate must catch this up front and refuse to run
+        until the operator resolves it.
+        """
+        def side_effect(*args, check=True):
+            if args[:2] == ("ls-files", "--unmerged"):
+                # Git prints three stage lines per conflicted path
+                # (mode sha stage<TAB>path). We only need one sample line
+                # — the helper dedups by path.
+                return subprocess.CompletedProcess(
+                    ["git", *args], 0,
+                    "100644 abc123 1\tbot/continuous.py\n"
+                    "100644 def456 2\tbot/continuous.py\n"
+                    "100644 789abc 3\tbot/continuous.py\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+        mock_git.side_effect = side_effect
+        success, msg = await updater.apply_update("0.2.0")
+        assert success is False
+        assert "Pre-flight check failed" in msg
+        assert "unmerged path" in msg
+        assert "bot/continuous.py" in msg
+        # Pre-flight must not have started stashing / pulling / installing.
+        non_preflight = [
+            c for c in mock_git.call_args_list
+            if c[0][:1] in (("pull",), ("stash",))
+            or (len(c[0]) > 1 and c[0][:2] == ("stash", "--include-untracked"))
+        ]
+        assert non_preflight == [], (
+            "pre-flight must abort before stashing or pulling"
+        )
+
+    @pytest.mark.asyncio
+    @patch("updater._git")
+    async def test_preflight_refuses_mid_rebase(self, mock_git, tmp_path, monkeypatch):
+        """An in-progress rebase (``.git/rebase-merge/`` present) is
+        another unrecoverable-without-intervention state. Pre-flight
+        must refuse rather than let the update trample it."""
+        mock_git.side_effect = _make_git_side_effect()
+
+        fake_git = tmp_path / ".git"
+        (fake_git / "rebase-merge").mkdir(parents=True)
+        monkeypatch.setattr(updater, "PROJECT_ROOT", tmp_path)
+
+        success, msg = await updater.apply_update("0.2.0")
+        assert success is False
+        assert "Pre-flight check failed" in msg
+        assert "rebase" in msg
+
+    @pytest.mark.asyncio
+    @patch("updater._git")
+    async def test_safe_stash_pop_surfaces_unmerged_paths(self, mock_git, caplog):
+        """When ``git stash pop`` leaves conflict markers (the typical
+        cause of the field incident), ``_safe_stash_pop`` must log at
+        ERROR with the file list, not at a low-signal WARNING. Low-signal
+        was what hid the incident in the first place."""
+        import logging as _logging
+        caplog.set_level(_logging.DEBUG, logger="robyx.updater")
+
+        def side_effect(*args, check=True):
+            if args[:2] == ("stash", "pop"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 1, "",
+                    "CONFLICT (content): Merge conflict in bot/foo.py\n",
+                )
+            if args[:2] == ("ls-files", "--unmerged"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 0,
+                    "100644 aaa 1\tbot/foo.py\n"
+                    "100644 bbb 2\tbot/foo.py\n"
+                    "100644 ccc 3\tbot/foo.py\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+        mock_git.side_effect = side_effect
+        await updater._safe_stash_pop()
+
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert errors, "conflicted stash pop must log at ERROR"
+        msg = errors[-1].getMessage()
+        assert "UNMERGED" in msg
+        assert "bot/foo.py" in msg
+
+    @pytest.mark.asyncio
     @patch("updater.asyncio.create_subprocess_exec")
     @patch("updater._git")
     async def test_detached_head_reattaches_to_main(self, mock_git, mock_exec, tmp_path):
