@@ -225,6 +225,26 @@ STRINGS = {
         "Continuous task not created — an internal error prevented setup."
     ),
 
+    # UPDATE_PLAN macro
+    "update_plan_ok": (
+        "Plan for continuous task *%s* updated."
+    ),
+    "update_plan_error_malformed": (
+        "Plan update skipped — the update block was incomplete."
+    ),
+    "update_plan_error_bad_json": (
+        "Plan update skipped — the program payload could not be parsed."
+    ),
+    "update_plan_error_bad_field": (
+        "Plan update skipped — invalid value for field `%s`."
+    ),
+    "update_plan_error_not_found": (
+        "Plan update skipped — no continuous task named *%s* in this workspace."
+    ),
+    "update_plan_error_downstream": (
+        "Plan update skipped — an internal error prevented the update."
+    ),
+
     # Time formatting
     "time_now": "now",
     "time_minutes": "%dm ago",

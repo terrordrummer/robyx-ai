@@ -21,6 +21,7 @@ from ai_invoke import (
     CLOSE_WORKSPACE_PATTERN,
     CREATE_CONTINUOUS_PATTERN,
     CONTINUOUS_PROGRAM_PATTERN,
+    UPDATE_PLAN_PATTERN,
     CREATE_SPECIALIST_PATTERN,
     FOCUS_OFF_PATTERN,
     FOCUS_PATTERN,
@@ -51,6 +52,10 @@ from lifecycle_macros import (
     parse_lifecycle_macros,
     substitute_macros as substitute_lifecycle_macros,
 )
+from update_plan_macro import (
+    UpdatePlanContext,
+    apply_update_plan_macros,
+)
 
 
 _EXECUTIVE_MARKERS = (
@@ -62,6 +67,7 @@ _EXECUTIVE_MARKERS = (
     ("CLOSE_WORKSPACE", CLOSE_WORKSPACE_PATTERN),
     ("CREATE_CONTINUOUS", CREATE_CONTINUOUS_PATTERN),
     ("CONTINUOUS_PROGRAM", CONTINUOUS_PROGRAM_PATTERN),
+    ("UPDATE_PLAN", UPDATE_PLAN_PATTERN),
     ("CREATE_SPECIALIST", CREATE_SPECIALIST_PATTERN),
     ("SPECIALIST_INSTRUCTIONS", SPECIALIST_INSTRUCTIONS_PATTERN),
     ("SEND_IMAGE", SEND_IMAGE_PATTERN),
@@ -470,6 +476,21 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                         platform=platform,
                         manager=manager,
                         is_executive=True,
+                    ),
+                )
+
+                # Apply in-place continuous-task edits (UPDATE_PLAN).
+                # Runs right after CREATE so a reply that both creates a
+                # new task and adjusts an existing one is handled in a
+                # single turn. Workspace-scoped: tasks owned by other
+                # threads are reported as "not found".
+                response, _ = await apply_update_plan_macros(
+                    response,
+                    UpdatePlanContext(
+                        thread_id=thread_id,
+                        chat_id=chat_id,
+                        manager=manager,
+                        platform=platform,
                     ),
                 )
 

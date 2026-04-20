@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.24.0
+
+**Continuous-task lifecycle hardening.** Three coordinated fixes remove
+the three failure modes that let a continuous task be silently replaced,
+duplicated, or stopped for no good reason:
+
+### Added
+
+- **`{{CHECKPOINT_POLICY}}` is now injected into the step agent's
+  prompt.** The policy configured at task creation (`on-demand`,
+  `on-uncertainty`, `on-milestone`, `every-N-steps`) is no longer dead
+  metadata — the step agent receives an explicit, per-policy rule set
+  describing when it may stop and wait for user input. Default behaviour
+  (`on-demand`) is: never ask unless the user explicitly configured a
+  stop point. Previously the step agent stopped on its own judgement
+  regardless of policy (`bot/scheduler.py`,
+  `templates/CONTINUOUS_STEP.md`).
+- **Workspace agents are now aware of the continuous tasks they own.**
+  `ai_invoke._render_active_continuous_tasks(thread_id)` reads
+  `data/continuous/*/state.json` filtered by `workspace_thread_id` and
+  injects a short block at the end of the system prompt listing every
+  active task with objective, status, policy, next step, and any
+  pending `awaiting_question`. The block is empty (zero overhead) when
+  the workspace has no active tasks (`bot/ai_invoke.py`). This closes
+  the "fresh chat turn creates a duplicate task" failure mode.
+- **New `[UPDATE_PLAN name="<slug>"]` macro** for in-place program
+  edits. Accepts a partial `[CONTINUOUS_PROGRAM]` body and merges
+  `objective`, `success_criteria`, `constraints`, `checkpoint_policy`,
+  `context`, and/or `plan_text` into the existing state, regenerating
+  `plan.md` atomically. Workspace-scoped: tasks owned by other threads
+  report as "not found". Unknown fields are ignored for forward
+  compatibility; invalid values produce a prose rejection line and the
+  state file is never touched (`bot/update_plan_macro.py`).
+
+### Changed
+
+- **Workspace agent instructions rewritten** (`templates/prompt_workspace_agent.md`)
+  with a new "How you interact with running tasks" section: two modes
+  only (direct chat vs scheduled execution); never create a new task
+  with scope overlapping an active one; mid-task user messages are
+  responses within the plan, not fresh setup triggers; scope changes
+  go through `[UPDATE_PLAN]`, never `[CREATE_CONTINUOUS]`.
+- `strip_control_tokens_for_user` now also scrubs `[UPDATE_PLAN]`
+  macros for defense-in-depth on non-interactive paths
+  (`bot/continuous_macro.py`).
+- `[UPDATE_PLAN]` pattern added to `_EXECUTIVE_MARKERS` so
+  non-executive collaborative agents cannot emit it
+  (`bot/handlers.py`, `bot/ai_invoke.py`).
+
+### Fixed
+
+- The "scheduler fires step 1 → agent stops and asks a question →
+  user replies → agent creates a brand-new continuous task" failure
+  mode. Root causes were: (a) checkpoint_policy was never consulted
+  by the step agent; (b) the workspace agent had no visibility into
+  ongoing tasks when processing direct-chat replies; (c) there was no
+  clean path to modify an existing task in place. All three addressed.
+
+### Tests
+
+- New `tests/test_update_plan_macro.py` — 30 tests covering extraction
+  (paired / unclosed / fenced / curly-quoted / multi), field validation,
+  apply success + every rejection path, workspace scoping.
+- New `tests/test_active_tasks_context.py` — 8 tests for the dynamic
+  prompt injection: empty / single / filtered / terminal-exclusion /
+  string-thread normalisation / missing dir.
+- `tests/test_continuous_secondary_prompt.py` extended with a test
+  pinning the `{{CHECKPOINT_POLICY}}` placeholder + policy vocabulary.
+- Total: 1657 passed, 1 skipped.
+
 ## 0.23.0
 
 Feature `005-unified-workspace-chat` — **unified workspace chat for

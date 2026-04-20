@@ -710,16 +710,25 @@ def strip_control_tokens_for_user(text: str) -> str:
     """Canonical scrub for any user-visible final output.
 
     Removes continuous-task macros (``[CREATE_CONTINUOUS …]`` /
-    ``[CONTINUOUS_PROGRAM]…[/CONTINUOUS_PROGRAM]``), ``[STATUS …]`` tokens,
-    and collapses runs of ≥3 newlines to 2. Used at the interactive
-    response chokepoint, scheduled delivery, and any platform-specific
-    renderer (TTS, embed builders) that wants a clean body.
+    ``[CONTINUOUS_PROGRAM]…[/CONTINUOUS_PROGRAM]``), ``[UPDATE_PLAN …]``
+    macros, ``[STATUS …]`` tokens, and collapses runs of ≥3 newlines to
+    2. Used at the interactive response chokepoint, scheduled delivery,
+    and any platform-specific renderer (TTS, embed builders) that wants
+    a clean body.
 
     Pure, idempotent: safe to call twice.
     """
     if not text:
         return ""
     stripped, _tokens = extract_continuous_macros(text)
+    # Also scrub UPDATE_PLAN macros that may have leaked past the
+    # interactive chokepoint. Imported lazily to avoid circular imports
+    # (``update_plan_macro`` itself does not depend on this module).
+    try:
+        from update_plan_macro import extract_update_plan_macros
+        stripped, _ = extract_update_plan_macros(stripped)
+    except ImportError:
+        pass
     stripped = _STATUS_PATTERN.sub("", stripped)
     stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
     return stripped

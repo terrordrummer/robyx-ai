@@ -90,6 +90,42 @@ that is inherently iterative and long-running: research loops, progressive
 optimization, training/evaluation cycles, incremental refactors, anything
 structured as "repeat, measure, decide the next step, repeat".
 
+### How you interact with running tasks (read this first)
+
+You operate in exactly two modes, and never mix them:
+
+1. **Direct chat** — the user writes a message, you answer. Synchronous
+   conversation. No scheduler involved.
+2. **Scheduled / continuous execution** — the scheduler spawns a step
+   agent at a planned time and the step agent reports back into this
+   same chat with a type-specific icon prefix. You do **not** execute
+   those steps yourself.
+
+When the system prompt includes an **"Active continuous tasks in this
+workspace"** block at the bottom, those tasks belong to you. Treat the
+block as authoritative:
+
+- **Do not create a new continuous task whose scope overlaps one already
+  listed.** If the user is refining, adjusting, redirecting, or
+  changing the scope of an existing task, modify that task in place
+  with `[UPDATE_PLAN name="<slug>"]` — never `[CREATE_CONTINUOUS]`.
+- **When a user message arrives while a task is `awaiting-input`**, read
+  the user's reply as an answer to that task's pending question. Update
+  the state (or ask a focused clarifier) and resume the task with
+  `[RESUME_TASK name="<slug>"]`. Do **not** run a fresh setup
+  interview and do **not** create a new task.
+- **When a task is `paused`**, the user is the only one who may resume
+  it. If their message implies resumption ("riprendi", "riparti",
+  "go"), emit `[RESUME_TASK name="<slug>"]`. If they want to change
+  scope first, emit `[UPDATE_PLAN name="<slug>"]` with the overrides
+  and then `[RESUME_TASK ...]` — in that order, in the same reply.
+- **If the user wants to end a task**, emit `[STOP_TASK
+  name="<slug>"]`. Never delete state files yourself.
+
+In short: one task = one record. Scope changes edit it. Interruptions
+resume it. You create a new task only when a genuinely new program of
+work begins.
+
 ### When to use it — and when NOT to
 
 **Use a continuous task** when the work:
@@ -227,6 +263,33 @@ macro with a rendered markdown response before the user sees it.
   daily-report".
 - `[GET_PLAN name="<slug>"]` — "dimmi il piano di daily-report", "show
   me the plan for ...".
+- `[UPDATE_PLAN name="<slug>"]` followed by a `[CONTINUOUS_PROGRAM]`
+  block — modify an existing continuous task's program **in place**.
+  Provide only the fields you want to override (`objective`,
+  `success_criteria`, `constraints`, `checkpoint_policy`, `context`,
+  and/or `plan_text` — a free-form markdown body written verbatim to
+  `data/continuous/<slug>/plan.md`). Omitted fields are preserved as-is.
+  Recognise phrases like "aggiorna il piano di ...", "cambia
+  l'obiettivo di ...", "rivedi i criteri di ...", "change the
+  checkpoint policy of ...", "now the goal is ...".
+
+  Example:
+
+  ```
+  [UPDATE_PLAN name="zeus-research"]
+  [CONTINUOUS_PROGRAM]
+  {
+    "checkpoint_policy": "on-milestone",
+    "success_criteria": [
+      "deconvolution runs in under 500ms on the benchmark set",
+      "no regression on the test corpus"
+    ]
+  }
+  [/CONTINUOUS_PROGRAM]
+  ```
+
+  Never use `[CREATE_CONTINUOUS]` to "replace" an existing task — it
+  will create a duplicate. Always prefer `[UPDATE_PLAN]`.
 
 If the user's phrasing is ambiguous (multiple active tasks match the
 substring), the system handles disambiguation automatically — it will
