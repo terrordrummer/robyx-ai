@@ -362,16 +362,98 @@ async def _safe_stash_pop() -> None:
     best-effort: we don't raise, because we're already on an error path
     and the broader update outcome is what matters. But the operator
     needs to know to run ``git stash list`` / ``git stash pop`` manually.
+
+    Conflict detection: a non-zero exit most commonly means the stash
+    would overwrite changes in the now-current code (i.e. the user's
+    local edits conflict with the new release). Git leaves conflict
+    markers and **keeps the stash** in that case, but the index is now
+    in an unmerged state. If we don't surface this loudly, the *next*
+    auto-update will hit the pre-flight gate in ``apply_update`` and
+    refuse to run until the operator resolves the conflict. Log with
+    explicit file list and recovery instructions so "why did auto-update
+    stop working?" is answered before the next attempt.
     """
     result = await _git("stash", "pop", check=False)
-    if result.returncode != 0:
+    if result.returncode == 0:
+        return
+
+    stderr_out = (result.stderr or result.stdout).strip() or "(no output)"
+    unmerged = await _git("ls-files", "--unmerged", check=False)
+    unmerged_paths = sorted({
+        line.split("\t", 1)[1] for line in unmerged.stdout.splitlines()
+        if "\t" in line
+    })
+
+    if unmerged_paths:
+        log.error(
+            "git stash pop LEFT UNMERGED PATHS after rc=%d: %s\n"
+            "The local changes still exist in the stash AND conflict markers "
+            "are in the working tree. Resolve manually: inspect with "
+            "`git status`, edit the files to remove <<<<<<</=======/>>>>>>> "
+            "markers, `git add <resolved-file>`, then `git stash drop` when "
+            "happy. Until resolved, subsequent `apply_update` calls will "
+            "refuse to run (pre-flight gate). stderr: %s",
+            result.returncode,
+            ", ".join(unmerged_paths),
+            stderr_out,
+        )
+    else:
         log.warning(
             "git stash pop failed (rc=%d): %s — local changes may be stranded "
             "in the stash list; run `git stash list` to inspect, "
             "`git stash pop` to recover",
             result.returncode,
-            (result.stderr or result.stdout).strip() or "(no output)",
+            stderr_out,
         )
+
+
+async def _preflight_git_state() -> tuple[bool, str]:
+    """Refuse to start an update when the repo is in a pre-existing
+    broken-merge state.
+
+    Today's pattern (observed in the field 2026-04-21): an earlier
+    auto-update's ``git stash pop`` conflicted silently, leaving the
+    index with unmerged stages and no ``MERGE_HEAD``. Every subsequent
+    update would then fail on ``git pull`` with "Pulling is not
+    possible because you have unmerged files", roll back, and leave
+    the user stuck in a loop until a human intervened.
+
+    Pre-flight blocks: unmerged index entries, or the marker files/dirs
+    left behind by in-progress merge / cherry-pick / rebase operations.
+    Returns ``(ok, message)``. ``ok=True`` means the update can proceed.
+    """
+    unmerged = await _git("ls-files", "--unmerged", check=False)
+    unmerged_paths = sorted({
+        line.split("\t", 1)[1] for line in unmerged.stdout.splitlines()
+        if "\t" in line
+    })
+    if unmerged_paths:
+        return False, (
+            "repository has %d unmerged path(s) from a prior interrupted "
+            "operation: %s. Resolve them (edit the files, `git add` each, "
+            "commit or `git reset --mixed HEAD` if the changes are stale) "
+            "before re-running the update."
+            % (len(unmerged_paths), ", ".join(unmerged_paths))
+        )
+
+    # In-progress merge / cherry-pick / rebase leave these behind.
+    in_progress_markers = {
+        "merge": PROJECT_ROOT / ".git" / "MERGE_HEAD",
+        "cherry-pick": PROJECT_ROOT / ".git" / "CHERRY_PICK_HEAD",
+        "revert": PROJECT_ROOT / ".git" / "REVERT_HEAD",
+        "rebase (apply)": PROJECT_ROOT / ".git" / "rebase-apply",
+        "rebase (merge)": PROJECT_ROOT / ".git" / "rebase-merge",
+    }
+    for kind, marker in in_progress_markers.items():
+        if marker.exists():
+            return False, (
+                "a git %s operation is in progress (%s exists). "
+                "Finish it (`git %s --continue`) or abort it "
+                "(`git %s --abort`) before re-running the update."
+                % (kind, marker, kind.split()[0], kind.split()[0])
+            )
+
+    return True, ""
 
 
 async def _rollback_code_to(tag: str) -> None:
@@ -599,6 +681,10 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
 
     Safety structure:
 
+    0. Pre-flight: refuse to proceed if the repo has unmerged index
+       entries or an in-progress merge/rebase/cherry-pick. Prevents the
+       "previous failed stash pop wedged auto-update forever" class of
+       bugs (see :func:`_preflight_git_state`).
     1. Stash any local working-tree changes so the pull can fast-forward.
     2. Snapshot ``data/`` into ``data/backups/pre-update-*.tar.gz`` so a
        failed migration / smoke test can restore mutated state. Snapshot
@@ -633,6 +719,17 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         if notify_fn:
             await notify_fn(msg)
         log.info(msg)
+
+    # 0. Pre-flight: refuse to run if the repo is in a pre-existing
+    # broken-merge state. Without this gate, a prior failed stash pop
+    # that left unmerged index entries (see _safe_stash_pop) would
+    # cause every subsequent update to fail on `git pull`, roll back,
+    # and leave the user stuck in a loop. Surface the problem clearly
+    # up front so the operator can resolve it once.
+    ok, preflight_msg = await _preflight_git_state()
+    if not ok:
+        await notify("Pre-flight check failed: %s" % preflight_msg)
+        return False, "Pre-flight check failed: %s" % preflight_msg
 
     # 1. Stash local changes
     stash_result = await _git("stash", "--include-untracked", check=False)

@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.25.1
+
+**Auto-updater hardening.** Bugfix release that closes a wedged-update
+field incident: a prior silent `git stash pop` conflict had left the
+deployment's index in a broken-merge state, blocking every subsequent
+update attempt on `git pull` with no clear signal what was wrong. No
+persisted state schema changes.
+
+### Added
+
+- **`bot/updater.py::_preflight_git_state`** — pre-flight gate run
+  before the first stash in `apply_update`. Refuses to start if
+  `git ls-files --unmerged` reports any path, or if any of
+  `.git/MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
+  `rebase-apply/`, `rebase-merge/` exists. Error message names the
+  affected files / operation and the exact recovery command. The gate
+  runs before stashing / snapshotting, so a refused update has zero
+  side effects.
+
+### Fixed
+
+- **`bot/updater.py::_safe_stash_pop`** now logs at `ERROR` (not
+  `WARNING`) and includes the file list when a post-update stash pop
+  leaves unmerged paths behind. The old low-signal `WARNING` without
+  file list was how the original incident escaped notice. Message also
+  explicitly tells the operator the next auto-update will be blocked
+  by the pre-flight gate until the conflict is resolved.
+
+### Migration
+
+- **`bot/migrations/v0_25_1.py`** — no-op release bump.
+
+### Tests
+
+Three regression tests in `tests/test_updater.py`:
+`test_preflight_refuses_when_unmerged_paths_exist`,
+`test_preflight_refuses_mid_rebase`,
+`test_safe_stash_pop_surfaces_unmerged_paths`.
+
+Full suite: 1700 passed, 1 skipped.
+
 ## 0.25.0
 
 **Code-review follow-through.** Closes ten bugs surfaced by a deep
