@@ -42,8 +42,8 @@ flowchart TD
     ROBYX -->|creates &amp; manages| W1
     ROBYX -->|creates &amp; manages| W2
     ROBYX -->|creates &amp; manages| S
-    W1 -.->|@mention| S
-    W2 -.->|@mention| S
+    W1 -.->|"@mention"| S
+    W2 -.->|"@mention"| S
 
     classDef user fill:#e1f5ff,stroke:#0288d1,stroke-width:2px
     classDef orchestrator fill:#fff4e6,stroke:#e65100,stroke-width:2px
