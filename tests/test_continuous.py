@@ -242,3 +242,53 @@ class TestQueryHelpers:
         assert "Step 1" in ctx
         assert "Step 2" in ctx
         assert "commit abc" in ctx
+
+    def test_build_step_context_tolerates_summary_key(self):
+        """Regression for v0.24.3: a step agent that drifts and writes
+        ``summary`` instead of ``description`` must not crash the
+        scheduler. The reader falls back to the alternate key.
+        """
+        state = {
+            "history": [
+                {"step": 1, "summary": "Legacy summary key", "artifact": "commit abc"},
+            ]
+        }
+        ctx = build_step_context(state)
+        assert "Step 1" in ctx
+        assert "Legacy summary key" in ctx
+        assert "commit abc" in ctx
+
+    def test_build_step_context_tolerates_missing_description_and_summary(self):
+        state = {
+            "history": [
+                {"step": 3, "artifact": "commit xyz"},
+            ]
+        }
+        ctx = build_step_context(state)
+        assert "Step 3" in ctx
+        # Falls back to artifact when neither description nor summary present.
+        assert "commit xyz" in ctx
+
+    def test_build_step_context_tolerates_missing_step_number(self):
+        state = {
+            "history": [
+                {"description": "Did thing", "artifact": "commit abc"},
+            ]
+        }
+        ctx = build_step_context(state)
+        assert "Step ?" in ctx
+        assert "Did thing" in ctx
+
+    def test_build_step_context_skips_non_dict_entries(self):
+        state = {
+            "history": [
+                "not a dict",
+                {"step": 1, "description": "Real entry", "artifact": "commit abc"},
+                42,
+            ]
+        }
+        ctx = build_step_context(state)
+        assert "Step 1" in ctx
+        assert "Real entry" in ctx
+        # The garbage entries must not have crashed the renderer.
+        assert "not a dict" not in ctx

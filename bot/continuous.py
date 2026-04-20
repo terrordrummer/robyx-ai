@@ -302,11 +302,40 @@ def is_ready_for_next_step(state: dict) -> bool:
 
 
 def build_step_context(state: dict) -> str:
-    """Build a summary of previous steps for the step agent's context."""
+    """Build a summary of previous steps for the step agent's context.
+
+    Robust against malformed history entries: a step agent that drifts
+    from the documented schema (for instance writing ``summary`` instead
+    of ``description``, or omitting ``step``) must NOT crash the
+    scheduler's dispatch loop. We fall back across common alternate keys
+    and skip entries that are truly unreadable, logging a warning so the
+    drift is visible without being fatal.
+    """
     lines = []
     for entry in state.get("history", [])[-10:]:  # Last 10 steps
-        lines.append(
-            "Step %d: %s → %s"
-            % (entry["step"], entry["description"][:80], entry.get("artifact", "n/a"))
+        if not isinstance(entry, dict):
+            log.warning(
+                "build_step_context: skipping non-dict history entry: %r",
+                entry,
+            )
+            continue
+        step_num = entry.get("step")
+        description = (
+            entry.get("description")
+            or entry.get("summary")
+            or entry.get("artifact")
+            or "(no description)"
         )
+        artifact = entry.get("artifact", "n/a")
+        try:
+            desc_str = str(description)[:80]
+            step_label = (
+                "Step %d" % int(step_num) if step_num is not None else "Step ?"
+            )
+            lines.append("%s: %s → %s" % (step_label, desc_str, artifact))
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning(
+                "build_step_context: skipping unrenderable entry %r: %s",
+                entry, exc,
+            )
     return "\n".join(lines) if lines else "(no previous steps)"
