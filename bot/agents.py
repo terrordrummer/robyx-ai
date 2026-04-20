@@ -149,34 +149,49 @@ class AgentManager:
         )
 
     def _load_state(self):
+        """Read ``STATE_FILE`` into ``self.agents``.
+
+        Called only from ``__init__``. Cross-process safety of the
+        subsequent save cycle relies on
+        :func:`bot.bot.ensure_single_instance` — do NOT invoke this method
+        mid-run from another call site without adding explicit file
+        locking around the load.
+        """
         if not STATE_FILE.exists():
             return
-        try:
-            raw = STATE_FILE.read_text()
-        except (OSError, UnicodeDecodeError) as e:
-            # Non-UTF-8 bytes are treated as corruption: quarantine and
-            # start with an empty registry so the next save doesn't
-            # silently overwrite whatever is on disk.
-            _quarantine_corrupt_file(STATE_FILE, reason="Decode error: %s" % e)
-            log.error(
-                "State file %s is unreadable (%s) — quarantined. "
-                "Starting with empty agent registry.",
-                STATE_FILE, e,
-            )
-            return
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            # Corrupt state would be silently overwritten on the next
-            # save_state() — losing the user's agent registry forever.
-            # Quarantine the file so an operator can inspect it.
-            _quarantine_corrupt_file(STATE_FILE, reason="JSONDecodeError: %s" % e)
-            log.error(
-                "State file %s is corrupt — quarantined. "
-                "Starting with empty agent registry; recreate workspaces via chat.",
-                STATE_FILE,
-            )
-            return
+
+        # Two attempts: the original file, and (if quarantined) whatever
+        # _recover_from_snapshot was able to install. Recovery happens
+        # at most once per call, so an unrecoverable corruption falls
+        # straight through to the empty-state path.
+        for attempt in range(2):
+            try:
+                raw = STATE_FILE.read_text()
+            except (OSError, UnicodeDecodeError) as e:
+                if attempt == 0:
+                    _quarantine_corrupt_file(STATE_FILE, reason="Decode error: %s" % e)
+                    if _recover_from_snapshot(STATE_FILE, reason="Decode error: %s" % e):
+                        continue
+                log.error(
+                    "State file %s is unreadable (%s) — quarantined. "
+                    "Starting with empty agent registry.",
+                    STATE_FILE, e,
+                )
+                return
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                if attempt == 0:
+                    _quarantine_corrupt_file(STATE_FILE, reason="JSONDecodeError: %s" % e)
+                    if _recover_from_snapshot(STATE_FILE, reason="JSONDecodeError: %s" % e):
+                        continue
+                log.error(
+                    "State file %s is corrupt — quarantined. "
+                    "Starting with empty agent registry; recreate workspaces via chat.",
+                    STATE_FILE,
+                )
+                return
+            break  # parse succeeded; continue with the rest of the load
         try:
             dirty = False
             for name, agent_data in data.get("agents", {}).items():
@@ -447,6 +462,130 @@ def _quarantine_corrupt_file(path, reason: str) -> None:
             "Failed to quarantine corrupt file %s: %s — leaving in place",
             path, e,
         )
+
+
+def _recover_from_snapshot(target, reason: str) -> bool:
+    """Try to restore *target* from the most recent updater data/ snapshot.
+
+    Called after :func:`_quarantine_corrupt_file` has set the corrupt file
+    aside. Walks ``DATA_DIR/backups/pre-update-*.tar.gz`` newest → oldest,
+    extracts the file at the same relative path inside ``DATA_DIR``,
+    validates the bytes parse as JSON, and atomically installs them as
+    the new *target*. Returns True on success.
+
+    Failures (no backups dir, no snapshots, none with a parseable copy,
+    extraction error) return False — the caller falls back to its
+    empty-state path. Because the snapshot is taken by the updater
+    *before* applying a release, the recovered copy is at least as fresh
+    as the last successful update; writes since then are LOST. The
+    log message is CRITICAL to make this visible.
+    """
+    import tarfile
+    from pathlib import Path
+
+    from config import DATA_DIR
+
+    try:
+        from updater import BACKUPS_DIR_NAME, SNAPSHOT_PREFIX
+    except Exception:
+        # updater is normally available; fall back to literals if its
+        # import side-effects ever fail (we don't want recovery itself to
+        # raise inside an already-degraded load path).
+        BACKUPS_DIR_NAME, SNAPSHOT_PREFIX = "backups", "pre-update-"
+
+    target = Path(target)
+    backups_dir = Path(DATA_DIR) / BACKUPS_DIR_NAME
+    if not backups_dir.exists():
+        log.critical(
+            "Cannot recover %s from snapshot: no backups dir at %s. "
+            "File quarantined; starting with empty state. Reason: %s",
+            target, backups_dir, reason,
+        )
+        return False
+
+    try:
+        rel_path = target.resolve().relative_to(Path(DATA_DIR).resolve())
+    except ValueError:
+        log.critical(
+            "Cannot recover %s: target is outside DATA_DIR=%s. Reason: %s",
+            target, DATA_DIR, reason,
+        )
+        return False
+
+    # Snapshots are tarred with arcname=".", so members are
+    # "./<rel>" (older tar) or "<rel>" (newer). Try both.
+    candidates = ["./" + rel_path.as_posix(), rel_path.as_posix()]
+
+    try:
+        snapshots = sorted(
+            backups_dir.glob(SNAPSHOT_PREFIX + "*.tar.gz"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError as e:
+        log.critical(
+            "Cannot list snapshots in %s: %s. Reason: %s",
+            backups_dir, e, reason,
+        )
+        return False
+
+    for snap in snapshots:
+        try:
+            with tarfile.open(str(snap), "r:gz") as tf:
+                member = None
+                for c in candidates:
+                    try:
+                        member = tf.getmember(c)
+                        break
+                    except KeyError:
+                        continue
+                if member is None or not member.isfile():
+                    continue
+                fobj = tf.extractfile(member)
+                if fobj is None:
+                    continue
+                content = fobj.read()
+        except (OSError, tarfile.TarError) as e:
+            log.warning(
+                "Snapshot %s unreadable (%s) — trying older snapshot",
+                snap.name, e,
+            )
+            continue
+
+        try:
+            json.loads(content.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as e:
+            log.warning(
+                "Snapshot %s has an unusable copy of %s (%s) — trying older",
+                snap.name, rel_path, e,
+            )
+            continue
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_suffix(target.suffix + ".recover-tmp")
+            tmp.write_bytes(content)
+            os.replace(tmp, target)
+        except OSError as e:
+            log.critical(
+                "Recovered bytes from %s but install to %s failed: %s. "
+                "Falling back to empty state. Reason: %s",
+                snap.name, target, e, reason,
+            )
+            return False
+
+        log.critical(
+            "Recovered corrupt %s from snapshot %s (reason: %s). "
+            "Writes since the snapshot are LOST — review and reconcile.",
+            target, snap.name, reason,
+        )
+        return True
+
+    log.critical(
+        "No usable snapshot found for %s — starting with empty state. "
+        "Reason: %s", target, reason,
+    )
+    return False
 
 
 def format_age(timestamp: float) -> str:

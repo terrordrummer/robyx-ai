@@ -165,6 +165,60 @@ class TestSendMessageRawHttpx:
             )
 
 
+class TestSendToChannelParseMode:
+    """``send_to_channel`` posts to a forum topic. Topic output is markdown
+    by convention, so ``parse_mode=None`` defaults to ``"Markdown"`` —
+    different from ``send_message``, which only renders markdown when
+    explicitly requested."""
+
+    @pytest.fixture
+    def captured(self, telegram_platform):
+        """Patch the persistent httpx client to capture the POST payload."""
+        captured: dict = {}
+
+        class _FakeResponse:
+            def json(self):
+                return {"ok": True}
+
+        class _FakeClient:
+            async def post(self, url, data=None, **kwargs):
+                captured["url"] = url
+                captured["data"] = data
+                return _FakeResponse()
+
+        telegram_platform._client = _FakeClient()
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_default_renders_markdown(self, telegram_platform, captured):
+        ok = await telegram_platform.send_to_channel(42, "**hi**")
+        assert ok is True
+        assert captured["data"]["parse_mode"] == "Markdown"
+        assert captured["data"]["message_thread_id"] == 42
+
+    @pytest.mark.asyncio
+    async def test_explicit_markdown_renders_markdown(
+        self, telegram_platform, captured,
+    ):
+        await telegram_platform.send_to_channel(42, "x", parse_mode="markdown")
+        assert captured["data"]["parse_mode"] == "Markdown"
+
+    @pytest.mark.asyncio
+    async def test_empty_string_disables_parsing(
+        self, telegram_platform, captured,
+    ):
+        """Opt-out path documented in base.Platform.send_to_channel."""
+        await telegram_platform.send_to_channel(42, "x", parse_mode="")
+        assert "parse_mode" not in captured["data"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_html_passes_through(
+        self, telegram_platform, captured,
+    ):
+        await telegram_platform.send_to_channel(42, "x", parse_mode="HTML")
+        assert captured["data"]["parse_mode"] == "HTML"
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Persistent httpx client (v0.20.16): every Telegram API call must
 # reuse a single AsyncClient so connection pooling actually works.

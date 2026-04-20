@@ -85,6 +85,20 @@ def _strip_executive_markers(response: str, agent_name: str) -> str:
     Used when the originating message lacks executive authorization
     (e.g. PARTICIPANT in a collab workspace). Logs each marker dropped
     so prompt-injection attempts surface in the bot log.
+
+    Note on quote-variant tolerance: the patterns consumed here are the
+    same ones used by the primary dispatcher in ``ai_invoke`` /
+    ``continuous_macro`` / ``update_plan_macro``. That means this
+    stripper matches exactly what the executive-authorized path would
+    match — no more, no less. In particular:
+
+    * ``CREATE_CONTINUOUS`` and ``UPDATE_PLAN`` tolerate ASCII and
+      typographic quotes (their authors are noisy workspace agents).
+    * ``CREATE_WORKSPACE`` / ``CLOSE_WORKSPACE`` / ``CREATE_SPECIALIST``
+      etc. accept only ASCII double quotes (their author is the
+      orchestrator, prompted to emit strict quotes). A marker that
+      wouldn't fire the executive path can't leak authority if we
+      don't strip it either — it just passes through as harmless text.
     """
     if not response:
         return response
@@ -1366,7 +1380,11 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             log.warning("Empty response from [%s] after stripping patterns", agent.name)
             response = STRINGS["ai_empty"]
 
-        for chunk in split_message(response):
+        # Use the platform's per-message ceiling (Telegram 4096, Discord 2000,
+        # Slack 4000). The tag prefix consumes a few dozen chars, leave a safe
+        # margin so the prefixed payload still fits the platform cap.
+        max_len = max(getattr(platform, "max_message_length", 4000) - 64, 256)
+        for chunk in split_message(response, max_len=max_len):
             try:
                 await platform.send_message(
                     chat_id=chat_id,

@@ -233,10 +233,12 @@ class TestCloseChannelFailure:
 
 class TestCorruptedState:
     @pytest.mark.asyncio
-    async def test_corrupted_json_is_skipped_not_fatal(
+    async def test_corrupted_json_raises_but_good_task_persists(
         self, data_dir, platform,
     ):
-        # One valid, one corrupted.
+        # One valid, one corrupted. The migration raises at the end to
+        # halt the chain so the operator notices; the good task's state
+        # is still persisted atomically before the raise.
         _write_state(data_dir, "good")
         bad_dir = data_dir / "continuous" / "bad"
         bad_dir.mkdir(parents=True)
@@ -245,7 +247,8 @@ class TestCorruptedState:
         manager = _FakeManager({"ops": _FakeAgent("ops", thread_id=2)})
 
         ctx = MigrationContext(platform=platform, manager=manager, data_dir=data_dir)
-        await mig.upgrade(ctx)
+        with pytest.raises(RuntimeError, match="could not be migrated"):
+            await mig.upgrade(ctx)
 
         # Good one migrated; bad one left alone.
         good_state = json.loads(
@@ -256,6 +259,9 @@ class TestCorruptedState:
         bad_text = (data_dir / "continuous" / "bad" / "state.json").read_text()
         assert bad_text == "{not valid json"
 
+        # Done marker NOT written — chain halts, will retry on next boot.
+        assert not (data_dir / "migrations" / "v0_23_0.done").exists()
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Missing workspace
@@ -264,7 +270,7 @@ class TestCorruptedState:
 
 class TestMissingWorkspace:
     @pytest.mark.asyncio
-    async def test_unknown_parent_workspace_skipped(
+    async def test_unknown_parent_workspace_raises(
         self, data_dir, platform,
     ):
         _write_state(data_dir, "orphan", parent_workspace="vanished")
@@ -272,7 +278,8 @@ class TestMissingWorkspace:
         manager = _FakeManager({})
 
         ctx = MigrationContext(platform=platform, manager=manager, data_dir=data_dir)
-        await mig.upgrade(ctx)
+        with pytest.raises(RuntimeError, match="could not be migrated"):
+            await mig.upgrade(ctx)
 
         # State unchanged — no marker stamped.
         state = json.loads(
@@ -283,6 +290,36 @@ class TestMissingWorkspace:
         # Platform side effects not attempted for the skipped task.
         assert platform.close_channel.await_count == 0
         assert platform.send_message.await_count == 0
+        # Done marker NOT written — chain halts until operator investigates.
+        assert not (data_dir / "migrations" / "v0_23_0.done").exists()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_workspace_recovers_completes_migration(
+        self, data_dir, platform,
+    ):
+        """On re-run, recovered workspaces finish and done_marker is written."""
+        _write_state(data_dir, "orphan", parent_workspace="vanished")
+
+        # First pass: vanished workspace → raise.
+        ctx1 = MigrationContext(
+            platform=platform, manager=_FakeManager({}), data_dir=data_dir,
+        )
+        with pytest.raises(RuntimeError):
+            await mig.upgrade(ctx1)
+
+        # Operator fixes the workspace. Second pass completes.
+        manager = _FakeManager({"vanished": _FakeAgent("vanished", thread_id=5)})
+        ctx2 = MigrationContext(
+            platform=platform, manager=manager, data_dir=data_dir,
+        )
+        await mig.upgrade(ctx2)
+
+        state = json.loads(
+            (data_dir / "continuous" / "orphan" / "state.json").read_text()
+        )
+        assert state["migrated_v0_23_0"]
+        assert state["workspace_thread_id"] == 5
+        assert (data_dir / "migrations" / "v0_23_0.done").exists()
 
 
 # ─────────────────────────────────────────────────────────────────────────

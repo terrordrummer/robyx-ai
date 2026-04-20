@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, List
 
@@ -116,7 +117,18 @@ def _save_applied(data: dict) -> None:
         except Exception:
             pass
     merged.update(data)
-    MIGRATIONS_FILE.write_text(json.dumps(merged, indent=2))
+    # tmp + fsync + os.replace: a SIGKILL or power loss mid-save must never
+    # leave migrations.json partially written (same contract as tracker.save).
+    tmp = MIGRATIONS_FILE.with_suffix(MIGRATIONS_FILE.suffix + ".tmp")
+    payload = json.dumps(merged, indent=2)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(tmp, MIGRATIONS_FILE)
 
 
 async def run_pending(platform, manager) -> list[tuple[str, str]]:

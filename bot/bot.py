@@ -143,6 +143,16 @@ def ensure_single_instance():
                 sys.exit("Robyx already running (another instance holds the lock)")
         _PID_LOCK_FD = fd
     else:
+        # Windows fallback: no fcntl, so we can't hold a real file lock
+        # for the life of the process. Instead we consult the PID file and
+        # check whether the recorded process looks like another running
+        # bot. There is a narrow TOCTOU window between the liveness check
+        # and ``PID_FILE.write_text`` below where two concurrent starts
+        # could both decide they are the sole instance. This is an
+        # accepted trade-off — Windows deployments are rare in practice
+        # and the POSIX path above is race-free. If this ever becomes a
+        # real problem, switch to ``os.open(..., O_CREAT | O_EXCL)`` for
+        # atomic exclusive creation.
         from process import is_pid_alive, is_bot_process_sync, get_process_name_sync
 
         if PID_FILE.exists():

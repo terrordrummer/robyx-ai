@@ -1430,6 +1430,80 @@ class TestApplyUpdateChildEnvHygiene:
         assert env.get("PATH") == "/usr/bin"
 
     @pytest.mark.asyncio
+    async def test_migration_step_with_quoted_argument_tokenized_via_shlex(
+        self, tmp_path,
+    ):
+        """Regression: migration steps with quoted args must tokenize via
+        shlex, not str.split. Plain split would break `mv "old name" new`
+        into 4 tokens ('mv', '"old', 'name"', 'new') instead of 3.
+        """
+        (tmp_path / "VERSION").write_text("0.1.0\n")
+        (tmp_path / "releases" / "0.2.0.md").write_text(
+            "---\n"
+            "version: 0.2.0\n"
+            "min_compatible: 0.1.0\n"
+            "requires_migration: true\n"
+            "---\n\n"
+            "## Migration\n\n"
+            '1. Run: `python -m pip install "package[extra]==1.2"`\n'
+        )
+
+        mig_proc = AsyncMock()
+        mig_proc.communicate = AsyncMock(return_value=(b"ok", b""))
+        mig_proc.returncode = 0
+
+        pip_proc = AsyncMock()
+        pip_proc.communicate = AsyncMock(return_value=(b"", b""))
+        pip_proc.returncode = 0
+
+        captured_argv: list[tuple] = []
+
+        async def _capture_spawn(*args, **kwargs):
+            captured_argv.append(args)
+            if args and "/.venv/" in str(args[0]):
+                return pip_proc
+            return mig_proc
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch("updater.asyncio.create_subprocess_exec", side_effect=_capture_spawn), \
+             patch("updater._snapshot_data_dir", return_value=None), \
+             patch("updater._post_update_smoke_test", new=AsyncMock(return_value=(True, ""))):
+            await updater.apply_update("0.2.0")
+
+        mig_calls = [a for a in captured_argv if a and a[0] == "python"]
+        assert mig_calls, "migration step was not invoked"
+        argv = mig_calls[0]
+        # shlex strips the quotes; the literal argument is preserved as a
+        # single token. str.split would have produced 5 fragments.
+        assert argv == ("python", "-m", "pip", "install", "package[extra]==1.2")
+
+    @pytest.mark.asyncio
+    async def test_migration_step_with_unbalanced_quotes_fails_clean(
+        self, tmp_path,
+    ):
+        """A malformed step (unbalanced quote) must fail the update with a
+        clear error rather than crash the parser deep in subprocess code."""
+        (tmp_path / "VERSION").write_text("0.1.0\n")
+        (tmp_path / "releases" / "0.2.0.md").write_text(
+            "---\n"
+            "version: 0.2.0\n"
+            "min_compatible: 0.1.0\n"
+            "requires_migration: true\n"
+            "---\n\n"
+            "## Migration\n\n"
+            '1. Run: `echo "unclosed`\n'
+        )
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch("updater._snapshot_data_dir", return_value=None), \
+             patch("updater._restore_data_dir"), \
+             patch("updater._rollback_code_to", new=AsyncMock()):
+            ok, msg = await updater.apply_update("0.2.0")
+
+        assert ok is False
+        assert "Unparseable migration step" in msg
+
+    @pytest.mark.asyncio
     async def test_migration_step_invoked_with_scrubbed_env(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "dc-secret")
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")

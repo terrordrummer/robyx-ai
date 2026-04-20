@@ -766,6 +766,32 @@ class TestSendResponse:
         assert "parse_mode" not in fallback_kwargs
         assert "[robyx]" in fallback_kwargs["text"]
 
+    @pytest.mark.asyncio
+    @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="x" * 5000)
+    @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.split_message")
+    async def test_split_message_receives_platform_max_length(
+        self, mock_split, mock_deleg, mock_focus, mock_invoke,
+        handlers, mock_platform, msg_ref,
+    ):
+        """Regression: Discord caps messages at 2000 chars. The handler
+        must pass ``platform.max_message_length`` to ``split_message``
+        instead of letting it default to Telegram's 4000."""
+        mock_split.return_value = ["chunk"]
+        mock_platform.max_message_length = 2000  # Discord ceiling
+
+        msg = make_message(text="produce a long reply")
+        await handlers["message"](mock_platform, msg, msg_ref)
+
+        assert mock_split.called
+        max_len = mock_split.call_args.kwargs.get("max_len")
+        # Tag prefix is reserved (~64 chars), so the budget must be
+        # platform_cap - prefix_margin and strictly under the cap.
+        assert max_len is not None
+        assert max_len < 2000, "split must respect platform cap"
+        assert max_len >= 1900, "but should consume nearly the whole budget"
+
 
 # ---------------------------------------------------------------------------
 # Helpers for new tests
@@ -1051,7 +1077,7 @@ class TestRestartPattern:
     @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="Config aggiornata.\n[RESTART]")
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_restart_triggered(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_restart,
         handlers, mock_platform, msg_ref
@@ -1069,7 +1095,7 @@ class TestRestartPattern:
     @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="No restart needed.")
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_no_restart_without_pattern(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_restart,
         handlers, mock_platform, msg_ref
@@ -1090,7 +1116,7 @@ class TestHandleWorkspaceCommands:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_create_single_workspace(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_create,
         handlers, mock_platform, msg_ref
@@ -1116,7 +1142,7 @@ class TestHandleWorkspaceCommands:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_create_multiple_workspaces_progress(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_create,
         handlers, mock_platform, msg_ref
@@ -1148,7 +1174,7 @@ class TestHandleWorkspaceCommands:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_create_workspace_fails(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_create,
         handlers, mock_platform, msg_ref
@@ -1174,7 +1200,7 @@ class TestHandleWorkspaceCommands:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_create_workspace_rejection_reason_is_shown(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_create,
         handlers, mock_platform, msg_ref
@@ -1197,7 +1223,7 @@ class TestHandleWorkspaceCommands:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_close_workspace_success(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_close,
         handlers, mock_platform, msg_ref
@@ -1216,7 +1242,7 @@ class TestHandleWorkspaceCommands:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_close_workspace_not_found(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_close,
         handlers, mock_platform, msg_ref
@@ -1234,7 +1260,7 @@ class TestHandleWorkspaceCommands:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_create_specialist_success(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_create_spec,
         handlers, mock_platform, msg_ref
@@ -1258,7 +1284,7 @@ class TestHandleWorkspaceCommands:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_create_specialist_fails(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_create_spec,
         handlers, mock_platform, msg_ref
@@ -1278,7 +1304,7 @@ class TestHandleWorkspaceCommands:
     @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="Just a plain reply")
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_no_patterns(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref
@@ -1304,7 +1330,7 @@ class TestHandleSendImage:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_single_image_sent_and_stripped(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, handlers, mock_platform, msg_ref
     ):
@@ -1332,7 +1358,7 @@ class TestHandleSendImage:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_image_without_caption(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, handlers, mock_platform, msg_ref
     ):
@@ -1350,7 +1376,7 @@ class TestHandleSendImage:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_multiple_images_sent_in_order(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, handlers, mock_platform, msg_ref
     ):
@@ -1373,7 +1399,7 @@ class TestHandleSendImage:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_platform_returns_none_appends_error_to_reply(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, handlers, mock_platform, msg_ref
     ):
@@ -1399,7 +1425,7 @@ class TestHandleSendImage:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_platform_raises_does_not_crash_handler(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, handlers, mock_platform, msg_ref
     ):
@@ -1418,7 +1444,7 @@ class TestHandleSendImage:
     @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="Just a reply, no media here.")
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_no_pattern_does_not_call_send_photo(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, handlers, mock_platform, msg_ref
     ):
@@ -1443,7 +1469,7 @@ class TestHandleRemind:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_in_duration_queues_reminder_and_strips_pattern(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref, tmp_path,
@@ -1476,7 +1502,7 @@ class TestHandleRemind:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_at_iso_datetime_with_offset(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref, tmp_path,
@@ -1498,7 +1524,7 @@ class TestHandleRemind:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_multiple_reminders_in_one_response(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref, tmp_path,
@@ -1521,7 +1547,7 @@ class TestHandleRemind:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_default_thread_is_current_topic(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         agent_manager, claude_backend, mock_platform, msg_ref, tmp_path,
@@ -1553,7 +1579,7 @@ class TestHandleRemind:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_explicit_thread_overrides_default(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         agent_manager, claude_backend, mock_platform, msg_ref, tmp_path,
@@ -1582,7 +1608,7 @@ class TestHandleRemind:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_invalid_duration_appends_inline_error(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref, tmp_path,
@@ -1605,7 +1631,7 @@ class TestHandleRemind:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_both_at_and_in_rejected(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref,
@@ -1624,7 +1650,7 @@ class TestHandleRemind:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_missing_text_rejected(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref,
@@ -1642,7 +1668,7 @@ class TestHandleRemind:
     @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="Just a reply, no scheduling here.")
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_no_pattern_does_not_create_file(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref, tmp_path,
@@ -1674,7 +1700,7 @@ class TestHandleRemindAction:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_action_mode_routes_to_timed_queue(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         agent_manager, claude_backend, mock_platform, msg_ref, tmp_path,
@@ -1727,7 +1753,7 @@ class TestHandleRemindAction:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_action_targets_specialist_uses_specialists_path(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         agent_manager, claude_backend, mock_platform, msg_ref, tmp_path,
@@ -1762,7 +1788,7 @@ class TestHandleRemindAction:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_unknown_agent_rejected_with_inline_error(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref, tmp_path,
@@ -1785,7 +1811,7 @@ class TestHandleRemindAction:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_robyx_is_not_a_valid_target(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         handlers, mock_platform, msg_ref, tmp_path,
@@ -1808,7 +1834,7 @@ class TestHandleRemindAction:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_explicit_thread_overrides_target_default(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         agent_manager, claude_backend, mock_platform, msg_ref, tmp_path,
@@ -1837,7 +1863,7 @@ class TestHandleRemindAction:
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_mixed_text_and_action_in_one_response(
         self, mock_split, mock_deleg, mock_focus, mock_invoke,
         agent_manager, claude_backend, mock_platform, msg_ref, tmp_path,
@@ -1892,7 +1918,7 @@ class TestHandleVoice:
     @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="AI heard you")
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
-    @patch("handlers.split_message", side_effect=lambda t: [t])
+    @patch("handlers.split_message", side_effect=lambda t, **kw: [t])
     async def test_voice_success(
         self, mock_split, mock_deleg, mock_focus, mock_invoke, mock_transcribe, mock_avail,
         handlers, mock_platform, msg_ref

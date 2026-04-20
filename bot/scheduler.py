@@ -14,7 +14,16 @@ continuous : iterative autonomous work (dispatched via bot.continuous)
 Race-condition safety
 ---------------------
 All queue mutations use atomic write-then-rename (``os.replace``).
-The claim system prevents double-dispatch even on concurrent access.
+The claim system prevents double-dispatch of one-shot and periodic
+entries even on concurrent access.
+
+Continuous tasks follow a different model: their source of truth is
+the per-task ``data/continuous/<name>/state.json`` file (not the queue
+entry), and the claim system does not apply. Dispatch safety comes from
+the per-task lock file written alongside state (see
+``scheduled_delivery.py``), and orphan recovery reconciles state back
+to ``failed`` when the scheduler sees ``status="running"`` but the lock
+file is gone (i.e. the subprocess crashed without clean teardown).
 
 Offline recovery
 ----------------
