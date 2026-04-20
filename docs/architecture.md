@@ -30,6 +30,33 @@ Every agent lives in its own topic/channel. You can talk to any agent directly b
 
 Robyx has three types of agents, each with a distinct purpose:
 
+```mermaid
+flowchart TD
+    YOU[<b>YOU</b><br/><i>Chat messages</i>]
+    ROBYX[<b>ROBYX</b><br/>Principal Orchestrator<br/><i>Lives in Headquarters</i><br/>Creates &amp; manages all agents]
+    W1[<b>Workspace Agent</b><br/>One channel. One job. Focused.]
+    W2[<b>Workspace Agent</b><br/>One channel. One job. Focused.]
+    S[<b>SPECIALIST</b><br/>Cross-functional<br/>Available to ALL workspaces]
+
+    YOU --> ROBYX
+    ROBYX -->|creates &amp; manages| W1
+    ROBYX -->|creates &amp; manages| W2
+    ROBYX -->|creates &amp; manages| S
+    W1 -.->|@mention| S
+    W2 -.->|@mention| S
+
+    classDef user fill:#e1f5ff,stroke:#0288d1,stroke-width:2px
+    classDef orchestrator fill:#fff4e6,stroke:#e65100,stroke-width:2px
+    classDef workspace fill:#f1f8e9,stroke:#558b2f,stroke-width:2px
+    classDef specialist fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
+    class YOU user
+    class ROBYX orchestrator
+    class W1,W2 workspace
+    class S specialist
+```
+
+<details><summary>ASCII fallback (for terminals and non-rendering viewers)</summary>
+
 ```
                         ┌──────────────────────────┐
                         │          YOU              │
@@ -63,6 +90,8 @@ Robyx has three types of agents, each with a distinct purpose:
                          │ @mention           │
                          └───────────────────┘
 ```
+
+</details>
 
 ### Robyx — The Orchestrator
 
@@ -122,6 +151,18 @@ A workspace is the fundamental unit of Robyx. When Robyx creates one, this is wh
 
 ### Lifecycle
 
+```mermaid
+stateDiagram-v2
+    [*] --> Created: you ask Robyx
+    Created --> Active: spawn agent
+    Active --> Paused: pause (scheduler skips)
+    Paused --> Active: resume
+    Active --> Closed: close workspace
+    Closed --> [*]
+```
+
+<details><summary>ASCII fallback</summary>
+
 ```
     You ask Robyx ──→ [Created] ──→ [Active] ──→ [Closed]
                                       │
@@ -130,6 +171,8 @@ A workspace is the fundamental unit of Robyx. When Robyx creates one, this is wh
                                    (scheduler
                                     skips it)
 ```
+
+</details>
 
 - **Active** — agent works, responds, and maintains its state
 - **Paused** — agent stops; you can resume anytime
