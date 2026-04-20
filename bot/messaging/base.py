@@ -118,11 +118,17 @@ class Platform(abc.ABC):
 
     @abc.abstractmethod
     async def reply(self, msg_ref: Any, text: str, parse_mode: str | None = None) -> Any:
-        """Reply to a specific message. Returns an opaque reference to the sent message."""
+        """Reply to a specific message. Returns an opaque reference to the sent message.
+
+        See :meth:`send_message` for the ``parse_mode`` contract.
+        """
 
     @abc.abstractmethod
     async def edit_message(self, msg_ref: Any, text: str, parse_mode: str | None = None) -> None:
-        """Edit a previously sent message identified by *msg_ref*."""
+        """Edit a previously sent message identified by *msg_ref*.
+
+        See :meth:`send_message` for the ``parse_mode`` contract.
+        """
 
     @abc.abstractmethod
     async def send_message(
@@ -132,7 +138,19 @@ class Platform(abc.ABC):
         thread_id: Any = None,
         parse_mode: str | None = None,
     ) -> Any:
-        """Send a new message to a chat/channel. Returns an opaque message reference."""
+        """Send a new message to a chat/channel. Returns an opaque message reference.
+
+        ``parse_mode`` is normalized to a single recognized value:
+
+        * ``"markdown"`` — request markdown rendering on platforms that
+          support an opt-in flag (Telegram). Platforms that always render
+          markdown (Slack, Discord) ignore it. Platforms that never do
+          (none currently) ignore it. Other string values are reserved
+          for Telegram-specific modes (e.g. ``"HTML"``) and treated as
+          opaque pass-through on Telegram, ignored elsewhere.
+        * ``None`` — let the platform pick its default (plain text on
+          Telegram replies, native rendering on Slack/Discord).
+        """
 
     @abc.abstractmethod
     async def send_typing(self, chat_id: Any, thread_id: Any = None) -> None:
@@ -173,7 +191,14 @@ class Platform(abc.ABC):
 
     @abc.abstractmethod
     async def send_to_channel(self, channel_id: Any, text: str, parse_mode: str | None = None) -> bool:
-        """Send a message to a specific channel/topic."""
+        """Send a message to a specific channel/topic.
+
+        See :meth:`send_message` for the ``parse_mode`` contract. Note that
+        on Telegram this method targets forum topics, where agent output
+        is markdown-formatted by convention: ``parse_mode=None`` defaults
+        to ``"markdown"`` rendering. Pass ``parse_mode=""`` (empty string)
+        to force plain text on Telegram topics.
+        """
 
     async def get_invite_link(self, chat_id: Any) -> str | None:
         """Generate or retrieve an invite link for a chat/group.

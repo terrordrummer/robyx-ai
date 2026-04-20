@@ -136,7 +136,11 @@ async def run_chain(
             record_step(tracker, m.from_version, m.to_version, "error", str(e))
             save(data_dir, tracker)
             summary.append((label, "error"))
-            # Stop the chain — subsequent migrations may assume this one ran.
+            # Stop the chain on the first failure: subsequent migrations
+            # may assume this one ran. The tracker records the error, so
+            # the next boot will re-attempt the same step (tracker lookup
+            # for current_version returns the last ``ok`` version, not
+            # the half-applied one).
             break
 
     return summary

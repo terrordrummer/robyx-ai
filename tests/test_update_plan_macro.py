@@ -385,6 +385,58 @@ class TestApply:
         assert outcomes[0].outcome == "applied"
         assert not store.writes  # nothing to persist
 
+    def test_update_plan_clears_awaiting_input(self):
+        """Regression: UPDATE_PLAN on an awaiting-input task must un-park it.
+
+        Previously the plan was rewritten but ``awaiting_question`` and
+        ``status="awaiting-input"`` lingered, so the scheduler kept skipping
+        the task forever (scheduler.py:1139). The user had to manually
+        RESUME_TASK to un-stick it.
+        """
+        s = self._state()
+        s["status"] = "awaiting-input"
+        s["awaiting_question"] = "should I proceed with X?"
+        store = _FakeStateStore({"zeus": s})
+        ctx = UpdatePlanContext(
+            thread_id=42,
+            state_reader=store.reader,
+            state_writer=store.writer,
+            plan_writer=store.plan_writer,
+        )
+        text = (
+            '[UPDATE_PLAN name="zeus"]\n'
+            '[CONTINUOUS_PROGRAM]\n'
+            '{"objective": "redirected goal"}\n'
+            '[/CONTINUOUS_PROGRAM]\n'
+        )
+        _, outcomes = _run(apply_update_plan_macros(text, ctx))
+        assert outcomes[0].outcome == "applied"
+        written = store.states["zeus"]
+        assert written["status"] == "pending"
+        assert "awaiting_question" not in written
+        assert written["program"]["objective"] == "redirected goal"
+
+    def test_update_plan_does_not_touch_status_for_running_task(self):
+        """Only awaiting-input gets re-armed; other statuses are preserved."""
+        s = self._state()
+        s["status"] = "running"
+        store = _FakeStateStore({"zeus": s})
+        ctx = UpdatePlanContext(
+            thread_id=42,
+            state_reader=store.reader,
+            state_writer=store.writer,
+            plan_writer=store.plan_writer,
+        )
+        text = (
+            '[UPDATE_PLAN name="zeus"]\n'
+            '[CONTINUOUS_PROGRAM]\n'
+            '{"objective": "tweaked"}\n'
+            '[/CONTINUOUS_PROGRAM]\n'
+        )
+        _, outcomes = _run(apply_update_plan_macros(text, ctx))
+        assert outcomes[0].outcome == "applied"
+        assert store.states["zeus"]["status"] == "running"
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Strip

@@ -323,17 +323,31 @@ async def upgrade(ctx: MigrationContext) -> None:
 
         migrated.append(name)
 
-    _write_done_marker(done_marker, log)
-
     log.info(
         "migration v0_23_0: migrated=%d skipped_already=%d skipped_error=%d",
         len(migrated), len(skipped_already), len(skipped_errors),
     )
+
     if skipped_errors:
+        # Do NOT write the done marker and do NOT return normally: the
+        # system is partially migrated (some tasks repointed, some still
+        # on the legacy sub-topic). Raising halts the chain so the next
+        # boot re-enters this migration. Per-task ``migrated_v0_23_0``
+        # markers skip the ones that already succeeded; only the failing
+        # entries are retried. The operator sees the error in the log and
+        # can resolve the underlying issue (missing workspace, disk full,
+        # corrupt state.json) before proceeding.
         for nm, reason in skipped_errors:
-            log.warning(
+            log.error(
                 "migration v0_23_0: skipped '%s' (%s)", nm, reason,
             )
+        failed = ", ".join("%s (%s)" % (nm, reason) for nm, reason in skipped_errors)
+        raise RuntimeError(
+            "migration v0_23_0: %d task(s) could not be migrated: %s"
+            % (len(skipped_errors), failed)
+        )
+
+    _write_done_marker(done_marker, log)
 
 
 def _write_done_marker(path: Path, log: logging.Logger) -> None:

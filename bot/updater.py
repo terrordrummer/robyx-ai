@@ -14,6 +14,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -351,6 +352,28 @@ async def _git(*args, check=True) -> subprocess.CompletedProcess:
     )
 
 
+async def _safe_stash_pop() -> None:
+    """Pop the most recent stash and log a WARNING if it fails.
+
+    All apply-update error paths call this to restore the user's local
+    changes after rolling back. A silent failure (the prior pattern) left
+    the changes stranded in the stash list with no signal — making
+    "where did my edits go?" debugging painful. The pop is still
+    best-effort: we don't raise, because we're already on an error path
+    and the broader update outcome is what matters. But the operator
+    needs to know to run ``git stash list`` / ``git stash pop`` manually.
+    """
+    result = await _git("stash", "pop", check=False)
+    if result.returncode != 0:
+        log.warning(
+            "git stash pop failed (rc=%d): %s — local changes may be stranded "
+            "in the stash list; run `git stash list` to inspect, "
+            "`git stash pop` to recover",
+            result.returncode,
+            (result.stderr or result.stdout).strip() or "(no output)",
+        )
+
+
 async def _rollback_code_to(tag: str) -> None:
     """Roll the working tree back to ``v<tag>`` while keeping HEAD on ``main``.
 
@@ -574,6 +597,22 @@ def migrate_personal_data_to_data_dir() -> list[str]:
 async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool, str]:
     """Apply an update to the given version.
 
+    Safety structure:
+
+    1. Stash any local working-tree changes so the pull can fast-forward.
+    2. Snapshot ``data/`` into ``data/backups/pre-update-*.tar.gz`` so a
+       failed migration / smoke test can restore mutated state. Snapshot
+       failure is logged but does not block the update (we prefer an
+       unprotected attempt to refusing to update at all).
+    3. Fast-forward pull on ``main``. If pull fails, pop the stash and
+       return with the git error.
+    4. Run any release-note migration steps. A non-zero exit rolls back
+       the code (git reset to the prior tag) AND restores ``data/`` from
+       the snapshot, then pops the stash.
+    5. ``pip install`` requirements. Same rollback chain on failure.
+    6. Import smoke test in a fresh subprocess. Same rollback chain.
+    7. Pop the stash so the user's local edits (if any) are back.
+
     Args:
         version: Target version string (e.g. "0.2.0")
         notify_fn: Optional async callback(message) for progress updates
@@ -666,7 +705,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             if attach.returncode != 0:
                 error = attach.stderr.strip() or attach.stdout.strip()
                 if has_stash:
-                    await _git("stash", "pop", check=False)
+                    await _safe_stash_pop()
                 return False, "could not switch to main: %s" % error
 
         # 3. Fast-forward pull only
@@ -675,7 +714,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         if pull.returncode != 0:
             error = pull.stderr.strip() or pull.stdout.strip()
             if has_stash:
-                await _git("stash", "pop", check=False)
+                await _safe_stash_pop()
             return False, "git pull --ff-only failed: %s" % error
 
         # 3. Read release notes from the now-available local file
@@ -690,8 +729,26 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             for step in notes["migration_steps"]:
                 await notify("  $ %s" % step)
                 try:
+                    # Use shlex.split so commands with quoted arguments or
+                    # multi-word flags (e.g. `python -m pip install foo`,
+                    # `mv "old name" new`) tokenize correctly. Plain
+                    # str.split would have broken the quoting.
+                    try:
+                        argv = shlex.split(step)
+                    except ValueError as exc:
+                        # Unbalanced quotes etc. — fail the migration loud.
+                        await _rollback_code_to(current)
+                        if snapshot is not None:
+                            _restore_data_dir(snapshot)
+                        if has_stash:
+                            await _safe_stash_pop()
+                        return False, "Unparseable migration step `%s`: %s" % (
+                            step, exc,
+                        )
+                    if not argv:
+                        continue
                     proc = await asyncio.create_subprocess_exec(
-                        *step.split(),
+                        *argv,
                         cwd=str(PROJECT_ROOT),
                         env=_scrubbed_child_env(),
                         stdout=asyncio.subprocess.PIPE,
@@ -705,14 +762,14 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                         if snapshot is not None:
                             _restore_data_dir(snapshot)
                         if has_stash:
-                            await _git("stash", "pop", check=False)
+                            await _safe_stash_pop()
                         return False, "Migration step failed: `%s`\n%s" % (step, error)
                 except asyncio.TimeoutError:
                     await _rollback_code_to(current)
                     if snapshot is not None:
                         _restore_data_dir(snapshot)
                     if has_stash:
-                        await _git("stash", "pop", check=False)
+                        await _safe_stash_pop()
                     return False, "Migration step timed out: `%s`" % step
 
         # 5. Always reinstall deps. A silently-failed install was the root
@@ -729,7 +786,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             if snapshot is not None:
                 _restore_data_dir(snapshot)
             if has_stash:
-                await _git("stash", "pop", check=False)
+                await _safe_stash_pop()
             return False, "venv pip not found at %s" % pip_path
 
         deps_proc = await asyncio.create_subprocess_exec(
@@ -750,7 +807,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             if snapshot is not None:
                 _restore_data_dir(snapshot)
             if has_stash:
-                await _git("stash", "pop", check=False)
+                await _safe_stash_pop()
             return False, "pip install timed out after 600s"
 
         pip_out_text = pip_stdout.decode(errors="replace")
@@ -765,7 +822,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             if snapshot is not None:
                 _restore_data_dir(snapshot)
             if has_stash:
-                await _git("stash", "pop", check=False)
+                await _safe_stash_pop()
             tail_lines = (pip_err_text or pip_out_text).strip().splitlines()[-8:]
             tail_str = "\n".join(tail_lines)
             return False, "pip install returned %d:\n%s" % (deps_proc.returncode, tail_str)
@@ -796,12 +853,12 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
             if snapshot is not None:
                 _restore_data_dir(snapshot)
             if has_stash:
-                await _git("stash", "pop", check=False)
+                await _safe_stash_pop()
             return False, "Smoke test failed: %s" % smoke_err
 
         # 6. Pop stash if we had one
         if has_stash:
-            await _git("stash", "pop", check=False)
+            await _safe_stash_pop()
 
         # 6.5 Invalidate AI-CLI sessions for any agent whose system prompt
         # or per-agent brief was changed by this update. See the module
@@ -877,7 +934,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         if snapshot is not None:
             _restore_data_dir(snapshot)
         if has_stash:
-            await _git("stash", "pop", check=False)
+            await _safe_stash_pop()
 
         state = _load_state()
         state["update_history"].append({

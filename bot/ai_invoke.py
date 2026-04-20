@@ -723,6 +723,9 @@ async def _invoke_ai_locked(
     # continuous loop that runs from message receipt until the response is
     # delivered, so this function no longer needs its own keep-alive.
 
+    # Pre-declare so the finally block can always reference it without
+    # guessing whether the try reached the create_task call.
+    heartbeat_task: asyncio.Task | None = None
     try:
         # start_new_session=True places the CLI in its own process group so
         # interrupt() can signal the whole tree via os.killpg — otherwise
@@ -910,10 +913,8 @@ async def _invoke_ai_locked(
         log.error("AI exception for [%s]: %s", agent.name, e, exc_info=True)
         return STRINGS["ai_error"] % str(e)
     finally:
-        try:
+        if heartbeat_task is not None:
             heartbeat_task.cancel()
-        except NameError:
-            pass
         agent.busy = False
         agent.interrupted = False
         try:

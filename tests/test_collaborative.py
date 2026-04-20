@@ -189,6 +189,74 @@ class TestCollabStore:
         assert len(siblings) == 1
         assert siblings[0].read_text() == "{not valid json!!"
 
+    def test_corrupt_recovers_from_snapshot(self, tmp_path):
+        """When a recent updater snapshot contains a valid copy of
+        collaborative_workspaces.json, the corrupt live file is
+        quarantined AND the snapshot version is restored. Prevents
+        total loss of the workspace registry on a crash-mid-write."""
+        import tarfile
+        import io
+        import json as _json
+        import os as _os
+        import config as _cfg
+
+        # The recovery helper is scoped to DATA_DIR, so we must use the
+        # patched data dir (not the raw tmp_path) as the file's parent.
+        collab_path = _cfg.DATA_DIR / "collaborative_workspaces.json"
+        collab_path.parent.mkdir(parents=True, exist_ok=True)
+
+        good_payload = {
+            "collab-rec-1": {
+                "id": "collab-rec-1",
+                "name": "recovered-project",
+                "agent_name": "collab-rec-1",
+                "platform": "telegram",
+                "chat_id": -100123,
+                "status": "active",
+                "roles": {"111": "owner"},
+                "expected_creator_id": 111,
+                "created_at": "2026-04-01T00:00:00+00:00",
+                "activated_at": "2026-04-01T00:00:00+00:00",
+            }
+        }
+        good_bytes = _json.dumps(good_payload).encode("utf-8")
+
+        backups_dir = _cfg.DATA_DIR / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        snap = backups_dir / "pre-update-0.22.0-to-0.23.0-20260101T000000Z.tar.gz"
+        with tarfile.open(str(snap), "w:gz") as tf:
+            info = tarfile.TarInfo(name="./collaborative_workspaces.json")
+            info.size = len(good_bytes)
+            tf.addfile(info, io.BytesIO(good_bytes))
+
+        # Stage corruption in the live file.
+        collab_path.write_text("{not valid json!!")
+
+        store = CollabStore(collab_path)
+
+        # Recovery happened — the workspace from the snapshot is back.
+        ws = store.get("collab-rec-1")
+        assert ws is not None
+        assert ws.name == "recovered-project"
+        assert ws.chat_id == -100123
+
+        # Quarantine record preserved.
+        siblings = list(collab_path.parent.glob(
+            collab_path.name + ".corrupt-*"
+        ))
+        assert len(siblings) == 1
+        assert siblings[0].read_text() == "{not valid json!!"
+
+        # Live file now holds the recovered bytes.
+        restored = _json.loads(collab_path.read_text())
+        assert "collab-rec-1" in restored
+
+        # Clean up so the test doesn't pollute other tests via the
+        # shared DATA_DIR fixture.
+        collab_path.unlink(missing_ok=True)
+        siblings[0].unlink(missing_ok=True)
+        snap.unlink(missing_ok=True)
+
     def test_unreadable_file_degrades_gracefully(self, tmp_path):
         """If the file is present but we can't decode it (e.g. written in
         a non-UTF-8 encoding from a botched edit), the store starts empty

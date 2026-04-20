@@ -81,10 +81,16 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(_SCHEMA_SQL)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.executescript(_SCHEMA_SQL)
+    except Exception:
+        # Don't leak the file descriptor if PRAGMA/schema setup fails
+        # (disk full, read-only FS, corrupt DB, etc.).
+        conn.close()
+        raise
     return conn
 
 

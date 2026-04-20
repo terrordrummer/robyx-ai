@@ -28,7 +28,16 @@ RESERVED_AGENT_NAMES = frozenset({"robyx", "orchestrator", ""})
 
 
 def _sanitize_task_name(name: str) -> str:
-    """Convert a display name to a safe task/file name."""
+    """Convert a display name to a safe task/file name.
+
+    The mapping is **not injective**: case-insensitive, and every run of
+    non-alphanumeric characters collapses to a single ``-``. So
+    ``"My-Project!"``, ``"my project"``, and ``"MY_PROJECT"`` all fold to
+    ``"my-project"``. ``_validate_new_agent_name`` catches the resulting
+    collision before any side-effect runs (manager lookup, file write,
+    topic creation), so the duplicate surfaces as a user-visible
+    "name already in use" error rather than silent overwrite.
+    """
     return re.sub(r'[^a-z0-9-]', '-', name.lower().strip()).strip('-')
 
 

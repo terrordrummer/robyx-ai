@@ -533,6 +533,19 @@ async def apply_update_plan_macros(
             state["program"] = merged_program
             state["updated_at"] = datetime.now(timezone.utc).isoformat()
 
+            # If the task was parked in ``awaiting-input``, the prior
+            # question is no longer relevant — the plan has been redirected.
+            # Mirror ``resume_task`` semantics so the scheduler picks the
+            # task back up on its next tick instead of silently skipping it
+            # forever (scheduler.py:1139).
+            if state.get("status") == "awaiting-input":
+                state["status"] = "pending"
+                state.pop("awaiting_question", None)
+                log.info(
+                    "update_plan: cleared awaiting-input on '%s' (plan redirected)",
+                    name,
+                )
+
             if ctx.state_writer is not None:
                 ctx.state_writer(state_path, state)
             else:

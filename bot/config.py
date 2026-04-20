@@ -48,7 +48,7 @@ def _int_env(new_key: str, old_key: str, default: int = 0):
     """Read an integer env var with legacy fallback.  Non-numeric values → None."""
     raw = _env(new_key, old_key, str(default))
     try:
-        return int(raw) or None
+        return int(raw)
     except (ValueError, TypeError):
         _log.warning("Non-integer value for %s/%s: %r — using None", new_key, old_key, raw)
         return None
@@ -59,7 +59,7 @@ BOT_TOKEN = _env("ROBYX_BOT_TOKEN", "KAELOPS_BOT_TOKEN")
 CHAT_ID = _int_env("ROBYX_CHAT_ID", "KAELOPS_CHAT_ID")
 OWNER_ID = _int_env("ROBYX_OWNER_ID", "KAELOPS_OWNER_ID")
 AI_BACKEND = os.environ.get("AI_BACKEND", "claude")
-AI_CLI_PATH = os.environ.get("AI_CLI_PATH", "")  # auto-detected if empty
+AI_CLI_PATH = os.environ.get("AI_CLI_PATH", "")  # empty → auto-detected lazily in ai_backend.create_backend()
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "").strip()
 PLATFORM = _env("ROBYX_PLATFORM", "KAELOPS_PLATFORM", "telegram")
 

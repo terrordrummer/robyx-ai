@@ -1,5 +1,111 @@
 # Changelog
 
+## 0.25.0
+
+**Code-review follow-through.** Closes ten bugs surfaced by a deep
+audit of `bot/`, tightens several doc contracts, adds thirteen
+regression tests. No persisted state schema changes.
+
+### Fixed
+
+- **`bot/migrations/legacy.py::_save_applied`** now writes atomically
+  via `tmp + fsync + os.replace`, matching `tracker.save`. A SIGKILL
+  or power loss mid-save previously truncated `data/migrations.json`
+  and the next boot re-ran every legacy migration.
+- **`bot/migrations/v0_23_0.py::upgrade`** raises when any task fails
+  to migrate (corrupt `state.json`, unresolved parent workspace, write
+  error) instead of silently writing the done marker. The chain halts;
+  per-task `migrated_v0_23_0` markers ensure already-migrated tasks
+  are not touched on retry.
+- **`bot/memory_store.py::get_connection`** closes the SQLite
+  connection and re-raises when `PRAGMA` or `executescript` fails.
+  Disk-full / read-only-FS / corrupt-DB conditions no longer leak FDs.
+- **`bot/config.py::_int_env`** returns `int(raw)` directly. The prior
+  `int(raw) or None` silently turned the valid integer `0` into
+  `None`.
+- **`bot/update_plan_macro.py::apply_update_plan_macros`** clears
+  `awaiting_question` and flips `awaiting-input` → `pending` when the
+  plan is redirected, so the scheduler picks the task back up on its
+  next tick.
+- **`TelegramPlatform.send_to_channel` `parse_mode` logic.** Now
+  consistent with `send_message`: `None` or `"markdown"` → Markdown,
+  `""` → plain text, anything else → raw passthrough. Previously an
+  empty string was silently ignored.
+- **`bot/handlers.py::_send_response`** passes
+  `platform.max_message_length - 64` to `split_message`, so Discord's
+  2000-char ceiling is honored. The Telegram-centric 4000 default used
+  to silently overflow on Discord.
+- **`bot/updater.py`** stash-pop failures now log a `WARNING` with
+  explicit recovery instructions (was silent before).
+- **`bot/updater.py`** migration-step commands tokenize via
+  `shlex.split`. Quoted arguments such as
+  `python -m pip install "package[extra]==1.2"` survive intact;
+  unbalanced quotes fail the migration loud with a clear error
+  message.
+- **`bot/ai_invoke.py`** pre-declares `heartbeat_task = None` instead
+  of catching `NameError` in the finally block.
+
+### Added
+
+- **`bot/agents.py::_recover_from_snapshot`** walks
+  `data/backups/pre-update-*.tar.gz` newest → oldest, extracts the
+  target file, validates it as parseable JSON, and atomically installs
+  the first usable copy. Called from `AgentManager._load_state` and
+  `CollabStore._load` after a corrupt file has been quarantined —
+  previously those paths silently dropped into empty state, erasing
+  the workspace registry on the next `save_state`.
+- **`bot/messaging/base.py`** documents the platform-agnostic
+  `parse_mode` contract (`"markdown"` universal; other values
+  Telegram-specific). `send_to_channel` docstring explains the
+  forum-topic default-to-markdown behaviour.
+
+### Changed
+
+- **`bot/scheduler.py`** module docstring covers continuous-task
+  dispatch safety (per-task lock files + orphan recovery) alongside
+  the claim-system safety for one-shot / periodic entries.
+- **`bot/migrations/runner.py`** break-on-error comment clarifies the
+  tracker-rollback semantics.
+- **`bot/updater.py::apply_update`** docstring enumerates the
+  seven-step safety structure (stash, snapshot, pull, migration,
+  deps, smoke test, unstash).
+- **`bot/_bootstrap.py`** docstring no longer claims a
+  `PYTEST_CURRENT_TEST` env check that was never implemented.
+- **`bot/topics.py::_sanitize_task_name`**,
+  **`bot/handlers.py::_strip_executive_markers`**,
+  **`bot/bot.py::ensure_single_instance`** docstrings / inline
+  comments document the non-injective mapping, the deliberate
+  quote-set asymmetry across executive markers, and the accepted
+  Windows TOCTOU trade-off respectively.
+- **`bot/collaborative.py::CollabStore._mutex`** and
+  **`bot/agents.py::AgentManager._load_state`** document the
+  single-process invariant enforced by `ensure_single_instance`.
+
+### Migration
+
+- **`bot/migrations/v0_25_0.py`** — no-op release bump. Keeps the
+  version chain continuous; no persisted-state schema changes.
+
+### Tests
+
+- `tests/test_config.py` (new) — six tests for `_int_env` including
+  the `"0"` regression.
+- `tests/test_migration_v0_23_0.py` — corruption raises, retry after
+  workspace recovery completes end-to-end.
+- `tests/test_telegram_platform.py::TestSendToChannelParseMode` — four
+  tests pinning the `parse_mode` contract.
+- `tests/test_handlers.py::test_split_message_receives_platform_max_length`
+  — Discord ceiling regression.
+- `tests/test_update_plan_macro.py` — `UPDATE_PLAN` clears
+  `awaiting-input`; does not touch `running`.
+- `tests/test_updater.py` — `shlex` quoted-argument tokenization and
+  unbalanced-quote detection.
+- `tests/test_agents.py` — corrupt-JSON recovery from newest
+  snapshot; recovery walks past an unusable newest snapshot.
+- `tests/test_collaborative.py` — `CollabStore` recovery equivalent.
+
+Full suite: 1697 passed, 1 skipped.
+
 ## 0.24.3
 
 **Continuous-task dispatch robustness.** Bugfix release: a step agent

@@ -196,7 +196,23 @@ class CollabStore:
 
     @contextlib.contextmanager
     def _mutex(self):
-        """Intra-process + inter-process exclusive access to the store file."""
+        """Intra-process + inter-process exclusive access to the store file.
+
+        Invariants this lock upholds:
+
+        * Writes are serialized across threads in the same process (the
+          thread lock at ``self._lock``).
+        * Writes are serialized across processes by an fcntl/msvcrt file
+          lock on ``<path>.lock``, so two processes cannot interleave
+          their writes even if both hold stale in-memory state.
+        * The lock does NOT cover :meth:`_load`. ``_load`` is only called
+          from ``__init__``, and :func:`bot.bot.ensure_single_instance`
+          keeps a PID/file lock that prevents two bot processes from
+          running against the same ``data/`` directory concurrently — so
+          the "load + later write" read-modify-write cycle is safe for
+          our deployment model. Do NOT add out-of-band callers to
+          ``_load`` without first wrapping them in ``_mutex``.
+        """
         with self._lock:
             if fcntl is None and msvcrt is None:
                 yield
@@ -226,34 +242,40 @@ class CollabStore:
     def _load(self) -> None:
         if not self._path.exists():
             return
-        try:
-            raw = self._path.read_text()
-        except (OSError, UnicodeDecodeError) as e:
-            # Non-UTF-8 bytes are treated the same as a malformed file:
-            # quarantine and start empty. Otherwise the next write would
-            # silently overwrite the original bytes.
-            from agents import _quarantine_corrupt_file
-            _quarantine_corrupt_file(self._path, reason="Decode error: %s" % e)
-            log.error(
-                "Failed to read collaborative workspaces from %s: %s — "
-                "file quarantined, starting with empty registry",
-                self._path, e,
-            )
-            return
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            # Without quarantine, the next write overwrites the corrupt
-            # file and loses every workspace registration silently.
-            # Closes Pass 1 F17 (deferred).
-            from agents import _quarantine_corrupt_file
-            _quarantine_corrupt_file(self._path, reason="JSONDecodeError: %s" % e)
-            log.error(
-                "Collaborative workspaces file %s is corrupt — quarantined. "
-                "Re-add the bot to each collaborative group to rebuild state.",
-                self._path,
-            )
-            return
+
+        from agents import _quarantine_corrupt_file, _recover_from_snapshot
+
+        # Two attempts: the original file, then whatever recovery was
+        # able to install (if anything). See AgentManager._load_state for
+        # the same pattern.
+        for attempt in range(2):
+            try:
+                raw = self._path.read_text()
+            except (OSError, UnicodeDecodeError) as e:
+                if attempt == 0:
+                    _quarantine_corrupt_file(self._path, reason="Decode error: %s" % e)
+                    if _recover_from_snapshot(self._path, reason="Decode error: %s" % e):
+                        continue
+                log.error(
+                    "Failed to read collaborative workspaces from %s: %s — "
+                    "file quarantined, starting with empty registry",
+                    self._path, e,
+                )
+                return
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as e:
+                if attempt == 0:
+                    _quarantine_corrupt_file(self._path, reason="JSONDecodeError: %s" % e)
+                    if _recover_from_snapshot(self._path, reason="JSONDecodeError: %s" % e):
+                        continue
+                log.error(
+                    "Collaborative workspaces file %s is corrupt — quarantined. "
+                    "Re-add the bot to each collaborative group to rebuild state.",
+                    self._path,
+                )
+                return
+            break  # parse succeeded
         try:
             for ws_id, ws_data in data.items():
                 ws = CollabWorkspace.from_dict(ws_data)

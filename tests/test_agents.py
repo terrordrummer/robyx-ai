@@ -153,9 +153,7 @@ class TestAgentManagerInit:
         assert list(mgr.agents.keys()) == ["robyx"]
 
     def test_load_state_corrupt_json(self, tmp_path):
-        """Corrupt JSON -> manager starts with only robyx, AND the
-        corrupt file is quarantined so the next save_state() doesn't
-        silently overwrite it. Closes the 'lose data forever' bug."""
+        """Corrupt JSON with no snapshot available -> quarantine, start fresh."""
         from agents import AgentManager
         import agents as _agents_mod
 
@@ -175,6 +173,134 @@ class TestAgentManagerInit:
             "state file should be quarantined, not present — otherwise "
             "the next save_state() would overwrite the original"
         )
+
+    def test_load_state_corrupt_recovers_from_snapshot(self, tmp_path):
+        """When the latest updater snapshot has a valid state.json copy,
+        the corrupt file is quarantined AND the snapshot version is
+        installed in its place, so the agent registry survives. Otherwise
+        all workspaces would be lost on the first crash-mid-write event."""
+        import tarfile
+        import io
+        from agents import AgentManager
+        import agents as _agents_mod
+
+        good_state = {
+            "agents": {
+                "robyx": {
+                    "session_id": "12345678-1234-5678-1234-567812345678",
+                    "message_count": 7,
+                    "session_started": True,
+                },
+                "alpha": {
+                    "name": "alpha",
+                    "session_id": "12345678-1234-5678-1234-567812345679",
+                    "message_count": 0,
+                    "session_started": False,
+                    "work_dir": str(tmp_path / "alpha"),
+                    "description": "Alpha workspace",
+                    "thread_id": 42,
+                    "agent_type": "workspace",
+                    "default_chat_id": -100999,
+                },
+            },
+            "focused_agent": None,
+        }
+        good_bytes = json.dumps(good_state).encode("utf-8")
+
+        # Build a snapshot tarball that mirrors what _snapshot_data_dir
+        # produces: arcname="." root with the state file at "./state.json".
+        backups_dir = _agents_mod.STATE_FILE.parent / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        snap_path = backups_dir / "pre-update-0.20.0-to-0.21.0-20260101T000000Z.tar.gz"
+        with tarfile.open(str(snap_path), "w:gz") as tf:
+            info = tarfile.TarInfo(name="./state.json")
+            info.size = len(good_bytes)
+            tf.addfile(info, io.BytesIO(good_bytes))
+
+        # Now stage a corrupt state.json. The load path should quarantine
+        # it, find the snapshot, restore, and re-parse successfully.
+        _agents_mod.STATE_FILE.write_text("{this is not json")
+
+        mgr = AgentManager()
+
+        # Recovery happened: the alpha workspace from the snapshot is
+        # back in the registry.
+        assert "alpha" in mgr.agents
+        assert mgr.agents["alpha"].thread_id == 42
+        # Quarantine record is preserved alongside the recovered file.
+        siblings = list(_agents_mod.STATE_FILE.parent.glob(
+            _agents_mod.STATE_FILE.name + ".corrupt-*"
+        ))
+        assert len(siblings) == 1
+        assert siblings[0].read_text() == "{this is not json"
+        # The state file now holds the snapshot's contents.
+        assert _agents_mod.STATE_FILE.exists()
+        restored = json.loads(_agents_mod.STATE_FILE.read_text())
+        assert restored["agents"]["alpha"]["thread_id"] == 42
+
+    def test_load_state_corrupt_skips_unusable_snapshot(self, tmp_path):
+        """If the newest snapshot is itself corrupt, recovery walks back
+        to an older snapshot. If none is usable we fall through to the
+        empty-state path."""
+        import tarfile
+        import io
+        from agents import AgentManager
+        import agents as _agents_mod
+
+        backups_dir = _agents_mod.STATE_FILE.parent / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+
+        # Older snapshot: contains a valid state.json with one workspace.
+        good_state = {
+            "agents": {
+                "robyx": {
+                    "session_id": "12345678-1234-5678-1234-567812345678",
+                    "message_count": 1,
+                    "session_started": True,
+                },
+                "beta": {
+                    "name": "beta",
+                    "session_id": "12345678-1234-5678-1234-567812345680",
+                    "message_count": 0,
+                    "session_started": False,
+                    "work_dir": str(tmp_path / "beta"),
+                    "description": "Beta workspace",
+                    "thread_id": 99,
+                    "agent_type": "workspace",
+                    "default_chat_id": -100999,
+                },
+            },
+            "focused_agent": None,
+        }
+        good_bytes = json.dumps(good_state).encode("utf-8")
+
+        old_snap = backups_dir / "pre-update-0.19.0-to-0.20.0-20251231T000000Z.tar.gz"
+        with tarfile.open(str(old_snap), "w:gz") as tf:
+            info = tarfile.TarInfo(name="./state.json")
+            info.size = len(good_bytes)
+            tf.addfile(info, io.BytesIO(good_bytes))
+
+        # Newer snapshot has a corrupt state.json — recovery must skip it.
+        bad_bytes = b"{not parseable"
+        new_snap = backups_dir / "pre-update-0.20.0-to-0.21.0-20260101T000000Z.tar.gz"
+        with tarfile.open(str(new_snap), "w:gz") as tf:
+            info = tarfile.TarInfo(name="./state.json")
+            info.size = len(bad_bytes)
+            tf.addfile(info, io.BytesIO(bad_bytes))
+
+        # Make sure the newer snapshot has a strictly newer mtime so the
+        # recovery sort puts it first.
+        import os as _os
+        old_mtime = old_snap.stat().st_mtime
+        _os.utime(new_snap, (old_mtime + 10, old_mtime + 10))
+
+        _agents_mod.STATE_FILE.write_text("{still not json")
+
+        mgr = AgentManager()
+
+        # Recovery walked past the corrupt newer snapshot to the good older one.
+        assert "beta" in mgr.agents
+        assert mgr.agents["beta"].thread_id == 99
 
     def test_load_state_restores_robyx_session(self, tmp_path):
         """robyx session fields are restored from state, not recreated."""

@@ -264,10 +264,13 @@ class TelegramPlatform(Platform):
                 "message_thread_id": channel_id,
                 "text": text,
             }
-            if parse_mode:
-                data["parse_mode"] = parse_mode
-            elif parse_mode is None:
+            # Forum topics default to Markdown rendering for agent output;
+            # callers can opt out with parse_mode="" (empty string) or pass
+            # an explicit Telegram-native value like "HTML".
+            if parse_mode is None or parse_mode == "markdown":
                 data["parse_mode"] = "Markdown"
+            elif parse_mode:
+                data["parse_mode"] = parse_mode
             client = self._get_client()
             resp = await client.post(
                 "%s/sendMessage" % self._api_base, data=data, timeout=30,

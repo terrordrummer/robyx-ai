@@ -35,9 +35,11 @@ Design choices
   message from the eventual ``ImportError`` is often more informative.
 - **Quiet common path**: no output when the hash matches, so the bot
   startup stays clean in operational logs.
-- **Never run in tests**: if we are clearly being imported from a test
-  context (``PYTEST_CURRENT_TEST`` in env, or there is no ``.venv`` at
-  the expected path), we return immediately.
+- **Skips when no venv**: if there is no ``.venv/`` at the expected path
+  we return immediately. This single check covers both dev/manual runs
+  and test sessions (pytest runs against the project tree without a
+  ``.venv/``), so the bootstrap never shells out to pip while tests
+  are executing.
 """
 
 from __future__ import annotations
