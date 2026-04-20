@@ -151,3 +151,19 @@ class TestTemplatePlaceholders:
             assert placeholder in text, (
                 "US5 refactor must preserve existing placeholder %s" % placeholder
             )
+
+    def test_continuous_step_template_has_checkpoint_policy_placeholder(self):
+        """0.24.0 — checkpoint_policy must be injected into the step prompt."""
+        from pathlib import Path
+        template_path = (
+            Path(__file__).resolve().parent.parent
+            / "templates" / "CONTINUOUS_STEP.md"
+        )
+        text = template_path.read_text()
+        assert "{{CHECKPOINT_POLICY}}" in text
+        # And the template must explain the four recognised values so the
+        # step agent knows how to interpret each one.
+        for policy in ("on-demand", "on-uncertainty", "on-milestone", "every-N-steps"):
+            assert policy in text, (
+                "CONTINUOUS_STEP.md must document policy %s" % policy
+            )

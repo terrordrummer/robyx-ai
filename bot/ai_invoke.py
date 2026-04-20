@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 # Robyx-specific secrets that MUST NOT be inherited by the AI CLI
 # subprocess (Pass 2 T066 / trust-boundary X-1). The AI CLI tools we
@@ -118,6 +119,18 @@ CREATE_CONTINUOUS_PATTERN = re.compile(
 )
 CONTINUOUS_PROGRAM_PATTERN = re.compile(
     r'\[\s*CONTINUOUS_PROGRAM\s*\](.*?)\[\s*/\s*CONTINUOUS_PROGRAM\s*\]',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# In-place plan edits: ``[UPDATE_PLAN name="…"]``. Same quote tolerance
+# as CREATE_CONTINUOUS. Used by ``bot/update_plan_macro.py`` for primary
+# detection and by ``bot/handlers._strip_executive_markers`` to scrub
+# non-executive responses.
+UPDATE_PLAN_PATTERN = re.compile(
+    r'\[\s*UPDATE_PLAN'
+    r'\s+name\s*=\s*' + _CONTINUOUS_QUOTE_CLASS +
+    r'([^"\u201C\u201D\u2018\u2019]+)' + _CONTINUOUS_QUOTE_CLASS +
+    r'\s*\]',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -414,6 +427,128 @@ def _load_agent_instructions(agent: Agent) -> str:
     return payload
 
 
+def _render_active_continuous_tasks(thread_id: Any) -> str:
+    """Render a short block listing continuous tasks owned by this workspace.
+
+    Scoped by ``workspace_thread_id == thread_id`` so each workspace agent
+    only sees its own tasks. Included states: ``pending``, ``running``,
+    ``paused``, ``awaiting-input``, ``rate-limited`` — everything not yet
+    terminal. Terminal states (``completed``, ``error``) are hidden to
+    keep the prompt focused on work the agent can actually influence.
+
+    The block is appended to the workspace/specialist system prompt at
+    invocation time so the primary agent always knows which continuous
+    tasks it owns, refuses to create duplicates, and routes scope changes
+    through ``[UPDATE_PLAN]`` instead of ``[CREATE_CONTINUOUS]``.
+
+    Returns the empty string when there are no active tasks so the prompt
+    stays unchanged in the common case.
+    """
+    if thread_id in (None, "", "-"):
+        return ""
+
+    try:
+        from config import CONTINUOUS_DIR
+        from continuous import load_state
+    except ImportError:
+        return ""
+
+    try:
+        root = CONTINUOUS_DIR
+        if not root.exists():
+            return ""
+        candidates = [
+            p / "state.json" for p in root.iterdir() if p.is_dir()
+        ]
+    except OSError:
+        return ""
+
+    # Normalize thread_id comparison: queue entries store ints as strings
+    # on some paths, so coerce both sides to a canonical form.
+    def _norm(raw):
+        if raw in (None, "", "-"):
+            return None
+        if isinstance(raw, str) and raw.lstrip("-").isdigit():
+            return int(raw)
+        return raw
+
+    target = _norm(thread_id)
+    active_states = {
+        "pending", "running", "paused", "awaiting-input", "rate-limited",
+    }
+
+    items: list[dict] = []
+    for path in candidates:
+        state = load_state(path)
+        if not state:
+            continue
+        if _norm(state.get("workspace_thread_id")) != target:
+            continue
+        status = state.get("status") or ""
+        if status not in active_states:
+            continue
+        items.append(state)
+
+    if not items:
+        return ""
+
+    # Stable ordering: by task name so successive invocations produce the
+    # same prompt suffix (avoids cache churn and diff noise).
+    items.sort(key=lambda s: (s.get("name") or "").lower())
+
+    lines: list[str] = [
+        "",
+        "## Active continuous tasks in this workspace",
+        "",
+        "You own the following continuous tasks right now. When the user",
+        "discusses any of them — scope, direction, status, the next move —",
+        "talk about and MODIFY these in place. Do NOT create a new task",
+        "with overlapping scope. To change objective, success criteria,",
+        "constraints, checkpoint policy, or context of an existing task,",
+        "emit `[UPDATE_PLAN name=\"<slug>\"]` followed by a partial",
+        "`[CONTINUOUS_PROGRAM]` block — never `[CREATE_CONTINUOUS]`.",
+        "",
+        "If the user replies while a task is `awaiting-input`, treat the",
+        "reply as an answer to that task's pending question and resume",
+        "(`[RESUME_TASK name=\"<slug>\"]` after updating state, or let the",
+        "scheduler pick it up). Do not start a fresh setup interview.",
+        "",
+    ]
+    for state in items:
+        name = state.get("name") or "?"
+        status = state.get("status") or "?"
+        program = state.get("program") or {}
+        objective = (program.get("objective") or "").strip()
+        policy = program.get("checkpoint_policy") or "on-demand"
+        next_step = state.get("next_step") or {}
+        step_num = next_step.get("number")
+        step_desc = (next_step.get("description") or "").strip()
+        awaiting = (state.get("awaiting_question") or "").strip()
+
+        lines.append("### `%s` — status: %s" % (name, status))
+        if objective:
+            lines.append("- Objective: %s" % _shorten(objective, 180))
+        lines.append("- Checkpoint policy: `%s`" % policy)
+        if step_num is not None:
+            lines.append(
+                "- Next step #%s: %s"
+                % (step_num, _shorten(step_desc, 140) or "(none planned)")
+            )
+        if awaiting:
+            lines.append("- Awaiting question: %s" % _shorten(awaiting, 240))
+        lines.append("- Plan file: `data/continuous/%s/plan.md`" % name)
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _shorten(s: str, max_chars: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 1] + "…"
+
+
 def _agent_model_role(agent: Agent) -> str:
     """Map an agent to the role key used by ``models.yaml`` defaults."""
     if agent.name == "robyx":
@@ -517,6 +652,12 @@ async def _invoke_ai_locked(
     elif agent.agent_type in ("workspace", "specialist"):
         system_prompt = WORKSPACE_AGENT_SYSTEM_PROMPT
         system_prompt = system_prompt + _load_agent_instructions(agent)
+        # Inject the workspace-scoped list of active continuous tasks so
+        # the agent knows what it owns before it decides whether to create
+        # a new task, update an existing plan, or answer a mid-task reply.
+        system_prompt = system_prompt + _render_active_continuous_tasks(
+            agent.thread_id,
+        )
 
     # Inject memory context and management instructions
     if system_prompt:

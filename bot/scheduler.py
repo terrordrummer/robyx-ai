@@ -1168,6 +1168,10 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             .replace("{{SUCCESS_CRITERIA}}", criteria_text or "(none specified)")
             .replace("{{CONSTRAINTS}}", constraints_text or "(none specified)")
             .replace("{{CONTEXT}}", program.get("context", ""))
+            .replace(
+                "{{CHECKPOINT_POLICY}}",
+                program.get("checkpoint_policy", "on-demand") or "on-demand",
+            )
             .replace("{{STEP_NUMBER}}", str(step_number))
             .replace("{{STEP_DESCRIPTION}}", step_description)
             .replace("{{STEP_HISTORY}}", history_text)
