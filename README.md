@@ -72,8 +72,9 @@ The control room is a group chat with topics. Each topic is an agent. You talk, 
 - **Three messaging platforms** — Telegram, Discord, Slack. Switch at any time; all workspaces and memory are preserved.
 - **Three AI backends** — Claude Code, Codex, OpenCode. Pick per-agent via semantic aliases (`fast`, `balanced`, `powerful`) or explicit model IDs in `models.yaml`.
 - **Unified 60 s scheduler** — reminders, one-shot, periodic, and continuous tasks in a single queue (`data/queue.json`) with atomic claims and late-firing on recovery.
-- **Continuous autonomous tasks** — step-by-step research/optimization loops with per-task git branch, structured state, user-pausable, user-interruptible in real time.
+- **Continuous autonomous tasks** — step-by-step research/optimization loops with per-task git branch, structured state, per-task `plan.md`, and four configurable checkpoint policies (`on-demand`, `on-uncertainty`, `on-milestone`, `every-N-steps`). Lifecycle (list, status, stop, pause, resume, read plan, update scope/policy in place) is controlled from the parent workspace chat — no dedicated control channel.
 - **Agent interruption** — any message to a busy agent immediately (SIGTERM → 5 s grace → SIGKILL) stops the current step and processes your new request.
+- **Collaborative workspaces** — invite external collaborators into a separate Telegram group with a role-based authorization model (Owner / Operator / Participant) and two interaction modes (intelligent or passive). Telegram-only today; Discord and Slack fall back to owner-only workspaces.
 - **Memory system** — per-agent active + archive tiers, integrated with Claude Code memory files.
 - **Voice + images** — voice transcription via Whisper, agent-initiated image delivery (explicit `[SEND_IMAGE …]` only, never proactive).
 - **Safe auto-updates** — tag-based releases, pre-update snapshot, smoke test, atomic rollback on failure; migration chain runs once per version.
@@ -289,9 +290,12 @@ robyx-ai/
 ├── docs/                      # Topical documentation (linked from README)
 ├── releases/                  # Full release notes per version
 ├── templates/
-│   ├── SCHEDULER_AGENT.md     # Scheduler agent system-prompt template
-│   ├── agent-template.md
-│   └── specialist-template.md
+│   ├── prompt_orchestrator.md       # Robyx system prompt (loaded by bot/config.py)
+│   ├── prompt_workspace_agent.md    # Workspace agent system prompt
+│   ├── prompt_focused_agent.md      # Focused-mode agent system prompt
+│   ├── prompt_collaborative_agent.md# Collaborative-workspace agent system prompt
+│   ├── CONTINUOUS_SETUP.md          # Continuous-task setup interview prompt
+│   └── CONTINUOUS_STEP.md           # Step-agent prompt (per-step dispatch)
 ├── VERSION                    # Current version
 ├── bot/                       # Python application
 │   ├── _bootstrap.py          # Start-up dep sanity check (runs before imports)
@@ -304,6 +308,8 @@ robyx-ai/
 │   ├── handlers.py            # Command & message handlers (platform-agnostic)
 │   ├── scheduler.py           # Unified scheduler (reminders, one-shot, periodic, continuous)
 │   ├── continuous.py          # Continuous task state management
+│   ├── lifecycle_macros.py    # [LIST_TASKS] / [STOP_TASK] / [PAUSE_TASK] / [RESUME_TASK] / [GET_PLAN] dispatcher
+│   ├── update_plan_macro.py   # [UPDATE_PLAN] — partial in-place continuous-program merge
 │   ├── scheduled_delivery.py  # Output relay from scheduled runs to topics
 │   ├── task_runtime.py        # Agent context resolver for scheduled tasks
 │   ├── memory.py              # Agent memory system
@@ -333,14 +339,16 @@ robyx-ai/
     ├── bot.pid                # Single-instance lock
     ├── state.json             # Agent state persistence
     ├── queue.json             # Unified scheduler queue (all task types)
-    ├── tasks.md               # Workspace registry (auto-managed)
-    ├── specialists.md         # Specialist registry (auto-managed)
+    ├── tasks.md               # (legacy pre-0.20 — read-only migration source)
+    ├── specialists.md         # (legacy pre-0.20 — read-only migration source)
     ├── agents/                # Workspace agent briefs (.md)
     ├── specialists/           # Specialist briefs (.md)
-    ├── continuous/            # Continuous task state files
+    ├── continuous/            # Per-task state.json + plan.md
     ├── migrations.json        # Applied migrations tracker
+    ├── collaborative_workspaces.json  # Collaborative-workspace registry
     ├── backups/               # Pre-update tar snapshots (retention: 3)
-    └── memory/                # Robyx & specialist memory
+    └── memory/                # Centralized memory — orchestrator + specialists only
+                               # (workspace memory lives at <work_dir>/.robyx/memory.db)
 ```
 
 </details>

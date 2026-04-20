@@ -8,6 +8,8 @@
 - `bot/continuous.py` manages state for continuous (iterative autonomous) tasks. State lives in `data/continuous/<name>/state.json`.
 - `bot/task_runtime.py` resolves agent identity and `work_dir` for scheduled/timed runs so they execute with the correct context and memory.
 - `bot/scheduled_delivery.py` relays parsed AI output from scheduled runs back into the target workspace/specialist topic.
+- `bot/lifecycle_macros.py` parses & dispatches workspace-scoped lifecycle macros emitted by the primary workspace agent (`[LIST_TASKS]`, `[TASK_STATUS]`, `[STOP_TASK]`, `[PAUSE_TASK]`, `[RESUME_TASK]`, `[GET_PLAN]`). Contract at `specs/005-unified-workspace-chat/contracts/lifecycle-macros.md`.
+- `bot/update_plan_macro.py` handles `[UPDATE_PLAN]` — partial in-place merge of a continuous task's program (`objective`, `success_criteria`, `constraints`, `checkpoint_policy`, `context`, `plan_text`). Workspace-scoped; unknown fields ignored for forward compatibility.
 - `bot/config_updates.py` intercepts `KEY=value` messages in `handlers.py` and applies them directly to `.env` without routing secrets through the AI backend.
 
 ## Commands
@@ -45,8 +47,9 @@
 - Prefer `install/uninstall-mac.sh` or `install/uninstall-linux.sh` to stop/remove the service. Do not just kill the bot process: launchd/systemd will respawn it.
 
 ## Memory Behavior
-- Workspace memory lives in `<work_dir>/.robyx/memory/`.
-- If a workspace project already has `CLAUDE.md` or a non-empty `.claude/`, Robyx does not inject its own memory for that workspace.
+- Workspace memory is a single SQLite file at `<work_dir>/.robyx/memory.db` (not a directory). See `bot/memory_store.py::db_path_for_agent` for the exact mapping.
+- Orchestrator and specialists are centralized instead: `data/memory/robyx.db` and `data/memory/<specialist>.db`.
+- If a workspace project already has `CLAUDE.md` or a non-empty `.claude/`, Robyx does not create a `.db` for that workspace — it defers to the project's native memory.
 
 ## Agent Session Lifecycle (since v0.15.1, fixed in v0.15.2)
 - The Claude Code CLI bakes the system prompt at session creation and ignores `--append-system-prompt` on `--resume`. Any change to a system prompt (`bot/config.py`) or per-agent brief (`data/agents/<name>.md`, `data/specialists/<name>.md`) is invisible to existing sessions until the session is regenerated.

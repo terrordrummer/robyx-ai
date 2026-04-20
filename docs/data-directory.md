@@ -23,10 +23,12 @@ data/
 ├── specialists.md           # Legacy specialists source
 ├── agents/                  # Per-workspace agent briefs (*.md)
 ├── specialists/             # Per-specialist briefs (*.md)
-├── memory/                  # Per-agent memory — SQLite databases (v0.21.0+)
+├── memory/                  # Centralized memory — SQLite databases (v0.21.0+)
 │   ├── robyx.db             # Orchestrator memory
-│   ├── <specialist>.db      # One DB per specialist
-│   └── <workspace>.db       # Workspaces without native Claude Code memory
+│   └── <specialist>.db      # One DB per specialist
+│                            # (workspace memory lives in the workspace
+│                            #  itself at <work_dir>/.robyx/memory.db,
+│                            #  NOT here — see docs/memory.md)
 ├── collaborative_workspaces.json   # Collaborative workspace registry
 ├── continuous/              # Per-continuous-task state + logs
 │   └── <name>/
@@ -54,7 +56,7 @@ data/
 | `migrations.json` | `bot/migrations/tracker.py` | **No.** Deletion causes every migration in the chain to re-run on next boot, which may re-apply fixes that have since been superseded. If it must be reset, restore from a `backups/` snapshot. | — |
 | `tasks.md`, `specialists.md` | Legacy (pre-0.20) | Yes, if you have already run the migration to the unified queue. | Kept read-only for the migration runner. |
 | `agents/*.md`, `specialists/*.md` | `bot/topics.py`, chat | Deleting a brief removes the agent's instructions; the agent still exists in `state.json` but will fall back to the base role prompt. Regenerate via `/reset` + describe the role again to Robyx. | — |
-| `memory/*.db` | `bot/memory_store.py`, agents themselves | Yes per file — the affected agent loses long-term context but keeps current session. Active snapshot and full archive live in the same DB; delete one `.db` to reset just that agent. | SQLite with WAL journal; each file also has sidecar `-wal` and `-shm` files that SQLite manages automatically. Workspaces whose project has a native `CLAUDE.md` or `.claude/` use that instead and do NOT get a `.db`. See [docs/memory.md](memory.md). |
+| `memory/*.db` | `bot/memory_store.py`, agents themselves | Yes per file — the affected agent loses long-term context but keeps current session. Active snapshot and full archive live in the same DB; delete one `.db` to reset just that agent. | SQLite with WAL journal; each file also has sidecar `-wal` and `-shm` files that SQLite manages automatically. Only the orchestrator (`robyx.db`) and specialists live here. Workspace agents without native memory store their DB at `<work_dir>/.robyx/memory.db` inside the workspace itself, so it travels with the project; workspaces whose project has a native `CLAUDE.md` or `.claude/` use that instead and do NOT get a `.db`. See [docs/memory.md](memory.md). |
 | `collaborative_workspaces.json` | `bot/collaborative.py` | No — deletion loses every collaborative-workspace registration (chat IDs, roles, interaction mode). Rebuild by re-adding the bot to each group. | Atomic writes via `tmp + os.replace`; `fcntl.flock` cross-process mutex since v0.20.28 (with `msvcrt` fallback on Windows). |
 | `*.corrupt-<UTC-timestamp>` | `bot/agents._quarantine_corrupt_file` (v0.21.1+) | Yes — forensic copies of JSON state files that failed to decode at load time (`state.json.corrupt-20260416T173805Z`, `collaborative_workspaces.json.corrupt-…`, etc.). Bot starts with empty state; the original bytes are preserved for operator inspection. Safe to delete once the cause has been investigated or the data is no longer needed. | Created when `state.json` or `collaborative_workspaces.json` fails `json.loads`/UTF-8 decode on startup. Prevents the next save from silently overwriting corrupt data. |
 | `continuous/<name>/state.json` | `bot/continuous.py` | **No** — deleting mid-task orphans the continuous task. Close the workspace via Robyx first (which cancels queue entries and archives the branch) before cleaning up. | Atomic writes. |

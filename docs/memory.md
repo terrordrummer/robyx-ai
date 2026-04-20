@@ -29,7 +29,9 @@ Each agent gets its own SQLite database file:
 
 - **Robyx (orchestrator)**: `data/memory/robyx.db`
 - **Specialists**: `data/memory/<name>.db`
-- **Workspace agents without native memory**: `data/memory/<name>.db`
+- **Workspace agents without native memory**: `<work_dir>/.robyx/memory.db`
+  — lives next to the project, not under Robyx's `data/`, so the
+  memory moves with the repo if the workspace is cloned or relocated.
 - **Workspace agents with native memory** (CLAUDE.md or `.claude/` in
   the project): *none* — Robyx stays out of the way, the AI backend
   uses the project's native memory natively.
@@ -57,8 +59,8 @@ Robyx respects each project's existing setup:
 | Project state | Memory behavior |
 |---------------|-----------------|
 | Has Claude Code memory (`CLAUDE.md` and/or `.claude/`) | Robyx does **not** create a `.db` — native memory works as-is. |
-| No existing memory | Robyx creates `data/memory/<agent>.db` with active + archive. |
-| Robyx orchestrator and specialists | Always use `data/memory/{name}.db`. |
+| No existing memory | Robyx creates `<work_dir>/.robyx/memory.db` with active + archive — the DB lives inside the workspace project, not under Robyx's `data/`. |
+| Robyx orchestrator and specialists | Always use `data/memory/{name}.db` (centralized under Robyx's own `data/`). |
 
 This means you can work on a project **both directly** (terminal +
 Claude Code) **and via Robyx** (chat) without memory conflicts.
