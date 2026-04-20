@@ -29,6 +29,37 @@ Two ways:
 
 In both cases the agent conducts a structured interview before creating the task — it never launches a long-running iterative workload inline.
 
+### Checkpoint policies
+
+Each continuous task is configured at creation with a `checkpoint_policy` that governs **when the step agent is allowed to stop and hand control back to the user** (via `status: "awaiting-input"`). The policy is binding — the agent does not substitute its own judgement for it.
+
+| Policy | Behaviour |
+|--------|-----------|
+| `on-demand` (default) | Never stops on the agent's own initiative. The user interrupts from chat when they want to pause or redirect. A genuinely impossible step is marked `status: error`, not `awaiting-input`. |
+| `on-uncertainty` | Stops only for **genuinely blocking ambiguity** — "no sensible person could choose without a human decision." Cosmetic doubts or "A or B both look fine" do not qualify. |
+| `on-milestone` | Stops only at milestones declared in the plan's `## Milestones` section. If the plan does not declare milestones, behaves like `on-demand`. |
+| `every-N-steps` | Stops when the current step number is a multiple of N, where N is read from a "Checkpoint every N steps" line in the plan. If N is not declared, behaves like `on-demand`. |
+
+The scheduler substitutes the active policy into the step-agent prompt on every dispatch (`templates/CONTINUOUS_STEP.md`). You can change the policy of a **running** task in place — see *Controlling tasks from the workspace chat* below.
+
+### Controlling tasks from the workspace chat
+
+You never need a dedicated control panel: everything happens by talking to the **primary workspace agent** in the workspace chat. The agent recognises natural-language lifecycle intents ("ferma daily-report", "pause the research loop", "mostrami il piano di zeus-research") and emits workspace-scoped lifecycle macros that the bot resolves against authoritative state (`data/queue.json` + `data/continuous/*/state.json`) before the response reaches the user.
+
+| Macro | Scope | Effect |
+|-------|-------|--------|
+| `[LIST_TASKS]` | Any active task in this workspace | Renders a grouped summary of continuous / periodic / one-shot / reminders. |
+| `[TASK_STATUS name="…"]` | Any active task | Detailed status — objective, steps completed, constraints, last step (for continuous); next run / fire-at (for scheduled). |
+| `[STOP_TASK name="…"]` | Any active task | Cancels the queue entry so the scheduler never re-picks it. For continuous, also marks `status: completed` on the state file. |
+| `[PAUSE_TASK name="…"]` | Continuous only | Sets `status: paused`. Scheduler skips the task silently until resumed. |
+| `[RESUME_TASK name="…"]` | Continuous only | Resumes a `paused` / `rate-limited` / `awaiting-input` task — the next tick dispatches the planned step. |
+| `[GET_PLAN name="…"]` | Continuous only | Streams `data/continuous/<name>/plan.md` inline (truncated at ~2000 chars). |
+| `[UPDATE_PLAN name="…"]` + `[CONTINUOUS_PROGRAM]{…}[/CONTINUOUS_PROGRAM]` | Continuous only | In-place partial update of `objective`, `success_criteria`, `constraints`, `checkpoint_policy`, `context`, or the free-form `plan_text` body of `plan.md`. Only the fields you provide are merged. |
+
+All macros are **workspace-scoped**: a task owned by another workspace is reported as `not found` rather than touched, so one workspace can never silently mutate another's state. Ambiguous name queries (substring match) surface a disambiguation prompt instead of acting.
+
+The primary workspace agent also receives an *Active continuous tasks in this workspace* block at the top of its prompt on every turn, listing the tasks it owns with their objective, checkpoint policy, and pending question if any — so when you reply to an `awaiting-input` task, the agent treats your reply as an answer to that task (optionally emitting `[UPDATE_PLAN]` + `[RESUME_TASK]`) rather than spawning a duplicate task with overlapping scope.
+
 ## Timing precision
 
 The scheduler ticks every `SCHEDULER_INTERVAL` seconds (default 60). That is the only cadence — there is no per-event wakeup. Consequences:
