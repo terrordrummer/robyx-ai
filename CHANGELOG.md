@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.24.3
+
+**Continuous-task dispatch robustness.** Bugfix release: a step agent
+that wrote `"summary"` instead of `"description"` in the history
+crashed `bot/continuous.py::build_step_context` with a `KeyError`, and
+the crash propagated out of the scheduler loop — stalling every other
+continuous task in the workspace. Three layered fixes.
+
+### Fixed
+
+- **`bot/continuous.py::build_step_context`** is now tolerant of drift.
+  Each history entry falls back across `description` → `summary` →
+  `artifact` → a `"(no description)"` placeholder; missing `step`
+  renders as `Step ?`; non-dict entries are skipped with a warning.
+  Drift is visible in logs, no longer fatal.
+- **`bot/scheduler.py::_handle_continuous_entries`** wraps each
+  per-entry iteration in a broad `try/except`. One corrupt state file
+  (or any other per-entry error) is logged and appended to the
+  `errors` list; the loop continues to the next task. Cross-task
+  collateral damage eliminated.
+
+### Migration
+
+- **`bot/migrations/v0_24_3.py`** renames `summary` → `description` in
+  every history entry of every `data/continuous/<name>/state.json` on
+  disk. Idempotent, tolerant of unreadable state files, preserves
+  entries that already carry `description`.
+
+### Tests
+
+- `tests/test_continuous.py` gains four `build_step_context` cases
+  covering the `summary` fallback, both keys missing, missing `step`,
+  and non-dict history entries.
+- `tests/test_migration_v0_24_3.py` (new) covers the rename happy
+  path, idempotency, preservation of existing `description`, broken
+  state files, non-dict history, and the missing-`continuous/`-dir
+  edge case.
+
 ## 0.24.2
 
 **Continuous-task fire-and-forget invariant.** Bugfix release addressing

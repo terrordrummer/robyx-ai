@@ -1107,162 +1107,178 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             continue
 
         name = entry.get("name", "")
-        sf = entry.get("state_file")
-        if not sf:
-            sf = str(state_file_path(name))
+        # Per-entry crash isolation: a corrupt state file, a history entry
+        # that drifts from the documented schema, or any other unexpected
+        # error must only affect THIS task. Pre-v0.24.3 a KeyError inside
+        # build_step_context would bubble out of the whole loop and leave
+        # every other continuous task undispatched on every scheduler tick.
+        try:
+            sf = entry.get("state_file")
+            if not sf:
+                sf = str(state_file_path(name))
 
-        state = load_state(Path(sf))
-        if state is None:
-            log.warning("Continuous task '%s': state file missing at %s", name, sf)
-            continue
-
-        # Handle rate-limited tasks
-        if state["status"] == "rate-limited":
-            if check_rate_limit_recovery(state):
-                resume_task(state)
-                save_state(Path(sf), state)
-                log.info("Continuous task '%s': rate limit recovered, resuming", name)
-            else:
+            state = load_state(Path(sf))
+            if state is None:
+                log.warning("Continuous task '%s': state file missing at %s", name, sf)
                 continue
 
-        # Server-side enforcement of on-demand checkpoint policy.
-        if _maybe_demote_on_demand_awaiting_input(state, name):
-            save_state(Path(sf), state)
+            # Handle rate-limited tasks
+            if state["status"] == "rate-limited":
+                if check_rate_limit_recovery(state):
+                    resume_task(state)
+                    save_state(Path(sf), state)
+                    log.info("Continuous task '%s': rate limit recovered, resuming", name)
+                else:
+                    continue
 
-        # Skip if not ready
-        if state["status"] in ("completed", "paused", "awaiting-input"):
-            continue
+            # Server-side enforcement of on-demand checkpoint policy.
+            if _maybe_demote_on_demand_awaiting_input(state, name):
+                save_state(Path(sf), state)
 
-        # Check if a subprocess is actually running (orphan detection)
-        if state["status"] == "running":
-            is_locked, pid = await check_lock(name)
-            if is_locked:
-                continue  # Subprocess still running
-            # Subprocess died without updating state
-            log.warning("Continuous task '%s': state=running but no lock. Marking step failed.", name)
-            mark_step_failed(state, "subprocess exited unexpectedly")
-            save_state(Path(sf), state)
-            continue
+            # Skip if not ready
+            if state["status"] in ("completed", "paused", "awaiting-input"):
+                continue
 
-        if not is_ready_for_next_step(state):
-            continue
+            # Check if a subprocess is actually running (orphan detection)
+            if state["status"] == "running":
+                is_locked, pid = await check_lock(name)
+                if is_locked:
+                    continue  # Subprocess still running
+                # Subprocess died without updating state
+                log.warning("Continuous task '%s': state=running but no lock. Marking step failed.", name)
+                mark_step_failed(state, "subprocess exited unexpectedly")
+                save_state(Path(sf), state)
+                continue
 
-        # Dispatch next step
-        next_step = state.get("next_step", {})
-        step_number = next_step.get("number", 1)
-        step_description = next_step.get("description", "Continue work.")
+            if not is_ready_for_next_step(state):
+                continue
 
-        # Build prompt from template
-        template_path = Path(__file__).parent.parent / "templates" / "CONTINUOUS_STEP.md"
-        if template_path.exists():
-            template = template_path.read_text()
-        else:
-            template = "Execute step {{STEP_NUMBER}}: {{STEP_DESCRIPTION}}"
+            # Dispatch next step
+            next_step = state.get("next_step", {})
+            step_number = next_step.get("number", 1)
+            step_description = next_step.get("description", "Continue work.")
 
-        program = state.get("program", {})
-        criteria_text = "\n".join("- %s" % c for c in program.get("success_criteria", []))
-        constraints_text = "\n".join("- %s" % c for c in program.get("constraints", []))
-        history_text = build_step_context(state)
+            # Build prompt from template
+            template_path = Path(__file__).parent.parent / "templates" / "CONTINUOUS_STEP.md"
+            if template_path.exists():
+                template = template_path.read_text()
+            else:
+                template = "Execute step {{STEP_NUMBER}}: {{STEP_DESCRIPTION}}"
 
-        # Spec 005 US5: secondary agent shares primary workspace knowledge.
-        # Load (a) the parent workspace's agent instructions file and (b)
-        # the task-specific plan.md; substitute both into the prompt so
-        # behaviour stays consistent with the primary that set the task up.
-        parent_instructions = _load_parent_workspace_instructions(state)
-        plan_md_body = _load_plan_md_for_prompt(name)
+            program = state.get("program", {})
+            criteria_text = "\n".join("- %s" % c for c in program.get("success_criteria", []))
+            constraints_text = "\n".join("- %s" % c for c in program.get("constraints", []))
+            history_text = build_step_context(state)
 
-        lock_file = DATA_DIR / name / "lock"
+            # Spec 005 US5: secondary agent shares primary workspace knowledge.
+            # Load (a) the parent workspace's agent instructions file and (b)
+            # the task-specific plan.md; substitute both into the prompt so
+            # behaviour stays consistent with the primary that set the task up.
+            parent_instructions = _load_parent_workspace_instructions(state)
+            plan_md_body = _load_plan_md_for_prompt(name)
 
-        # Build versioning instructions based on git availability
-        versioning = state.get("versioning", "none")
-        branch = state.get("branch", "main")
-        if versioning in ("git-branch", "git-init"):
-            versioning_instructions = (
-                "You are working on branch `%s`. Commit your changes after each step:\n"
-                "```\n"
-                "git add -A && git commit -m \"continuous(%s): step %d — <brief description>\"\n"
-                "```\n"
-                "Record the commit hash in the state file's `history[].artifact` field."
-                % (branch, name, step_number)
+            lock_file = DATA_DIR / name / "lock"
+
+            # Build versioning instructions based on git availability
+            versioning = state.get("versioning", "none")
+            branch = state.get("branch", "main")
+            if versioning in ("git-branch", "git-init"):
+                versioning_instructions = (
+                    "You are working on branch `%s`. Commit your changes after each step:\n"
+                    "```\n"
+                    "git add -A && git commit -m \"continuous(%s): step %d — <brief description>\"\n"
+                    "```\n"
+                    "Record the commit hash in the state file's `history[].artifact` field."
+                    % (branch, name, step_number)
+                )
+            else:
+                versioning_instructions = (
+                    "Git is not available in this work directory. "
+                    "Do not attempt git commands. Track progress only via the state file."
+                )
+
+            prompt = (
+                template
+                .replace("{{PARENT_WORKSPACE_INSTRUCTIONS}}", parent_instructions)
+                .replace("{{PLAN_MD}}", plan_md_body)
+                .replace("{{OBJECTIVE}}", program.get("objective", ""))
+                .replace("{{SUCCESS_CRITERIA}}", criteria_text or "(none specified)")
+                .replace("{{CONSTRAINTS}}", constraints_text or "(none specified)")
+                .replace("{{CONTEXT}}", program.get("context", ""))
+                .replace(
+                    "{{CHECKPOINT_POLICY}}",
+                    program.get("checkpoint_policy", "on-demand") or "on-demand",
+                )
+                .replace("{{STEP_NUMBER}}", str(step_number))
+                .replace("{{STEP_DESCRIPTION}}", step_description)
+                .replace("{{STEP_HISTORY}}", history_text)
+                .replace("{{VERSIONING_INSTRUCTIONS}}", versioning_instructions)
+                .replace("{{STATE_FILE}}", sf)
+                .replace("{{TASK_NAME}}", name)
+                .replace("{{LOCK_FILE}}", str(lock_file))
+                .replace("{{LOG_FILE}}", str(LOG_FILE))
             )
-        else:
-            versioning_instructions = (
-                "Git is not available in this work directory. "
-                "Do not attempt git commands. Track progress only via the state file."
+
+            # Spawn the step agent
+            model = resolve_model_preference(
+                entry.get("model"), backend, role="continuous",
             )
+            work_dir = state.get("work_dir", "")
 
-        prompt = (
-            template
-            .replace("{{PARENT_WORKSPACE_INSTRUCTIONS}}", parent_instructions)
-            .replace("{{PLAN_MD}}", plan_md_body)
-            .replace("{{OBJECTIVE}}", program.get("objective", ""))
-            .replace("{{SUCCESS_CRITERIA}}", criteria_text or "(none specified)")
-            .replace("{{CONSTRAINTS}}", constraints_text or "(none specified)")
-            .replace("{{CONTEXT}}", program.get("context", ""))
-            .replace(
-                "{{CHECKPOINT_POLICY}}",
-                program.get("checkpoint_policy", "on-demand") or "on-demand",
-            )
-            .replace("{{STEP_NUMBER}}", str(step_number))
-            .replace("{{STEP_DESCRIPTION}}", step_description)
-            .replace("{{STEP_HISTORY}}", history_text)
-            .replace("{{VERSIONING_INSTRUCTIONS}}", versioning_instructions)
-            .replace("{{STATE_FILE}}", sf)
-            .replace("{{TASK_NAME}}", name)
-            .replace("{{LOCK_FILE}}", str(lock_file))
-            .replace("{{LOG_FILE}}", str(LOG_FILE))
-        )
-
-        # Spawn the step agent
-        model = resolve_model_preference(
-            entry.get("model"), backend, role="continuous",
-        )
-        work_dir = state.get("work_dir", "")
-
-        cmd = backend.build_spawn_command(
-            prompt=prompt,
-            model=model,
-            work_dir=work_dir,
-        )
-        stdin_payload = backend.spawn_stdin_payload(prompt)
-
-        (DATA_DIR / name).mkdir(parents=True, exist_ok=True)
-        output_log = DATA_DIR / name / "output.log"
-
-        try:
-            proc = await _spawn_ai_subprocess(
-                cmd=cmd,
-                stdin_payload=stdin_payload,
-                output_log=output_log,
+            cmd = backend.build_spawn_command(
+                prompt=prompt,
+                model=model,
                 work_dir=work_dir,
             )
+            stdin_payload = backend.spawn_stdin_payload(prompt)
 
-            # Persist state=running BEFORE writing the lock file. If we
-            # crash between the two writes, the next scheduler cycle sees
-            # state="running" and triggers the orphan-recovery branch above
-            # (check_lock → mark_step_failed). The reverse order would leak
-            # a stale lock with a dead PID and leave state in a pre-running
-            # status, allowing a silent re-dispatch that overwrites
-            # output.log and stomps on the prior attempt.
-            mark_step_started(state, step_number, step_description)
-            save_state(Path(sf), state)
+            (DATA_DIR / name).mkdir(parents=True, exist_ok=True)
+            output_log = DATA_DIR / name / "output.log"
 
-            _write_lock_file(lock_file, proc.pid)
+            try:
+                proc = await _spawn_ai_subprocess(
+                    cmd=cmd,
+                    stdin_payload=stdin_payload,
+                    output_log=output_log,
+                    work_dir=work_dir,
+                )
 
-            # Start delivery watcher for output relay
-            start_task_delivery_watch(entry, proc, output_log, lock_file, platform, backend, log)
+                # Persist state=running BEFORE writing the lock file. If we
+                # crash between the two writes, the next scheduler cycle sees
+                # state="running" and triggers the orphan-recovery branch above
+                # (check_lock → mark_step_failed). The reverse order would leak
+                # a stale lock with a dead PID and leave state in a pre-running
+                # status, allowing a silent re-dispatch that overwrites
+                # output.log and stomps on the prior attempt.
+                mark_step_started(state, step_number, step_description)
+                save_state(Path(sf), state)
 
-            dispatched.append((name, proc.pid))
-            append_log("%s -- DISPATCHED -- step %d PID %d" % (name, step_number, proc.pid))
-            log.info(
-                "Continuous '%s': dispatched step %d (PID %d, model: %s)",
-                name, step_number, proc.pid, model,
+                _write_lock_file(lock_file, proc.pid)
+
+                # Start delivery watcher for output relay
+                start_task_delivery_watch(entry, proc, output_log, lock_file, platform, backend, log)
+
+                dispatched.append((name, proc.pid))
+                append_log("%s -- DISPATCHED -- step %d PID %d" % (name, step_number, proc.pid))
+                log.info(
+                    "Continuous '%s': dispatched step %d (PID %d, model: %s)",
+                    name, step_number, proc.pid, model,
+                )
+
+            except (OSError, ValueError) as exc:
+                errors.append(name)
+                append_log("%s -- ERROR -- step %d failed to spawn: %s" % (name, step_number, exc))
+                log.error("Continuous '%s': failed to spawn step %d: %s", name, step_number, exc, exc_info=True)
+
+        except Exception as exc:  # noqa: BLE001 - per-entry isolation boundary
+            errors.append(name or "?")
+            append_log(
+                "%s -- ERROR -- dispatch crashed: %s" % (name or "?", exc)
             )
-
-        except (OSError, ValueError) as exc:
-            errors.append(name)
-            append_log("%s -- ERROR -- step %d failed to spawn: %s" % (name, step_number, exc))
-            log.error("Continuous '%s': failed to spawn step %d: %s", name, step_number, exc, exc_info=True)
+            log.error(
+                "Continuous '%s': dispatch crashed (isolated from other "
+                "tasks): %s", name or "?", exc, exc_info=True,
+            )
 
     return dispatched, errors
 
