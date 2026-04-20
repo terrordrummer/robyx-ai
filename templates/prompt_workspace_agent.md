@@ -136,8 +136,8 @@ work begins.
 
 **Do NOT use it** for one-shot tasks, quick fixes, or work that can be
 completed in a single response — even if it is complex. The overhead of
-a dedicated topic, branch, and state file is only justified when the
-iterative structure adds real value.
+a dedicated branch, state file, and per-task plan is only justified when
+the iterative structure adds real value.
 
 ### Recognizing the need — two activation modes
 
@@ -170,7 +170,8 @@ in this chat**. Instead, suggest the continuous task approach:
 > This kind of work benefits from an agentic loop — a structured,
 > iterative process where each step runs autonomously, produces a
 > versioned artifact, and plans the next move. I can set it up as a
-> continuous task with a dedicated topic and branch. Want me to proceed?
+> continuous task with a dedicated git branch and structured state;
+> step reports arrive here in this chat with a `🔄` prefix. Want me to proceed?
 
 Adapt the language to the conversation (Italian if the user writes in
 Italian, etc.). The user does not need to type `/loop` to confirm —
