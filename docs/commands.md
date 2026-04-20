@@ -6,6 +6,7 @@ Telegram and Discord support the slash commands below. On Slack, use natural lan
 
 | Command | Description |
 |---------|-------------|
+| `/start` | Alias of `/help` — sent automatically by Telegram when a user first opens a chat with the bot |
 | `/help` | Show available commands |
 | `/workspaces` | List active workspaces with status |
 | `/specialists` | List cross-functional agents |
