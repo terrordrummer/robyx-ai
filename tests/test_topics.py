@@ -839,8 +839,12 @@ class TestHealDetachedWorkspaces:
 
 
 class TestCreateContinuousWorkspaceSpec005:
-    """US1 acceptance: continuous tasks do NOT open a sub-topic; delivery
-    target is the parent workspace chat's thread; plan.md is persisted.
+    """Continuous-task creation acceptance tests.
+
+    Originally written against spec 005 (unified workspace chat, no
+    sub-topic). Spec 006 reinstates dedicated topics with state markers;
+    these tests now assert the spec-006 behaviour while retaining the
+    class name for diff continuity.
     """
 
     @pytest.fixture
@@ -858,13 +862,17 @@ class TestCreateContinuousWorkspaceSpec005:
         }
 
     @pytest.mark.asyncio
-    async def test_does_not_create_subtopic(
+    async def test_creates_dedicated_topic(
         self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
     ):
+        """Spec 006 US2: every continuous task creates a dedicated
+        [Continuous] topic with an initial state-marker suffix.
+        """
         monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous")
         work_dir = tmp_path / "project"
         work_dir.mkdir()
 
+        # The mock_platform fixture returns 999 from create_channel.
         result = await topics.create_continuous_workspace(
             name="Docs Hunt",
             program=program,
@@ -877,10 +885,14 @@ class TestCreateContinuousWorkspaceSpec005:
         )
 
         assert result is not None
-        # Core spec 005 assertion: no new sub-topic opened.
-        mock_platform.create_channel.assert_not_awaited()
-        # Delivery target is the parent thread.
-        assert result["thread_id"] == 42
+        mock_platform.create_channel.assert_awaited_once()
+        # Creation call includes the [Continuous] prefix and display name.
+        called_name = mock_platform.create_channel.call_args[0][0]
+        assert called_name == "[Continuous] Docs Hunt"
+        # Delivery target is the new dedicated thread, not the parent.
+        assert result["thread_id"] == 999
+        assert result["dedicated_thread_id"] == 999
+        assert result["parent_thread_id"] == 42
 
     @pytest.mark.asyncio
     async def test_persists_plan_md(
@@ -935,9 +947,12 @@ class TestCreateContinuousWorkspaceSpec005:
         assert state["plan_path"].endswith("data/continuous/docs-hunt/plan.md")
 
     @pytest.mark.asyncio
-    async def test_queue_entry_uses_parent_thread(
+    async def test_queue_entry_uses_dedicated_thread(
         self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
     ):
+        """Spec 006 US2: the queue entry's thread_id points at the
+        dedicated topic (not the parent) so delivery lands there.
+        """
         monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous")
         work_dir = tmp_path / "project"
         work_dir.mkdir()
@@ -958,13 +973,17 @@ class TestCreateContinuousWorkspaceSpec005:
         entries = queue.get("entries") if isinstance(queue, dict) else queue
         continuous_entries = [e for e in entries if e.get("type") == "continuous"]
         assert len(continuous_entries) == 1
-        assert continuous_entries[0]["thread_id"] == "42"
+        # Dedicated thread id (999 from mock_platform) — NOT parent 42.
+        assert continuous_entries[0]["thread_id"] == "999"
         assert continuous_entries[0]["name"] == "docs-hunt"
 
     @pytest.mark.asyncio
-    async def test_agent_registered_with_no_thread_id(
+    async def test_agent_registered_with_dedicated_thread_id(
         self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
     ):
+        """Spec 006 US2: the agent is registered with the dedicated
+        topic's thread_id so thread→agent routing lands there.
+        """
         monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous")
         work_dir = tmp_path / "project"
         work_dir.mkdir()
@@ -980,11 +999,9 @@ class TestCreateContinuousWorkspaceSpec005:
             parent_thread_id=42,
         )
 
-        # Agent must NOT claim the parent workspace's thread_id in the
-        # routing map — the parent agent owns thread 42.
         agent = agent_manager.get("docs-hunt")
         assert agent is not None
-        assert agent.thread_id is None
+        assert agent.thread_id == 999  # dedicated topic from mock_platform
 
     @pytest.mark.asyncio
     async def test_missing_parent_thread_id_returns_none(

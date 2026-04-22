@@ -216,7 +216,9 @@ STRINGS = {
         "Continuous task not created — the requested work directory is outside the workspace."
     ),
     "continuous_task_error_name_taken": (
-        "Continuous task *%s* not created — that name is already in use."
+        "Continuous task *%s* not created — a task with that name is already "
+        "registered. To reuse the name, run `[DELETE_TASK name=\"%s\"]` first "
+        "(archives the topic and frees the name), or pick a different name."
     ),
     "continuous_task_error_permission_denied": (
         "Continuous task not created — this agent is not authorised to create one here."

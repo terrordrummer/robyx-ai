@@ -47,6 +47,25 @@ async def retry_send(
     raise last_exc
 
 
+class TopicUnreachable(Exception):
+    """Raised by adapter topic operations when the target topic/channel has
+    been deleted, archived irreversibly, or is otherwise permanently
+    inaccessible. Callers (scheduler, delivery) catch this and invoke the
+    FR-002a last-resort HQ surface path (spec 006).
+
+    Transient failures (rate limits, network blips) are NOT this — those
+    are retried internally by :func:`retry_send` and surface as regular
+    falsy returns if retries are exhausted.
+    """
+
+    def __init__(self, channel_id: Any, reason: str = "") -> None:
+        self.channel_id = channel_id
+        self.reason = reason
+        super().__init__(
+            "Topic %s unreachable: %s" % (channel_id, reason or "unknown"),
+        )
+
+
 @dataclass
 class PlatformMessage:
     """Platform-agnostic incoming message."""
@@ -239,3 +258,91 @@ class Platform(abc.ABC):
             adapter). Must NOT raise — the migration runner depends on a
             clean boolean.
         """
+
+    # ── Spec 006 — dedicated-topic operations ───────────────────────────
+
+    async def edit_topic_title(self, channel_id: Any, new_title: str) -> bool:
+        """Update the display title of a topic/channel.
+
+        Default implementation: log WARN once and return ``False``.
+        Adapters MUST override with a real implementation. Raises
+        :class:`TopicUnreachable` if the topic has been permanently
+        deleted (e.g. user removed it manually).
+
+        Returns True on success, False on transient / non-fatal failure.
+        """
+        _log.warning(
+            "edit_topic_title: platform %s does not implement topic title edits",
+            type(self).__name__,
+        )
+        return False
+
+    async def pin_message(
+        self,
+        chat_id: Any,
+        thread_id: Any,
+        message_id: Any,
+    ) -> bool:
+        """Pin a specific message inside a topic.
+
+        Default: WARN + ``False``. Telegram/Discord implement this;
+        Slack pins are workspace-wide (documented degradation — adapter
+        logs one WARN per session per FR-013).
+        """
+        _log.warning(
+            "pin_message: platform %s does not implement per-topic pinning",
+            type(self).__name__,
+        )
+        return False
+
+    async def unpin_message(
+        self,
+        chat_id: Any,
+        thread_id: Any,
+        message_id: Any | None = None,
+    ) -> bool:
+        """Unpin a specific message (or all pinned messages in the topic
+        if ``message_id`` is None).
+
+        Default: WARN + ``False``. Adapters MUST override.
+        """
+        _log.warning(
+            "unpin_message: platform %s does not implement unpin",
+            type(self).__name__,
+        )
+        return False
+
+    async def close_topic(self, channel_id: Any) -> bool:
+        """Close a topic/channel to new messages. History remains visible.
+
+        On Telegram maps to ``closeForumTopic``. On Discord to
+        ``thread.edit(archived=True, locked=True)``. On Slack to
+        ``conversations.archive`` (permanent — logged with WARN on first
+        use).
+
+        Default: WARN + ``False``.
+        """
+        _log.warning(
+            "close_topic: platform %s does not implement close_topic",
+            type(self).__name__,
+        )
+        return False
+
+    async def archive_topic(
+        self,
+        channel_id: Any,
+        display_name: str,
+    ) -> bool:
+        """Atomic-ish: rename to ``[Archived] <display_name>`` then close.
+
+        Used by the spec-006 ``delete_task`` lifecycle op so a deleted
+        task's history remains readable. Default implementation composes
+        :meth:`edit_topic_title` + :meth:`close_topic` — adapters can
+        override for a single-call primitive on their platform.
+
+        Returns ``True`` only if BOTH operations succeeded.
+        """
+        new_title = "[Archived] %s" % display_name
+        renamed = await self.edit_topic_title(channel_id, new_title)
+        closed = await self.close_topic(channel_id)
+        return bool(renamed and closed)

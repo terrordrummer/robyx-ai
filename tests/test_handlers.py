@@ -98,6 +98,8 @@ class TestMakeHandlers:
             "start", "help", "workspaces", "specialists", "status",
             "reset", "focus", "ping", "checkupdate", "doupdate",
             "voice", "message",
+            # Spec 006: [GET_EVENTS] handler always exposed (no collab dep).
+            "_handle_get_events",
         }
         assert set(handlers.keys()) == expected
 

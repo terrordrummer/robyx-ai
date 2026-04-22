@@ -71,16 +71,57 @@ def read_plan_md(name: str) -> str | None:
         return None
 
 
+_SPEC_006_DEFAULTS: dict[str, Any] = {
+    "dedicated_thread_id": None,
+    "drain_timeout_seconds": 3600,
+    "awaiting_since_ts": None,
+    "awaiting_pinned_msg_id": None,
+    "awaiting_reminder_sent_ts": None,
+    "orphan_detect_count": 0,
+    "orphan_last_detected_ts": None,
+    "hq_fallback_sent": False,
+    "topic_unreachable_since_ts": None,
+    "archived_at": None,
+    "migrated_v0_26_0": None,
+}
+
+
 def load_state(path: Path) -> dict | None:
-    """Load a continuous task state file. Returns None if missing or corrupt."""
+    """Load a continuous task state file. Returns None if missing or corrupt.
+
+    Spec 006: applies legacy status normalisation (``awaiting-input`` →
+    ``awaiting_input``, ``rate-limited`` → ``rate_limited``, ``paused`` →
+    ``stopped``) in-memory so older snapshots keep working. Defaults any
+    missing spec-006 fields so downstream code can rely on their presence.
+    The caller decides whether to persist the normalised form (save_state
+    automatically writes canonical form).
+    """
     if not path.exists():
         return None
     try:
         data = json.loads(path.read_text())
-        return data if isinstance(data, dict) else None
     except (json.JSONDecodeError, OSError) as exc:
         log.error("Failed to load continuous state %s: %s", path, exc)
         return None
+
+    if not isinstance(data, dict):
+        return None
+
+    # Spec 006 — normalise legacy status strings and default new fields.
+    try:
+        from continuous_state_machine import normalize_legacy_status
+        raw_status = data.get("status")
+        if isinstance(raw_status, str):
+            data["status"] = normalize_legacy_status(raw_status)
+    except ImportError:
+        # Circular import protection — tests that import continuous before
+        # the full module tree is loaded. Status normalisation is best-effort.
+        pass
+
+    for field, default in _SPEC_006_DEFAULTS.items():
+        data.setdefault(field, default)
+
+    return data
 
 
 def save_state(path: Path, state: dict) -> None:
@@ -125,10 +166,10 @@ def create_continuous_task(
         Filesystem path where the agent operates.
     """
     now = datetime.now(timezone.utc).isoformat()
-    state = {
+    state: dict[str, Any] = {
         "id": str(_uuid.uuid4()),
         "name": name,
-        "status": "pending",  # pending, running, paused, awaiting-input, completed, error, rate-limited
+        "status": "pending",  # canonical spec-006 states: pending | running | awaiting_input | rate_limited | stopped | completed | error | deleted
         "parent_workspace": parent_workspace,
         "workspace_thread_id": thread_id,
         "branch": branch,
@@ -151,6 +192,14 @@ def create_continuous_task(
         "total_steps_completed": 0,
         "rate_limited_until": None,
     }
+    # Spec 006 additive fields — present from creation so every code path
+    # can rely on them without defensive .get() calls.
+    for field, default in _SPEC_006_DEFAULTS.items():
+        state[field] = default
+    # Thread routing: at create time, both workspace_thread_id (legacy
+    # parent-chat delivery target) and dedicated_thread_id (post-spec-006
+    # dedicated-topic target) can be present. The caller in topics.py
+    # fills dedicated_thread_id after create_channel returns.
 
     path = state_file_path(name)
     save_state(path, state)
@@ -222,21 +271,36 @@ def set_next_step(state: dict, description: str) -> dict:
 
 
 def pause_task(state: dict) -> dict:
-    """Pause a continuous task. The scheduler will not dispatch new steps."""
-    state["status"] = "paused"
+    """Stop a continuous task. The scheduler will not dispatch new steps.
+
+    Spec 006: renamed ``paused`` → ``stopped`` for consistency with the
+    lifecycle contract. The word "pause" is retained in this function
+    name for source-level continuity but the status written is now the
+    canonical ``stopped``. Legacy ``paused`` values on disk are
+    normalised by ``load_state`` on read.
+    """
+    state["status"] = "stopped"
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     return state
 
 
 def resume_task(state: dict) -> dict:
-    """Resume a paused, rate-limited, or awaiting-input task.
+    """Resume a stopped, rate-limited, awaiting-input, or errored task.
 
-    Clears ``awaiting_question`` so the next scheduler tick sees a clean
-    ``pending`` state with no stale question attached.
+    Clears awaiting-related fields so the next scheduler tick sees a
+    clean ``pending`` state. The scheduler will transition
+    ``pending → running`` on its next dispatch.
     """
     state["status"] = "pending"
     state["rate_limited_until"] = None
     state.pop("awaiting_question", None)
+    state["awaiting_since_ts"] = None
+    state["awaiting_pinned_msg_id"] = None
+    state["awaiting_reminder_sent_ts"] = None
+    # Resume on an errored task resets the orphan counter — it's a fresh
+    # attempt per the spec-006 recovery contract.
+    state["orphan_detect_count"] = 0
+    state["orphan_last_detected_ts"] = None
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
     return state
 
@@ -251,29 +315,150 @@ def complete_task(state: dict) -> dict:
 
 
 def set_awaiting_input(state: dict, question: str = "") -> dict:
-    """Mark a task as waiting for user input."""
-    state["status"] = "awaiting-input"
+    """Mark a task as waiting for user input (spec 006 canonical state).
+
+    Also sets ``awaiting_since_ts`` used by the scheduler's 24-hour
+    reminder loop, and clears any prior ``awaiting_reminder_sent_ts``
+    so the new awaiting episode starts a fresh reminder cycle.
+    """
+    now = datetime.now(timezone.utc)
+    state["status"] = "awaiting_input"
     if question:
         state["awaiting_question"] = question
-    state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    state["awaiting_since_ts"] = now.isoformat()
+    state["awaiting_reminder_sent_ts"] = None
+    state["awaiting_pinned_msg_id"] = None  # pin set separately by delivery layer
+    state["updated_at"] = now.isoformat()
     return state
 
 
 def set_rate_limited(state: dict, retry_after_seconds: int = 3600) -> dict:
-    """Mark a task as rate-limited. The scheduler will skip until recovery."""
+    """Mark a task as rate-limited (spec 006 canonical underscore form)."""
     now = datetime.now(timezone.utc)
     retry_at = datetime.fromtimestamp(
         now.timestamp() + retry_after_seconds, tz=timezone.utc,
     )
-    state["status"] = "rate-limited"
+    state["status"] = "rate_limited"
     state["rate_limited_until"] = retry_at.isoformat()
     state["updated_at"] = now.isoformat()
     return state
 
 
+async def update_topic_state_marker(state: dict, platform, display_name: str | None = None) -> bool:
+    """Spec 006 FR-009 — refresh the dedicated topic's title suffix from
+    the task's current ``status``.
+
+    No-op if the task has no ``dedicated_thread_id`` or the platform
+    lacks ``edit_topic_title``. Catches ``TopicUnreachable`` and
+    propagates it so the scheduler-side recovery path (FR-002a) can
+    engage. All other exceptions are logged and swallowed — a failed
+    title update must not block the state transition.
+    """
+    dedicated = state.get("dedicated_thread_id")
+    if dedicated is None or platform is None:
+        return False
+    if not hasattr(platform, "edit_topic_title"):
+        return False
+
+    from continuous_state_machine import marker_suffix
+    suffix = marker_suffix(state.get("status") or "running")
+    name = display_name or state.get("name") or "?"
+    new_title = "[Continuous] %s%s" % (name, suffix)
+
+    try:
+        return bool(await platform.edit_topic_title(dedicated, new_title))
+    except Exception as exc:
+        # TopicUnreachable is significant; re-raise so the scheduler's
+        # recovery layer can see it. Everything else: log + swallow.
+        from messaging.base import TopicUnreachable
+        if isinstance(exc, TopicUnreachable):
+            raise
+        log.warning(
+            "update_topic_state_marker failed for '%s' (thread=%s): %s",
+            name, dedicated, exc,
+        )
+        return False
+
+
+async def pin_awaiting_message(
+    state: dict,
+    platform,
+    chat_id,
+    message_id: int,
+) -> bool:
+    """Spec 006 FR-010 — pin an awaiting-input message in the task's
+    dedicated topic and record ``awaiting_pinned_msg_id`` in the state.
+    """
+    dedicated = state.get("dedicated_thread_id")
+    if dedicated is None or platform is None:
+        return False
+    if not hasattr(platform, "pin_message"):
+        return False
+
+    try:
+        ok = await platform.pin_message(
+            chat_id=chat_id,
+            thread_id=dedicated,
+            message_id=message_id,
+        )
+    except Exception as exc:
+        from messaging.base import TopicUnreachable
+        if isinstance(exc, TopicUnreachable):
+            raise
+        log.warning(
+            "pin_awaiting_message failed for task '%s': %s",
+            state.get("name"), exc,
+        )
+        return False
+    if ok:
+        state["awaiting_pinned_msg_id"] = message_id
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return bool(ok)
+
+
+async def unpin_awaiting_message(
+    state: dict,
+    platform,
+    chat_id,
+) -> bool:
+    """Spec 006 FR-012 — unpin the currently-pinned awaiting message
+    (if any) in the task's dedicated topic.
+    """
+    dedicated = state.get("dedicated_thread_id")
+    pinned = state.get("awaiting_pinned_msg_id")
+    if dedicated is None or platform is None or pinned is None:
+        return False
+    if not hasattr(platform, "unpin_message"):
+        return False
+
+    try:
+        ok = await platform.unpin_message(
+            chat_id=chat_id,
+            thread_id=dedicated,
+            message_id=pinned,
+        )
+    except Exception as exc:
+        from messaging.base import TopicUnreachable
+        if isinstance(exc, TopicUnreachable):
+            raise
+        log.warning(
+            "unpin_awaiting_message failed for task '%s': %s",
+            state.get("name"), exc,
+        )
+        return False
+    if ok:
+        state["awaiting_pinned_msg_id"] = None
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return bool(ok)
+
+
 def check_rate_limit_recovery(state: dict) -> bool:
-    """Return True if a rate-limited task can be retried now."""
-    if state.get("status") != "rate-limited":
+    """Return True if a rate-limited task can be retried now.
+
+    Accepts both canonical ``rate_limited`` and legacy ``rate-limited``.
+    """
+    status = state.get("status")
+    if status not in ("rate_limited", "rate-limited"):
         return False
     retry_until = state.get("rate_limited_until")
     if not retry_until:
@@ -291,11 +476,22 @@ def check_rate_limit_recovery(state: dict) -> bool:
 
 
 def is_ready_for_next_step(state: dict) -> bool:
-    """Return True if the task has a planned next step and is not blocked."""
+    """Return True if the task has a planned next step and is not blocked.
+
+    Accepts both canonical spec-006 status names and their legacy aliases.
+    Blocked states: running, awaiting_input, stopped, completed, error,
+    deleted, rate_limited (unless recovery time has passed).
+    """
     status = state.get("status")
-    if status in ("completed", "paused", "awaiting-input", "running"):
+    if status in (
+        "completed", "deleted",
+        "stopped", "paused",
+        "awaiting_input", "awaiting-input",
+        "running",
+        "error",
+    ):
         return False
-    if status == "rate-limited":
+    if status in ("rate_limited", "rate-limited"):
         return check_rate_limit_recovery(state)
     next_step = state.get("next_step")
     return next_step is not None and bool(next_step.get("description"))

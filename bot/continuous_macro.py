@@ -559,6 +559,26 @@ async def apply_continuous_macros(
 
         # ── 7. Side effects ──────────────────────────────────────────
         name = tok.name_raw or "?"
+        # Spec 006 T062 — optional `drain_timeout_seconds` override
+        # travels inside the program payload. Valid range clamped to
+        # [60, 21600] = 1 min … 6 h.
+        drain_timeout: int | None = None
+        raw_drain = program.get("drain_timeout_seconds") if isinstance(program, dict) else None
+        if raw_drain is not None:
+            try:
+                drain_val = int(raw_drain)
+                if 60 <= drain_val <= 21600:
+                    drain_timeout = drain_val
+                else:
+                    log.warning(
+                        "continuous.macro: drain_timeout_seconds=%s out of "
+                        "range [60, 21600] — ignoring", raw_drain,
+                    )
+            except (TypeError, ValueError):
+                log.warning(
+                    "continuous.macro: drain_timeout_seconds=%r not an int — ignoring",
+                    raw_drain,
+                )
         try:
             result = await create_ws(
                 name=name,
@@ -569,6 +589,7 @@ async def apply_continuous_macros(
                 manager=ctx.manager,
                 platform=ctx.platform,
                 parent_thread_id=ctx.thread_id,
+                drain_timeout_seconds=drain_timeout,
             )
         except ValueError as exc:
             msg = str(exc)
@@ -585,7 +606,7 @@ async def apply_continuous_macros(
             outcomes.append(outcome)
             if reason == "name_taken":
                 lines.append(
-                    strings["continuous_task_error_name_taken"] % name
+                    strings["continuous_task_error_name_taken"] % (name, name)
                 )
             else:
                 lines.append(strings["continuous_task_error_downstream"])

@@ -324,15 +324,23 @@ async def create_continuous_workspace(
     manager: AgentManager,
     platform=None,
     parent_thread_id=None,
+    drain_timeout_seconds: int | None = None,
 ) -> dict | None:
-    """Create a continuous task: git branch + state + plan.md + queue entry.
+    """Create a continuous task: git branch + state + plan.md + queue entry
+    + dedicated topic (spec 006 US2).
 
-    Spec 005 (unified workspace chat): this function no longer creates a
-    dedicated sub-topic. The continuous task reports into the *parent*
-    workspace chat identified by ``parent_thread_id``. The agent is
-    registered with ``thread_id=None`` so the parent workspace's routing
-    is not hijacked (interrupts go through the primary agent's lifecycle
-    macros, not through a dedicated thread).
+    Spec 006 supersedes spec 005's unified-chat model for continuous tasks:
+    each task gets a **dedicated topic** named ``[Continuous] <display_name>``
+    with a state-marker suffix (``· ▶`` on creation). All subsequent step
+    deliveries, awaiting-input pins, state transitions, and the
+    ``[GET_EVENTS]`` fallbacks target this dedicated thread — the parent
+    workspace topic stays clean for human↔agent conversation.
+
+    If the platform adapter cannot create a topic (e.g. Slack on an
+    inadequately-scoped bot, or a test fixture with ``create_channel``
+    returning None), the task still gets created and queued; delivery
+    falls back to ``parent_thread_id`` until a later manual heal
+    (``heal_detached_workspaces``) attaches it.
 
     Returns dict with workspace info or None on failure.
     """
@@ -348,8 +356,8 @@ async def create_continuous_workspace(
 
     if parent_thread_id is None:
         log.error(
-            "create_continuous_workspace '%s' called without parent_thread_id "
-            "(spec 005 removed the dedicated sub-topic model)", safe_name,
+            "create_continuous_workspace '%s' called without parent_thread_id",
+            safe_name,
         )
         return None
 
@@ -377,11 +385,47 @@ async def create_continuous_workspace(
 
     # 3. Persist the per-task plan.md (spec 005). Readable by the primary
     # agent on demand via [GET_PLAN] and by the secondary step agent in its
-    # prompt context. See contracts/lifecycle-macros.md and data-model.md.
+    # prompt context.
     plan_md = _render_plan_markdown(display_name, program)
     plan_path = write_plan_md(safe_name, plan_md)
 
-    # 4. Create state file
+    # 4. Spec 006 — create the dedicated topic BEFORE writing state, so
+    # ``dedicated_thread_id`` can be persisted atomically with the rest
+    # of the initial state. Best-effort: platform failures degrade to
+    # the legacy parent-thread routing.
+    dedicated_thread_id = None
+    if platform is not None and hasattr(platform, "create_channel"):
+        try:
+            from continuous_state_machine import marker_suffix
+            base_title = "[Continuous] %s" % display_name
+            raw_id = await platform.create_channel(base_title)
+            if raw_id is not None:
+                dedicated_thread_id = raw_id
+                # Apply the initial running-state marker suffix.
+                suffix = marker_suffix("pending")  # " · ▶"
+                if suffix and hasattr(platform, "edit_topic_title"):
+                    try:
+                        await platform.edit_topic_title(
+                            dedicated_thread_id,
+                            base_title + suffix,
+                        )
+                    except Exception as exc:
+                        log.warning(
+                            "Could not apply initial marker for '%s': %s",
+                            safe_name, exc,
+                        )
+            else:
+                log.warning(
+                    "create_channel returned None for '%s' — falling back to "
+                    "parent_thread_id for delivery", safe_name,
+                )
+        except Exception as exc:
+            log.warning(
+                "Dedicated topic creation failed for '%s': %s — falling back "
+                "to parent_thread_id", safe_name, exc,
+            )
+
+    # 5. Create state file with the dedicated_thread_id persisted from the start.
     state = create_continuous_task(
         name=safe_name,
         parent_workspace=parent_workspace,
@@ -391,6 +435,9 @@ async def create_continuous_workspace(
         work_dir=work_dir,
     )
     state["versioning"] = versioning
+    state["dedicated_thread_id"] = dedicated_thread_id
+    if drain_timeout_seconds is not None:
+        state["drain_timeout_seconds"] = int(drain_timeout_seconds)
     # Relative path from repo root for portability across machines (spec 005).
     from pathlib import Path as _Path
     repo_root = _Path(__file__).resolve().parents[1]
@@ -401,35 +448,59 @@ async def create_continuous_workspace(
     from continuous import save_state, state_file_path as _sfp
     save_state(_sfp(safe_name), state)
 
-    # 5. Create data directory
+    # 6. Create data directory
     (DATA_DIR / safe_name).mkdir(parents=True, exist_ok=True)
 
-    # 6. Add to unified queue (delivery target = parent workspace thread).
+    # 7. Add to unified queue. Delivery target is the dedicated topic
+    # when available; otherwise falls back to the parent workspace thread.
+    queue_thread_id = (
+        dedicated_thread_id if dedicated_thread_id is not None else parent_thread_id
+    )
     _add_task({
         "name": safe_name,
         "type": "continuous",
         "agent_file": "agents/%s.md" % safe_name,
         "model": model,
-        "thread_id": str(parent_thread_id),
+        "thread_id": str(queue_thread_id),
         "state_file": str(state_file_path(safe_name)),
         "description": "Continuous: %s" % display_name,
     })
 
-    # 7. Register agent with thread_id=None so it does not displace the
-    # parent workspace agent in the thread→agent routing map.
+    # 8. Register agent. thread_id points at the dedicated topic when
+    # present (so the agent can be routed to by thread lookup); falls
+    # back to None (non-hijacking) when no dedicated topic exists.
     manager.add_agent(
         name=safe_name,
         work_dir=work_dir,
         description="[Continuous] %s" % display_name,
         agent_type="workspace",
         model=model,
-        thread_id=None,
+        thread_id=dedicated_thread_id,
     )
+
+    # 9. Spec 006 — journal the creation event for pull-based queries.
+    try:
+        import events as events_mod
+        events_mod.append(
+            task_name=safe_name,
+            task_type="continuous",
+            event_type="created",
+            outcome="ok",
+            payload={
+                "dedicated_thread_id": dedicated_thread_id,
+                "parent_thread_id": parent_thread_id,
+                "drain_timeout_seconds": state.get("drain_timeout_seconds", 3600),
+            },
+        )
+    except Exception:
+        pass
 
     return {
         "name": safe_name,
         "display_name": display_name,
-        "thread_id": parent_thread_id,
+        "thread_id": dedicated_thread_id or parent_thread_id,
+        "dedicated_thread_id": dedicated_thread_id,
+        "parent_thread_id": parent_thread_id,
         "branch": branch,
         "versioning": versioning,
         "state_file": str(state_file_path(safe_name)),

@@ -270,9 +270,12 @@ class TestTaskStatus:
 
 
 class TestStopTask:
-    def test_stop_continuous_transitions_status_to_completed(
+    def test_stop_continuous_transitions_status_to_stopped(
         self, tmp_path, monkeypatch,
     ):
+        """Spec 006 FR-014: stop preserves resumability (status=stopped,
+        not completed). Prior to spec-006, stop wrote completed which
+        conflicted with the distinct complete op."""
         monkeypatch.setattr("continuous.CONTINUOUS_DIR", tmp_path / "continuous")
         import continuous as cont
 
@@ -281,7 +284,6 @@ class TestStopTask:
             _state("daily-report", "running"),
         )
 
-        # Real queue path so cancel_task_by_name doesn't crash.
         queue_file = tmp_path / "queue.json"
         queue_file.write_text('[{"name": "daily-report", '
                               '"type": "continuous", "status": "pending", '
@@ -297,9 +299,9 @@ class TestStopTask:
         body = list(subs.values())[0]
         assert "fermato" in body.lower()
 
-        # State file now reflects completed.
         new_state = cont.load_state(cont.state_file_path("daily-report"))
-        assert new_state["status"] == "completed"
+        # Spec 006 canonical "stopped" (resumable), NOT terminal "completed".
+        assert new_state["status"] == "stopped"
 
     def test_stop_non_continuous_cancels_queue_entry(
         self, tmp_path, monkeypatch,
@@ -373,7 +375,9 @@ class TestPauseResume:
         ))
         assert "pausa" in list(subs.values())[0].lower()
         reloaded = cont.load_state(cont.state_file_path("daily-report"))
-        assert reloaded["status"] == "paused"
+        # Spec 006: pause writes canonical "stopped" (legacy "paused" is
+        # normalised on load anyway, so either would appear here).
+        assert reloaded["status"] == "stopped"
 
         # RESUME
         state_map = {"daily-report": reloaded}
@@ -547,9 +551,14 @@ class TestWorkspaceIsolation:
             _entry("my-task", "continuous", thread_id=42, status="running"),
             _entry("their-task", "continuous", thread_id=99, status="running"),
         ]
+        # Spec 006: scope filter also consults state.workspace_thread_id
+        # so each state must carry the correct parent thread — otherwise
+        # both tasks look like they belong to workspace 42.
+        their_state = _state("their-task", "running")
+        their_state["workspace_thread_id"] = 99
         state_map = {
-            "my-task": _state("my-task", "running"),
-            "their-task": _state("their-task", "running"),
+            "my-task": _state("my-task", "running"),  # workspace_thread_id=42 (fixture default)
+            "their-task": their_state,
         }
         ctx = _ctx(entries, state_map)
 

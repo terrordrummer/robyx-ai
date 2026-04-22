@@ -40,6 +40,7 @@ import re
 import threading
 import time
 import uuid as _uuid
+from enum import Enum
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -246,6 +247,105 @@ def add_reminder(entry: dict) -> None:
         entries = _load_queue_unlocked()
         entries.append(queued)
         _save_queue_unlocked(entries)
+
+
+async def drain_and_cancel_continuous_task(
+    task_name: str,
+    *,
+    reason: str = "workspace closed",
+    drain_timeout_seconds: int | None = None,
+) -> dict:
+    """Spec 006 FR-021 — drain-on-close with a bounded window.
+
+    If the continuous task ``task_name`` has a running subprocess, wait
+    up to ``drain_timeout_seconds`` (or the task's per-state override,
+    or ``DRAIN_TIMEOUT_DEFAULT_SECONDS``) for it to exit naturally. If
+    the timeout elapses first, SIGTERM + 5s grace + SIGKILL, then
+    journal ``drain_timeout``. Finally cancel the queue entry.
+
+    Returns ``{"drained": bool, "timeout": bool, "waited_seconds": float}``.
+    """
+    import asyncio as _asyncio
+    import signal as _signal
+    from process import is_pid_alive
+
+    try:
+        from config import DRAIN_TIMEOUT_DEFAULT_SECONDS as _default_drain
+    except Exception:
+        _default_drain = 3600
+
+    from continuous import load_state, state_file_path
+
+    # Resolve effective drain window.
+    state_path = state_file_path(task_name)
+    state = load_state(state_path)
+    effective = drain_timeout_seconds
+    if effective is None and state is not None:
+        effective = state.get("drain_timeout_seconds")
+    if effective is None:
+        effective = _default_drain
+    effective = max(1, int(effective))
+
+    _journal_scheduler_event(
+        task_name=task_name,
+        event_type="drain_started",
+        outcome="ok",
+        payload={"timeout_seconds": effective, "reason": reason},
+    )
+
+    # Locate the running subprocess via lock file.
+    lock_file = DATA_DIR / task_name / "lock"
+    pid: int | None = None
+    if lock_file.exists():
+        pid_raw, _ = _parse_lock_content(lock_file.read_text())
+        pid = pid_raw
+
+    waited = 0.0
+    timed_out = False
+    drained = False
+
+    if pid is not None and is_pid_alive(pid):
+        # Poll for natural exit up to the drain window.
+        interval = 1.0
+        start = time.monotonic()
+        while waited < effective:
+            if not is_pid_alive(pid):
+                drained = True
+                break
+            await _asyncio.sleep(interval)
+            waited = time.monotonic() - start
+
+        if not drained and is_pid_alive(pid):
+            timed_out = True
+            try:
+                os.kill(pid, _signal.SIGTERM)
+                await _asyncio.sleep(5)
+                if is_pid_alive(pid):
+                    os.kill(pid, _signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            _journal_scheduler_event(
+                task_name=task_name,
+                event_type="drain_timeout",
+                outcome="killed",
+                payload={"pid": pid, "timeout_seconds": effective},
+            )
+
+    # Cancel the queue entry regardless of drain outcome.
+    cancel_task_by_name(task_name, reason=reason)
+
+    _journal_scheduler_event(
+        task_name=task_name,
+        event_type="drain_completed",
+        outcome="drained" if drained else ("timeout" if timed_out else "not_running"),
+        payload={"waited_seconds": round(waited, 2)},
+    )
+
+    return {
+        "drained": drained,
+        "timeout": timed_out,
+        "waited_seconds": round(waited, 2),
+    }
 
 
 def cancel_tasks_for_agent_file(
@@ -832,9 +932,160 @@ async def _spawn_ai_subprocess(
 
 
 def _write_lock_file(lock_file: Path, pid: int) -> None:
-    """Write ``<pid> <ISO-utc>`` to the task lock file."""
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lock_file.write_text("%d %s" % (pid, now_str))
+    """Write the initial lock file — spec 006 two-line format.
+
+    Line 1: ``<pid>``
+    Line 2: ``<iso8601_heartbeat_ts>``
+
+    The heartbeat timestamp is refreshed periodically by the subprocess
+    via :func:`refresh_heartbeat` so stale-lock detection can distinguish
+    "subprocess alive but slow" from "subprocess crashed/SIGKILL'd".
+    """
+    now_str = datetime.now(timezone.utc).isoformat()
+    # Pre-spec-006 single-line format kept as a subline-safe prefix: some
+    # readers that only look at line 1 still see the pid.
+    lock_file.write_text("%d\n%s\n" % (pid, now_str))
+
+
+def refresh_heartbeat(lock_file: Path, pid: int) -> None:
+    """Atomic heartbeat refresh — writes the same two-line lock format
+    via a temp file + ``os.replace`` so concurrent ``check_lock`` readers
+    never see a torn file.
+
+    Used by the subprocess-side heartbeat loop (spec 006 FR-019).
+    """
+    now_str = datetime.now(timezone.utc).isoformat()
+    tmp = lock_file.with_suffix(".lock.tmp-%d" % pid)
+    try:
+        tmp.write_text("%d\n%s\n" % (pid, now_str))
+        os.replace(str(tmp), str(lock_file))
+    except OSError:
+        # Best-effort — failure to refresh is non-fatal; scheduler will
+        # eventually detect the stale heartbeat and recover. Cleanup.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+class LockStatus(str, Enum):
+    """Outcome of ``check_lock`` — spec 006."""
+    ALIVE = "alive"
+    STALE_DEAD_PID = "stale_dead_pid"
+    STALE_ZOMBIE = "stale_zombie"
+    MISSING = "missing"
+
+
+def _parse_lock_content(content: str) -> tuple[int | None, datetime | None]:
+    """Parse a lock file body into ``(pid, heartbeat_ts)``.
+
+    Accepts three formats for backward compat:
+    * Legacy single-line ``<pid> <iso_ts>`` (space-separated).
+    * Legacy pid-only ``<pid>``.
+    * Spec 006 two-line ``<pid>\\n<iso_ts>\\n``.
+
+    Returns ``(None, None)`` on unparseable content.
+    """
+    content = content.strip()
+    if not content:
+        return None, None
+    pid: int | None = None
+    ts: datetime | None = None
+
+    if "\n" in content:
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        if not lines:
+            return None, None
+        try:
+            pid = int(lines[0])
+        except ValueError:
+            return None, None
+        if len(lines) >= 2:
+            try:
+                ts = datetime.fromisoformat(lines[1])
+            except ValueError:
+                ts = None
+    else:
+        parts = content.split()
+        try:
+            pid = int(parts[0])
+        except (ValueError, IndexError):
+            return None, None
+        if len(parts) >= 2:
+            try:
+                ts = datetime.fromisoformat(parts[1])
+            except ValueError:
+                ts = None
+
+    if ts is not None and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return pid, ts
+
+
+async def check_lock_status(task_name: str) -> tuple[LockStatus, int | None]:
+    """Spec 006 stale-aware lock check.
+
+    Returns the ``LockStatus`` and — when present and parseable — the pid
+    recorded in the lock file. Callers deciding whether to reclaim should
+    prefer this over the legacy bool-returning :func:`check_lock`.
+
+    Recovery semantics:
+      * ``ALIVE`` — subprocess is running AND heartbeat is fresh (or the
+        lock is in legacy pid-only format and the pid is alive). Skip
+        this task for the current scheduler cycle.
+      * ``STALE_DEAD_PID`` — pid is no longer on the OS. Scheduler may
+        delete the lock and reclaim.
+      * ``STALE_ZOMBIE`` — pid exists but heartbeat is older than the
+        configured threshold. Scheduler attempts SIGTERM + grace +
+        SIGKILL before deleting the lock.
+      * ``MISSING`` — no lock file. Task is not currently running.
+    """
+    try:
+        safe_name = validate_task_name(task_name)
+    except ValueError as exc:
+        log.error("Invalid task name for lock check %r: %s", task_name, exc)
+        return LockStatus.MISSING, None
+
+    lock_file = DATA_DIR / safe_name / "lock"
+    if not lock_file.exists():
+        return LockStatus.MISSING, None
+
+    try:
+        content = lock_file.read_text()
+    except OSError as exc:
+        log.warning(
+            "check_lock_status: read error on %s: %s — treating as missing",
+            lock_file, exc,
+        )
+        return LockStatus.MISSING, None
+
+    pid, heartbeat_ts = _parse_lock_content(content)
+    if pid is None:
+        # Unparseable lock — treat as missing so we don't deadlock.
+        try:
+            lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return LockStatus.MISSING, None
+
+    from process import is_pid_alive
+
+    if not is_pid_alive(pid):
+        return LockStatus.STALE_DEAD_PID, pid
+
+    # Pid alive. If heartbeat info is absent (legacy format), trust the
+    # pid — earlier Robyx never deadlocked on pid-alive-but-slow. If
+    # present, enforce the stale threshold.
+    if heartbeat_ts is not None:
+        try:
+            from config import LOCK_STALE_THRESHOLD_SECONDS as _threshold
+        except Exception:
+            _threshold = 300
+        age = (datetime.now(timezone.utc) - heartbeat_ts).total_seconds()
+        if age > _threshold:
+            return LockStatus.STALE_ZOMBIE, pid
+
+    return LockStatus.ALIVE, pid
 
 
 # ── Dispatch: agent tasks (one-shot / periodic) ─────────────────────────────
@@ -1144,18 +1395,61 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             if _maybe_demote_on_demand_awaiting_input(state, name):
                 save_state(Path(sf), state)
 
-            # Skip if not ready
-            if state["status"] in ("completed", "paused", "awaiting-input"):
+            # Skip if not ready.
+            # Spec 006: accept both legacy (hyphen / "paused") and canonical
+            # (underscore / "stopped") forms. Any of these means the task is
+            # not currently eligible for dispatch.
+            if state["status"] in (
+                "completed", "deleted", "error",
+                "stopped", "paused",
+                "awaiting_input", "awaiting-input",
+            ):
                 continue
 
-            # Check if a subprocess is actually running (orphan detection)
+            # Spec 006 US4: stale-aware lock check. Decides between
+            # ALIVE (skip this cycle), STALE_DEAD_PID / STALE_ZOMBIE
+            # (clean the lock and run the orphan-backoff path), MISSING
+            # (subprocess already exited — fall through to orphan path).
             if state["status"] == "running":
-                is_locked, pid = await check_lock(name)
-                if is_locked:
-                    continue  # Subprocess still running
-                # Subprocess died without updating state
-                log.warning("Continuous task '%s': state=running but no lock. Marking step failed.", name)
-                mark_step_failed(state, "subprocess exited unexpectedly")
+                lock_status, pid = await check_lock_status(name)
+                if lock_status == LockStatus.ALIVE:
+                    continue  # Subprocess still running and heartbeating
+
+                # Recovery: remove the stale lock. STALE_ZOMBIE means the
+                # pid is still alive but heartbeat died; attempt graceful
+                # termination before unlinking.
+                lock_file = DATA_DIR / name / "lock"
+                if lock_status == LockStatus.STALE_ZOMBIE and pid is not None:
+                    import signal as _signal
+                    try:
+                        os.kill(pid, _signal.SIGTERM)
+                        await asyncio.sleep(5)
+                    except ProcessLookupError:
+                        pass
+                    except OSError as exc:
+                        log.warning(
+                            "STALE_ZOMBIE SIGTERM failed for %s (pid=%d): %s",
+                            name, pid, exc,
+                        )
+                    try:
+                        from process import is_pid_alive
+                        if is_pid_alive(pid):
+                            os.kill(pid, _signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+
+                lock_file.unlink(missing_ok=True)
+                _journal_scheduler_event(
+                    task_name=name,
+                    event_type="lock_recovered",
+                    outcome=lock_status.value if lock_status != LockStatus.MISSING else "missing",
+                    payload={"pid": pid},
+                )
+
+                # Feed into the orphan-backoff path (writes state; the
+                # scheduler may re-dispatch on the next cycle if below
+                # threshold, or escalate to incident).
+                _handle_continuous_orphan(state, name)
                 save_state(Path(sf), state)
                 continue
 
@@ -1273,11 +1567,24 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                     "Continuous '%s': dispatched step %d (PID %d, model: %s)",
                     name, step_number, proc.pid, model,
                 )
+                # Spec 006 — journal the dispatch for [GET_EVENTS] queries.
+                _journal_scheduler_event(
+                    task_name=name,
+                    event_type="dispatched",
+                    outcome="ok",
+                    payload={"step": step_number, "pid": proc.pid, "model": model},
+                )
 
             except (OSError, ValueError) as exc:
                 errors.append(name)
                 append_log("%s -- ERROR -- step %d failed to spawn: %s" % (name, step_number, exc))
                 log.error("Continuous '%s': failed to spawn step %d: %s", name, step_number, exc, exc_info=True)
+                _journal_scheduler_event(
+                    task_name=name,
+                    event_type="error",
+                    outcome="spawn_failed",
+                    payload={"step": step_number, "exc": str(exc)},
+                )
 
         except Exception as exc:  # noqa: BLE001 - per-entry isolation boundary
             errors.append(name or "?")
@@ -1304,6 +1611,223 @@ def append_log(entry: str) -> None:
     with _append_log_lock:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write("[%s] %s\n" % (now, entry))
+
+
+async def _dispatch_awaiting_reminders(platform, default_chat_id) -> int:
+    """Spec 006 FR-011 — for each continuous task that has been
+    awaiting input for longer than ``AWAITING_REMINDER_SECONDS`` and has
+    not yet had a reminder for this episode, post exactly one reminder
+    into its dedicated topic.
+
+    Returns the number of reminders posted this cycle.
+    """
+    if platform is None:
+        return 0
+
+    try:
+        from config import AWAITING_REMINDER_SECONDS, CHAT_ID, CONTINUOUS_DIR
+    except Exception:
+        return 0
+
+    from continuous import load_state, save_state, state_file_path
+
+    continuous_dir = Path(CONTINUOUS_DIR)
+    if not continuous_dir.exists():
+        return 0
+
+    now = datetime.now(timezone.utc)
+    threshold = AWAITING_REMINDER_SECONDS
+    posted = 0
+
+    for task_dir in sorted(continuous_dir.iterdir()):
+        if not task_dir.is_dir():
+            continue
+        sf = task_dir / "state.json"
+        if not sf.exists():
+            continue
+        state = load_state(sf)
+        if state is None:
+            continue
+        if state.get("status") not in ("awaiting_input", "awaiting-input"):
+            continue
+        if state.get("awaiting_reminder_sent_ts"):
+            continue
+        since_iso = state.get("awaiting_since_ts")
+        if not since_iso:
+            continue
+        try:
+            since_dt = datetime.fromisoformat(since_iso)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if (now - since_dt).total_seconds() < threshold:
+            continue
+
+        dedicated = state.get("dedicated_thread_id")
+        if dedicated is None:
+            # No dedicated topic — rely on FR-002a last-resort or silent skip.
+            continue
+
+        question = state.get("awaiting_question") or "a user decision"
+        body = (
+            "⏸ Still awaiting your reply on *%s*:\n\n%s\n\n"
+            "Reply in this topic to resume the task."
+            % (state.get("name") or task_dir.name, question)
+        )
+        try:
+            await platform.send_to_channel(dedicated, body, parse_mode="markdown")
+        except Exception as exc:
+            log.warning(
+                "awaiting-reminder delivery failed for '%s': %s",
+                state.get("name"), exc,
+            )
+            continue
+
+        state["awaiting_reminder_sent_ts"] = now.isoformat()
+        try:
+            save_state(state_file_path(state.get("name") or task_dir.name), state)
+        except Exception:
+            pass
+
+        _journal_scheduler_event(
+            task_name=state.get("name") or task_dir.name,
+            event_type="awaiting_reminder_sent",
+            outcome="posted",
+            payload={"dedicated_thread_id": dedicated},
+        )
+        posted += 1
+
+    if posted:
+        log.info("Awaiting-input reminders posted this cycle: %d", posted)
+    return posted
+
+
+def _handle_continuous_orphan(state: dict, name: str) -> None:
+    """Spec 006 FR-022 orphan backoff.
+
+    Counts consecutive orphan detections; once the threshold is reached
+    escalates to a single incident (state=error + journal
+    ``orphan_incident`` event with diagnostic payload). Below threshold:
+    journals ``orphan_detected`` silently and marks the step failed so
+    the next cycle can re-dispatch.
+
+    Consecutiveness: detections older than 2× SCHEDULER_INTERVAL reset
+    the counter to 1 (treat as a fresh episode).
+    """
+    try:
+        from config import ORPHAN_INCIDENT_THRESHOLD as _threshold
+        from config import SCHEDULER_INTERVAL as _cycle
+    except Exception:
+        _threshold, _cycle = 3, 60
+
+    now = datetime.now(timezone.utc)
+    last_iso = state.get("orphan_last_detected_ts")
+    if last_iso:
+        try:
+            last_dt = datetime.fromisoformat(last_iso)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            if (now - last_dt).total_seconds() > 2 * _cycle:
+                state["orphan_detect_count"] = 0
+        except ValueError:
+            state["orphan_detect_count"] = 0
+
+    state["orphan_detect_count"] = int(state.get("orphan_detect_count", 0)) + 1
+    state["orphan_last_detected_ts"] = now.isoformat()
+
+    count = state["orphan_detect_count"]
+
+    if count < _threshold:
+        # Below threshold — silent journal + mark step failed so
+        # dispatch can retry next cycle.
+        log.warning(
+            "Continuous task '%s': orphan detected (cycle %d/%d) — "
+            "marking step failed for re-dispatch",
+            name, count, _threshold,
+        )
+        from continuous import mark_step_failed as _mark_step_failed
+        _mark_step_failed(state, "subprocess exited unexpectedly")
+        # mark_step_failed sets status=error, but below-threshold we want
+        # to allow a retry — roll it back to 'pending' for the next tick.
+        state["status"] = "pending"
+        _journal_scheduler_event(
+            task_name=name,
+            event_type="orphan_detected",
+            outcome="below_threshold",
+            payload={"cycle": count, "threshold": _threshold},
+        )
+        return
+
+    # Threshold reached — escalate to single incident.
+    from pathlib import Path as _Path
+    from config import DATA_DIR as _DATA_DIR
+    output_tail = ""
+    last_exit_code = None
+    try:
+        log_path = _Path(_DATA_DIR) / name / "output.log"
+        if log_path.exists():
+            with log_path.open("rb") as fh:
+                try:
+                    fh.seek(-500, os.SEEK_END)
+                except OSError:
+                    fh.seek(0)
+                output_tail = fh.read().decode("utf-8", errors="replace")
+    except Exception:
+        output_tail = "(output.log not readable)"
+
+    payload = {
+        "detected_cycles": count,
+        "last_output_tail": output_tail[-500:],
+        "last_exit_code": last_exit_code,
+        "lock_last_heartbeat_ts": None,
+        "dedicated_thread_id": state.get("dedicated_thread_id"),
+    }
+
+    from continuous import mark_step_failed as _mark_step_failed
+    _mark_step_failed(state, "orphan incident — backoff threshold reached")
+    state["status"] = "error"
+
+    _journal_scheduler_event(
+        task_name=name,
+        event_type="orphan_incident",
+        outcome="escalated",
+        payload=payload,
+    )
+    log.error(
+        "Continuous task '%s': orphan incident after %d consecutive "
+        "detections — state=error",
+        name, count,
+    )
+
+
+def _journal_scheduler_event(
+    task_name: str,
+    event_type: str,
+    outcome: str,
+    payload: dict | None = None,
+    task_type: str = "continuous",
+) -> None:
+    """Append a scheduler-origin event to the spec-006 event journal.
+
+    Safe wrapper: silently swallows any journal error so a logging issue
+    never takes down a dispatch path. The journal itself logs at WARN/
+    ERROR level if writes fail.
+    """
+    try:
+        import events as events_mod
+        events_mod.append(
+            task_name=task_name,
+            task_type=task_type,
+            event_type=event_type,
+            outcome=outcome,
+            payload=payload,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.error(
+            "journal event append failed for %s (%s): %s",
+            task_name, event_type, exc,
+        )
 
 
 # ── Query helpers ────────────────────────────────────────────────────────────
@@ -1373,6 +1897,20 @@ async def run_scheduler_cycle(
         errors.extend(cont_errors)
     except Exception as exc:
         log.error("Continuous task handling failed: %s", exc, exc_info=True)
+
+    # Spec 006 — rotate the hot event journal (hourly + size-based) and
+    # prune retention once per cycle. Idempotent and cheap.
+    try:
+        import events as events_mod
+        events_mod.rotate_if_needed()
+    except Exception as exc:
+        log.error("events.rotate_if_needed failed: %s", exc, exc_info=True)
+
+    # Spec 006 FR-011 — 24h awaiting-input reminder per dedicated topic.
+    try:
+        await _dispatch_awaiting_reminders(platform, default_chat_id)
+    except Exception as exc:
+        log.error("awaiting-reminder loop failed: %s", exc, exc_info=True)
 
     return {
         "dispatched": dispatched,

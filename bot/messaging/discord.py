@@ -360,3 +360,142 @@ class DiscordPlatform(Platform):
             "leave_chat is not yet supported on Discord — external collaborative "
             "groups are Telegram-only in this iteration"
         )
+
+    # ── Spec 006 — dedicated-topic operations ──────────────────────────
+
+    async def _fetch_channel(self, channel_id: int):
+        """Fetch a channel, raising TopicUnreachable on 404."""
+        import discord
+        from .base import TopicUnreachable
+
+        channel = self._client.get_channel(channel_id)
+        if channel is not None:
+            return channel
+        try:
+            return await self._client.fetch_channel(channel_id)
+        except discord.NotFound as exc:
+            raise TopicUnreachable(channel_id, reason=str(exc))
+        except Exception as exc:
+            log.error("Error fetching channel %d: %s", channel_id, exc)
+            return None
+
+    async def edit_topic_title(self, channel_id: int, new_title: str) -> bool:
+        """Rename a thread or channel to ``new_title``."""
+        from .base import TopicUnreachable
+        try:
+            channel = await self._fetch_channel(channel_id)
+        except TopicUnreachable:
+            raise
+        if channel is None:
+            return False
+        try:
+            current = getattr(channel, "name", None)
+            if current == new_title:
+                return True
+            await channel.edit(name=new_title)
+            log.info("Renamed Discord channel %d → %r", channel_id, new_title)
+            return True
+        except Exception as exc:
+            log.error(
+                "Failed to rename Discord channel %d: %s", channel_id, exc,
+            )
+            return False
+
+    async def pin_message(
+        self,
+        chat_id: Any,
+        thread_id: int,
+        message_id: int,
+    ) -> bool:
+        """Pin a specific message inside a channel or thread.
+
+        Discord pins are per-channel/thread, matching Telegram semantics.
+        """
+        import discord
+        from .base import TopicUnreachable
+        try:
+            channel = await self._fetch_channel(thread_id)
+        except TopicUnreachable:
+            raise
+        if channel is None:
+            return False
+        try:
+            msg = await channel.fetch_message(message_id)
+            await msg.pin()
+            log.info(
+                "Pinned Discord message %d in channel %d",
+                message_id, thread_id,
+            )
+            return True
+        except discord.NotFound:
+            log.warning("Cannot pin Discord message %d: not found", message_id)
+            return False
+        except Exception as exc:
+            log.error("Error pinning Discord message %d: %s", message_id, exc)
+            return False
+
+    async def unpin_message(
+        self,
+        chat_id: Any,
+        thread_id: int,
+        message_id: int | None = None,
+    ) -> bool:
+        """Unpin a specific message or all pins in a Discord channel/thread."""
+        import discord
+        from .base import TopicUnreachable
+        try:
+            channel = await self._fetch_channel(thread_id)
+        except TopicUnreachable:
+            raise
+        if channel is None:
+            return False
+        try:
+            if message_id is None:
+                pins = await channel.pins()
+                for pin in pins:
+                    await pin.unpin()
+                log.info("Unpinned all messages in Discord channel %d", thread_id)
+                return True
+            msg = await channel.fetch_message(message_id)
+            await msg.unpin()
+            log.info(
+                "Unpinned Discord message %d in channel %d",
+                message_id, thread_id,
+            )
+            return True
+        except discord.NotFound:
+            log.warning(
+                "Cannot unpin Discord message %s: not found", message_id,
+            )
+            return False
+        except Exception as exc:
+            log.error(
+                "Error unpinning in Discord channel %d: %s", thread_id, exc,
+            )
+            return False
+
+    async def close_topic(self, channel_id: int) -> bool:
+        """Close (archive + lock) a Discord thread. For regular channels,
+        falls back to `close_channel` which deletes the channel.
+        """
+        import discord
+        from .base import TopicUnreachable
+        try:
+            channel = await self._fetch_channel(channel_id)
+        except TopicUnreachable:
+            raise
+        if channel is None:
+            return False
+        try:
+            if isinstance(channel, discord.Thread) or hasattr(channel, "archived"):
+                await channel.edit(archived=True, locked=True)
+                log.info(
+                    "Closed (archived+locked) Discord thread %d", channel_id,
+                )
+                return True
+            # Regular channels cannot be "closed" without deleting — fall
+            # back to existing close_channel semantics for compatibility.
+            return await self.close_channel(channel_id)
+        except Exception as exc:
+            log.error("Failed to close Discord channel %d: %s", channel_id, exc)
+            return False
