@@ -60,6 +60,15 @@ _GET_PLAN_RE = re.compile(
     r"\[\s*GET_PLAN\s+" + _NAME_ATTR + r"\s*\]",
     re.IGNORECASE,
 )
+# Spec 006 — explicit complete and delete operations distinct from stop.
+_COMPLETE_TASK_RE = re.compile(
+    r"\[\s*COMPLETE_TASK\s+" + _NAME_ATTR + r"\s*\]",
+    re.IGNORECASE,
+)
+_DELETE_TASK_RE = re.compile(
+    r"\[\s*DELETE_TASK\s+" + _NAME_ATTR + r"\s*\]",
+    re.IGNORECASE,
+)
 
 
 MacroKind = Literal[
@@ -69,6 +78,8 @@ MacroKind = Literal[
     "pause_task",
     "resume_task",
     "get_plan",
+    "complete_task",
+    "delete_task",
 ]
 
 
@@ -143,6 +154,8 @@ def parse_lifecycle_macros(text: str) -> list[MacroInvocation]:
         ("pause_task", _PAUSE_TASK_RE),
         ("resume_task", _RESUME_TASK_RE),
         ("get_plan", _GET_PLAN_RE),
+        ("complete_task", _COMPLETE_TASK_RE),
+        ("delete_task", _DELETE_TASK_RE),
     ):
         for m in pattern.finditer(text):
             hits.append(
@@ -184,19 +197,51 @@ def _normalize_thread_id(raw: Any) -> Any:
 
 
 def _is_active_status(status: str) -> bool:
-    return status in {"pending", "running", "paused", "awaiting-input", "rate-limited"}
+    # Spec 006: accept both canonical underscore and legacy hyphen/paused forms.
+    return status in {
+        "pending", "running",
+        "stopped", "paused",
+        "awaiting_input", "awaiting-input",
+        "rate_limited", "rate-limited",
+        "error",
+    }
 
 
 def _load_scoped_entries(ctx: DispatchContext) -> list[dict]:
     """Read the queue (via ctx.queue_reader or the real scheduler) and
     filter to the invoking workspace.
+
+    Spec 006: continuous-task queue entries now point at the task's
+    dedicated topic (not the parent). Lifecycle macros are still invoked
+    from the parent workspace chat, so we extend the scope filter to
+    also accept continuous entries whose state's ``workspace_thread_id``
+    matches ``ctx.thread_id`` — i.e. the invoking parent workspace.
     """
     if ctx.queue_reader is not None:
         entries = list(ctx.queue_reader())
     else:
         from scheduler import load_queue
         entries = load_queue()
-    return scope_to_workspace(entries, ctx.chat_id, ctx.thread_id)
+
+    direct = scope_to_workspace(entries, ctx.chat_id, ctx.thread_id)
+    direct_ids = {e.get("name") for e in direct}
+
+    # Spec 006 — also include continuous entries whose state's
+    # workspace_thread_id matches ctx.thread_id (these are tasks owned
+    # by the invoking workspace but with queue.thread_id now pointing
+    # at the dedicated topic).
+    target = _normalize_thread_id(ctx.thread_id)
+    for e in entries:
+        if e.get("type") != "continuous":
+            continue
+        if e.get("name") in direct_ids:
+            continue
+        state = _load_continuous_state(e, ctx)
+        if state is None:
+            continue
+        if _normalize_thread_id(state.get("workspace_thread_id")) == target:
+            direct.append(e)
+    return direct
 
 
 def _load_continuous_state(entry: dict, ctx: DispatchContext) -> dict | None:
@@ -428,30 +473,39 @@ def _stop_reason(ctx: DispatchContext, verb: str) -> str:
 
 
 def _stop_task(t: dict, ctx: DispatchContext) -> str:
+    """Spec 006 FR-014 stop: halt dispatches but preserve
+    state+history+topic. Task is resumable.
+    """
     entry = t["entry"]
     name = entry.get("name") or "?"
     tk = _type_key(entry)
     reason = _stop_reason(ctx, "stopped")
     if tk == "continuous" and t["state"] is not None:
-        from continuous import complete_task, save_state, state_file_path
-        state = complete_task(t["state"])
+        from continuous import pause_task, save_state, state_file_path
+        state = pause_task(t["state"])  # writes canonical "stopped"
         save_state(state_file_path(name), state)
-        # Also mark the queue entry as canceled so the scheduler never
-        # re-picks it (belt + suspenders on top of the status=completed).
         try:
-            from scheduler import cancel_task_by_name
+            from scheduler import cancel_task_by_name, _journal_scheduler_event
             cancel_task_by_name(name, reason=reason)
+            _journal_scheduler_event(
+                task_name=name,
+                event_type="stopped",
+                outcome="ok",
+                payload={"prev_status": entry.get("status")},
+            )
         except Exception as exc:  # pragma: no cover - defensive
             log.warning("stop_task: cancel_task_by_name failed for %s: %s", name, exc)
     else:
-        # Periodic / one-shot: cancel the queue entry.
         from scheduler import cancel_task_by_name
         cancel_task_by_name(name, reason=reason)
     _log_action(ctx, "stop_task", name, name, "stopped")
-    return "Task `%s` fermato." % name
+    return "Task `%s` fermato. Riprendi con: `ripristina %s`." % (name, name)
 
 
 def _pause_task(t: dict, ctx: DispatchContext) -> str:
+    """Spec 006 alias for stop — preserved for the Italian 'metti in pausa'
+    macro. Behaviourally identical to _stop_task for continuous tasks.
+    """
     entry = t["entry"]
     name = entry.get("name") or "?"
     tk = _type_key(entry)
@@ -463,12 +517,162 @@ def _pause_task(t: dict, ctx: DispatchContext) -> str:
             % (tk, name)
         )
     from continuous import pause_task, save_state, state_file_path
-    state = pause_task(t["state"])
+    state = pause_task(t["state"])  # writes canonical "stopped"
     save_state(state_file_path(name), state)
+    try:
+        from scheduler import _journal_scheduler_event
+        _journal_scheduler_event(
+            task_name=name,
+            event_type="stopped",
+            outcome="ok",
+            payload={"via": "pause_task"},
+        )
+    except Exception:
+        pass
     _log_action(ctx, "pause_task", name, name, "paused")
     return (
         "Task `%s` in pausa. Riprendi con: `ripristina %s`." % (name, name)
     )
+
+
+def _complete_task(t: dict, ctx: DispatchContext) -> str:
+    """Spec 006 FR-014 complete: terminal success. History + topic
+    preserved as permanent record; no further dispatches; not resumable.
+    """
+    entry = t["entry"]
+    name = entry.get("name") or "?"
+    tk = _type_key(entry)
+    if tk != "continuous" or t["state"] is None:
+        _log_action(ctx, "complete_task", name, name, "unsupported")
+        return (
+            "Complete non supportato per task di tipo `%s`. "
+            "Usa `ferma %s` per fermarlo." % (tk, name)
+        )
+    from continuous import complete_task as _complete, save_state, state_file_path
+    state = _complete(t["state"])
+    save_state(state_file_path(name), state)
+    reason = _stop_reason(ctx, "completed")
+    try:
+        from scheduler import cancel_task_by_name, _journal_scheduler_event
+        cancel_task_by_name(name, reason=reason)
+        _journal_scheduler_event(
+            task_name=name,
+            event_type="completed",
+            outcome="ok",
+            payload={"total_steps": state.get("total_steps_completed", 0)},
+        )
+    except Exception:
+        pass
+    _log_action(ctx, "complete_task", name, name, "completed")
+    return (
+        "Task `%s` marcato come completato. Stato preservato come record "
+        "permanente — il nome resta riservato." % name
+    )
+
+
+async def _delete_task(t: dict, ctx: DispatchContext) -> str:
+    """Spec 006 FR-014 delete: purge + archive dedicated topic + free name.
+
+    Order:
+      1. Cancel queue entry (belt).
+      2. Archive the dedicated topic (rename to [Archived] <name> + close).
+      3. Mark state `deleted` with archived_at timestamp.
+      4. Remove the agent definition file so the name becomes free.
+      5. Journal delete + archived events.
+    """
+    entry = t["entry"]
+    name = entry.get("name") or "?"
+    tk = _type_key(entry)
+    if tk != "continuous" or t["state"] is None:
+        _log_action(ctx, "delete_task", name, name, "unsupported")
+        return (
+            "Delete non supportato per task di tipo `%s`. "
+            "Usa `ferma %s` per fermarlo." % (tk, name)
+        )
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    state = t["state"]
+    dedicated_thread_id = state.get("dedicated_thread_id")
+    display_name = state.get("name") or name
+
+    from scheduler import cancel_task_by_name, _journal_scheduler_event
+
+    reason = _stop_reason(ctx, "deleted")
+    try:
+        cancel_task_by_name(name, reason=reason)
+    except Exception as exc:
+        log.warning("delete_task: cancel_task_by_name failed for %s: %s", name, exc)
+
+    # Archive the dedicated topic (best-effort).
+    archive_ok = False
+    platform = getattr(ctx, "platform", None)
+    if (
+        platform is not None
+        and dedicated_thread_id is not None
+        and hasattr(platform, "archive_topic")
+    ):
+        try:
+            archive_ok = bool(
+                await platform.archive_topic(dedicated_thread_id, display_name)
+            )
+        except Exception as exc:
+            log.warning(
+                "delete_task: archive_topic failed for %s (thread=%s): %s",
+                name, dedicated_thread_id, exc,
+            )
+
+    state["status"] = "deleted"
+    state["archived_at"] = datetime.now(timezone.utc).isoformat()
+    from continuous import save_state, state_file_path
+    save_state(state_file_path(name), state)
+
+    # Remove agent definition file so the name is freed.
+    from config import AGENTS_DIR
+    agent_file = Path(AGENTS_DIR) / ("%s.md" % name)
+    try:
+        agent_file.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("delete_task: agent file removal failed for %s: %s", name, exc)
+
+    # Unregister from AgentManager so subsequent creates with the same
+    # name succeed.
+    manager = getattr(ctx, "manager", None)
+    if manager is not None and hasattr(manager, "remove_agent"):
+        try:
+            manager.remove_agent(name)
+        except Exception as exc:
+            log.warning(
+                "delete_task: manager.remove_agent failed for %s: %s",
+                name, exc,
+            )
+
+    _journal_scheduler_event(
+        task_name=name,
+        event_type="deleted",
+        outcome="ok",
+        payload={
+            "archived_thread_id": dedicated_thread_id,
+            "archive_ok": archive_ok,
+        },
+    )
+    if archive_ok:
+        _journal_scheduler_event(
+            task_name=name,
+            event_type="archived",
+            outcome="ok",
+            payload={"new_title": "[Archived] %s" % display_name},
+        )
+
+    _log_action(ctx, "delete_task", name, name, "deleted")
+    archive_note = (
+        "\n\nIl topic è stato archiviato come `[Archived] %s` — storia "
+        "consultabile. Il nome `%s` è ora libero per nuovi task." % (display_name, name)
+    ) if archive_ok else (
+        "\n\nTopic non archiviato (irraggiungibile o piattaforma non supportata); "
+        "stato marcato `deleted` comunque. Il nome `%s` è libero." % name
+    )
+    return "Task `%s` eliminato.%s" % (name, archive_note)
 
 
 def _resume_task(t: dict, ctx: DispatchContext) -> str:
@@ -481,7 +685,13 @@ def _resume_task(t: dict, ctx: DispatchContext) -> str:
             "Resume non supportato per task di tipo `%s`." % tk
         )
     state = t["state"]
-    if state.get("status") not in ("paused", "rate-limited", "awaiting-input"):
+    # Spec 006: accept both legacy and canonical resumable states.
+    if state.get("status") not in (
+        "stopped", "paused",
+        "rate_limited", "rate-limited",
+        "awaiting_input", "awaiting-input",
+        "error",
+    ):
         _log_action(ctx, "resume_task", name, name, "noop")
         return (
             "Task `%s` non è in pausa (status: %s)." % (name, state.get("status"))
@@ -542,15 +752,28 @@ async def _handle_mutating(
     inv: MacroInvocation, ctx: DispatchContext, *,
     macro: str, action,
 ) -> str:
+    import inspect
     query = inv.name or ""
     matches = _match_by_name(_list_active_tasks(ctx), query)
     if not matches:
         _log_action(ctx, macro, query, None, "not_found")
+        # Spec 006 — richer not-found message with recreation hint.
+        if macro in ("resume_task", "complete_task", "delete_task", "stop_task"):
+            return (
+                "Task `%s` non trovato. "
+                "Se è stato eliminato, la sua storia è consultabile via "
+                "`[GET_EVENTS task=\"%s\"]` o nel topic archiviato "
+                "`[Archived] %s`. Per ricrearlo usa `[CONTINUOUS name=\"%s\" …]`."
+                % (query, query, query, query)
+            )
         return render_not_found(query)
     if len(matches) > 1:
         _log_action(ctx, macro, query, None, "ambiguous:%d" % len(matches))
         return render_ambiguous_candidates(matches, query)
-    return action(matches[0], ctx)
+    result = action(matches[0], ctx)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
 
 
 async def _handle_stop_task(
@@ -571,6 +794,18 @@ async def _handle_resume_task(
     return await _handle_mutating(inv, ctx, macro="resume_task", action=_resume_task)
 
 
+async def _handle_complete_task(
+    inv: MacroInvocation, ctx: DispatchContext,
+) -> str:
+    return await _handle_mutating(inv, ctx, macro="complete_task", action=_complete_task)
+
+
+async def _handle_delete_task(
+    inv: MacroInvocation, ctx: DispatchContext,
+) -> str:
+    return await _handle_mutating(inv, ctx, macro="delete_task", action=_delete_task)
+
+
 async def _handle_get_plan(
     inv: MacroInvocation, ctx: DispatchContext,
 ) -> str:
@@ -584,6 +819,8 @@ _HANDLERS = {
     "pause_task": _handle_pause_task,
     "resume_task": _handle_resume_task,
     "get_plan": _handle_get_plan,
+    "complete_task": _handle_complete_task,
+    "delete_task": _handle_delete_task,
 }
 
 

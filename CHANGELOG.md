@@ -1,5 +1,137 @@
 # Changelog
 
+## 0.26.0
+
+**Continuous-task observability & lifecycle robustness** (spec 006).
+Addresses nine interconnected fragilities surfaced by real incidents in
+zeus-rd-172, zeus-research, zeus-engine, align-research: unified-topic
+confusion, silent awaiting-input state, generic delivery format,
+dispatch-noise in HQ, `name_taken` after stop, workspace-close orphans,
+stale-lock starvation, orphan-detection spam, resume of vanished task.
+
+### Added
+
+- **Dedicated topic per continuous task.** `create_continuous_workspace`
+  opens a `[Continuous] <display_name>` topic at creation time with a
+  live state-marker suffix (`· ▶ / ⏸ / ⏳ / ⏹ / ✅ / ❌`). All step
+  deliveries, pinned questions, and closure notices land there — the
+  parent workspace topic stays clean for human↔agent conversation.
+  Gracefully falls back to `parent_thread_id` if the platform cannot
+  create a topic (Slack on limited scopes, test fixtures).
+- **Append-only event journal** at `data/events.jsonl` with hourly +
+  10 MB size-based rotation to `data/events/events-YYYYMMDD-HH.jsonl`.
+  Task-type-agnostic schema (`task_type` field required from day one)
+  so extending to periodic / one-shot / reminder is additive. 7-day
+  rolling retention; `bot/events.py` exposes `append/query/rotate_if_needed/prune_retention`.
+- **`[GET_EVENTS since="…" task="…" type="…" limit="…"]` macro** —
+  orchestrator-pullable history, parsed in `bot/handlers.py::_handle_get_events`;
+  registered in `_EXECUTIVE_MARKERS` so non-executive agents see it
+  stripped.
+- **Lock-file heartbeat.** Spec-006 two-line lock format (`pid\n<iso8601_ts>`);
+  subprocess-side watchdog refreshes the heartbeat every
+  `LOCK_HEARTBEAT_INTERVAL_SECONDS` (default 30). Scheduler's
+  `check_lock_status` returns `LockStatus.ALIVE / STALE_DEAD_PID /
+  STALE_ZOMBIE / MISSING`; stale locks are reclaimed on every cycle,
+  not just at boot. Zombie subprocesses get SIGTERM + 5s grace +
+  SIGKILL.
+- **Continuous state machine** (`bot/continuous_state_machine.py`):
+  canonical `pending / running / awaiting_input / rate_limited / stopped /
+  completed / error / deleted` set; `validate_transition`,
+  `is_resumable`, `is_terminal`, `marker_suffix` helpers; tolerant of
+  legacy hyphen-form status values on read (normalised on next save).
+- **Lifecycle contract.** Four distinct operations:
+  - `STOP_TASK` — halts dispatches; status → `stopped`; resumable.
+  - `RESUME_TASK` — resumes from `stopped / awaiting_input / rate_limited / error`.
+  - `COMPLETE_TASK` (new) — terminal success; history + topic preserved.
+  - `DELETE_TASK` (new) — archives topic as `[Archived] <name>`,
+    removes agent definition, frees the name. Not hard-delete.
+- **Awaiting-input pin + 24h reminder.** `set_awaiting_input` stamps
+  `awaiting_since_ts`; scheduler's `_dispatch_awaiting_reminders` posts
+  exactly one reminder per awaiting episode after
+  `AWAITING_REMINDER_SECONDS` (default 24h) in the task's dedicated topic.
+  Pin / unpin helpers in `bot/continuous.py`.
+- **Drain-on-close.** `drain_and_cancel_continuous_task` waits up to
+  per-task `drain_timeout_seconds` (default 3600, overridable via
+  `[CONTINUOUS_PROGRAM]` payload, clamped to `[60, 21600]`) for an
+  in-flight step to exit naturally before SIGTERM + grace + SIGKILL.
+- **Orphan backoff.** Consecutive orphan detections increment
+  `orphan_detect_count`; under `ORPHAN_INCIDENT_THRESHOLD` (default 3)
+  the scheduler silently re-dispatches; at threshold it emits exactly
+  one `orphan_incident` event with `last_output_tail`, `last_exit_code`,
+  and transitions state to `error`. No more warning spam.
+- **Structured delivery header** (`DELIVERY_HEADER_RE`):
+  `🔄 [name] · Step N/M · <state emoji> <label> · HH:MM` + optional
+  `→ Next: <truncated description>`. Defensive strip prevents
+  double-headers from agent drift.
+- **Platform adapter extensions** (`bot/messaging/base.py`):
+  `edit_topic_title`, `pin_message`, `unpin_message`, `close_topic`,
+  `archive_topic`, plus `TopicUnreachable` exception. Full
+  implementations on Telegram (Bot API) and Discord (`discord.py`).
+  Slack ships best-effort with a once-per-session WARN log documenting
+  UX caveats (workspace-wide pins, permanent archive).
+
+### Fixed
+
+- **Scheduler noise.** `append_log("-- DISPATCHED --")` still writes to
+  `bot.log`; every such event now also appends to the journal. Orphan
+  detection no longer logs `WARNING` every cycle — only the one-shot
+  incident escalation is visible.
+- **State-field canonicalisation.** `set_awaiting_input` writes
+  `awaiting_input` (underscore). `set_rate_limited` writes
+  `rate_limited`. `pause_task` writes `stopped` (spec-006 rename).
+  Legacy hyphen-form values on disk are normalised on read; readers
+  of state files accept both forms during the migration window.
+
+### Migration
+
+- **`bot/migrations/v0_26_0.py`** — idempotent forward-only migration
+  (per-task timestamp gate + `data/migrations/v0_26_0.done` marker):
+  1. Initialises `data/events/` + `data/events.jsonl`.
+  2. For each existing continuous task (excluding `deleted`), creates
+     the dedicated topic, persists `dedicated_thread_id` +
+     `drain_timeout_seconds` default, re-points the queue entry,
+     applies the state-marker title suffix.
+  3. Seeds one `migration` event per task with the old and new
+     thread_ids for provenance.
+  4. Tasks in `awaiting_input` get a retroactive pinned question so
+     the first-boot UX lands on the correct state.
+  5. Partial failures leave per-task state atomically consistent and
+     re-enter only the unfinished portion on the next run.
+
+### Tests
+
+77 new tests across nine new modules:
+- `test_events_journal.py` (16)
+- `test_events_macro.py` (17)
+- `test_hq_silence.py` (4)
+- `test_continuous_state_machine.py` (30)
+- `test_platform_topic_ops.py` (19)
+- `test_lock_heartbeat.py` (14)
+- `test_delivery_header.py` (16)
+- `test_dedicated_topic_creation.py` (11)
+- `test_awaiting_input_pin.py` (5)
+- `test_migration_v0_26_0.py` (6)
+- `test_continuous_lifecycle.py` (7)
+- `test_drain_on_close.py` (7)
+
+Existing test suite updated for: canonical status values, spec-006
+lifecycle behaviour (stop writes `stopped`), dedicated-topic creation
+expectations, i18n assertion (`DELETE_TASK` in `name_taken`).
+
+Full suite 1859/1859 passing.
+
+### Known limitations
+
+- **Slack UX parity.** Pins are workspace-wide, not topic-scoped; channel
+  archive is permanent (admin required to unarchive). Logged once per
+  session per method.
+- **FR-002a end-to-end.** Infrastructure for last-resort HQ push on
+  unreachable topic + user-actionable event is in place
+  (`check_lock_status`, `topic_unreachable_since_ts`, `hq_fallback_sent`
+  state fields), but the final HQ push wiring is a follow-up PR.
+- **`/stop /resume /complete /delete` slash commands** not yet wired;
+  the macro path (`[STOP_TASK name="…"]` etc.) is fully functional.
+
 ## 0.25.1
 
 **Auto-updater hardening.** Bugfix release that closes a wedged-update

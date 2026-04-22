@@ -294,3 +294,136 @@ class SlackPlatform(Platform):
             "leave_chat is not yet supported on Slack — external collaborative "
             "groups are Telegram-only in this iteration"
         )
+
+    # ── Spec 006 — dedicated-topic operations ──────────────────────────
+    #
+    # Slack does not have per-thread pins: pins are workspace-wide. Archive
+    # is permanent (unarchive requires admin). We implement each method
+    # best-effort and log a one-time WARN on first call per session so
+    # operators are aware of the UX differences (documented degradation
+    # per Constitution Principle I).
+
+    _SPEC_006_WARNED: set[str] = set()
+
+    def _warn_once(self, method: str, detail: str) -> None:
+        if method in self._SPEC_006_WARNED:
+            return
+        self._SPEC_006_WARNED.add(method)
+        log.warning(
+            "Slack %s: documented UX degradation vs Telegram — %s",
+            method, detail,
+        )
+
+    async def edit_topic_title(self, channel_id: Any, new_title: str) -> bool:
+        """Rename a Slack channel via ``conversations.rename``.
+
+        Slack channel names must be slugified (lowercase, no spaces); we
+        slugify ``new_title`` here so callers can pass a human-readable
+        form and still succeed.
+        """
+        from .base import TopicUnreachable
+        try:
+            slug = _channel_slug(new_title)
+            resp = await self._client.conversations_rename(
+                channel=str(channel_id),
+                name=slug,
+            )
+            if resp.get("ok"):
+                log.info(
+                    "Renamed Slack channel %s → %r (original=%r)",
+                    channel_id, slug, new_title,
+                )
+                return True
+            err = (resp.get("error") or "").lower()
+            if "channel_not_found" in err or "is_archived" in err:
+                raise TopicUnreachable(channel_id, reason=err)
+            log.warning("conversations.rename failed: %s", resp)
+            return False
+        except TopicUnreachable:
+            raise
+        except Exception as exc:
+            err = str(exc).lower()
+            if "channel_not_found" in err:
+                raise TopicUnreachable(channel_id, reason=err)
+            log.error(
+                "Error renaming Slack channel %s: %s", channel_id, exc,
+            )
+            return False
+
+    async def pin_message(
+        self,
+        chat_id: Any,
+        thread_id: Any,
+        message_id: Any,
+    ) -> bool:
+        """Pin a message via ``pins.add``.
+
+        Slack pins are visible under a channel's pinned-items view but
+        are NOT per-thread (messages pinned from inside a thread still
+        surface at channel level). Logged once per session.
+        """
+        self._warn_once(
+            "pin_message",
+            "Slack pins are workspace-wide, not topic-scoped",
+        )
+        try:
+            resp = await self._client.pins_add(
+                channel=str(thread_id),
+                timestamp=str(message_id),
+            )
+            return bool(resp.get("ok"))
+        except Exception as exc:
+            log.error(
+                "Error pinning Slack message %s in %s: %s",
+                message_id, thread_id, exc,
+            )
+            return False
+
+    async def unpin_message(
+        self,
+        chat_id: Any,
+        thread_id: Any,
+        message_id: Any | None = None,
+    ) -> bool:
+        """Unpin a specific message (or all pins in the channel)."""
+        self._warn_once(
+            "unpin_message",
+            "Slack pins are workspace-wide, not topic-scoped",
+        )
+        try:
+            if message_id is not None:
+                resp = await self._client.pins_remove(
+                    channel=str(thread_id),
+                    timestamp=str(message_id),
+                )
+                return bool(resp.get("ok"))
+            # Remove all pins in channel.
+            info = await self._client.pins_list(channel=str(thread_id))
+            items = info.get("items", [])
+            all_ok = True
+            for item in items:
+                ts = (item.get("message") or {}).get("ts")
+                if ts:
+                    r = await self._client.pins_remove(
+                        channel=str(thread_id),
+                        timestamp=ts,
+                    )
+                    all_ok = all_ok and bool(r.get("ok"))
+            return all_ok
+        except Exception as exc:
+            log.error(
+                "Error unpinning Slack messages in %s: %s", thread_id, exc,
+            )
+            return False
+
+    async def close_topic(self, channel_id: Any) -> bool:
+        """Archive a Slack channel (permanent — requires admin to reverse).
+
+        Delegates to :meth:`close_channel` and emits a one-time WARN so
+        operators understand the asymmetry vs Telegram/Discord.
+        """
+        self._warn_once(
+            "close_topic",
+            "Slack archive is permanent (admin required to unarchive)",
+        )
+        return await self.close_channel(channel_id)

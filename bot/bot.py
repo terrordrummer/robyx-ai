@@ -568,6 +568,16 @@ def _run_telegram(plat, h, backend, manager):
         except Exception as e:
             log.error("heal_detached_workspaces failed: %s", e, exc_info=True)
 
+        # Spec 006 — ensure event-journal directory exists before any
+        # scheduler cycle tries to append. Idempotent; safe on every boot.
+        try:
+            from config import EVENTS_DIR, EVENTS_HOT_FILE
+            EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+            if not EVENTS_HOT_FILE.exists():
+                EVENTS_HOT_FILE.touch()
+        except Exception as e:
+            log.error("events dir/file init failed: %s", e, exc_info=True)
+
         # Migrate legacy scheduler data (tasks.md, timed_queue.json, reminders.json)
         # into the unified queue.json — idempotent, skips if queue.json exists.
         try:

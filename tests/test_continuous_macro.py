@@ -434,7 +434,9 @@ def test_name_taken_maps_to_name_taken_outcome(monkeypatch, tmp_path, new_loop):
     )
     assert len(outcomes) == 1
     assert outcomes[0].reason == "name_taken"
-    assert "already in use" in out
+    # Spec 006: golden error tells user how to reuse the name.
+    assert "already registered" in out
+    assert "DELETE_TASK" in out
     assert "[CREATE_CONTINUOUS" not in out
 
 

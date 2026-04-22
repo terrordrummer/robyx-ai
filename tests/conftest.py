@@ -58,6 +58,9 @@ def _patch_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "TIMED_QUEUE_FILE", data_dir / "timed_queue.json")
     monkeypatch.setattr(cfg, "QUEUE_FILE", data_dir / "queue.json")
     monkeypatch.setattr(cfg, "CONTINUOUS_DIR", data_dir / "continuous")
+    # Spec 006 — event journal paths
+    monkeypatch.setattr(cfg, "EVENTS_DIR", data_dir / "events")
+    monkeypatch.setattr(cfg, "EVENTS_HOT_FILE", data_dir / "events.jsonl")
     monkeypatch.setattr(cfg, "DISCORD_BOT_TOKEN", "test-discord-token")
     monkeypatch.setattr(cfg, "DISCORD_GUILD_ID", None)
     monkeypatch.setattr(cfg, "DISCORD_OWNER_ID", None)

@@ -25,6 +25,7 @@ from ai_invoke import (
     CREATE_SPECIALIST_PATTERN,
     FOCUS_OFF_PATTERN,
     FOCUS_PATTERN,
+    GET_EVENTS_PATTERN,
     NOTIFY_HQ_PATTERN,
     REMIND_PATTERN,
     RESTART_PATTERN,
@@ -76,6 +77,7 @@ _EXECUTIVE_MARKERS = (
     ("COLLAB_SEND", COLLAB_SEND_PATTERN),
     ("COLLAB_SETUP_COMPLETE", COLLAB_SETUP_COMPLETE_PATTERN),
     ("NOTIFY_HQ", NOTIFY_HQ_PATTERN),
+    ("GET_EVENTS", GET_EVENTS_PATTERN),
 )
 
 
@@ -527,6 +529,13 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                     )
                     response = substitute_lifecycle_macros(response, subs)
 
+                # Spec 006 — [GET_EVENTS] substitution available to every
+                # executive-authorised agent. Replaces each macro token
+                # with a compact markdown table of matching events. Zero
+                # push-notifications to HQ — this is the pull-based
+                # query path that makes FR-002 ("scheduler silence") safe.
+                response = await _handle_get_events(response, agent.name)
+
                 if is_robyx:
                     response = await handle_delegations(
                         response, chat_id, platform, manager, backend, thread_id=thread_id,
@@ -940,6 +949,151 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             )
 
         return out.strip()
+
+    async def _handle_get_events(response: str, agent_name: str) -> str:
+        """Process ``[GET_EVENTS ...]`` macros emitted by any executive-
+        authorised agent (orchestrator, workspace agent, collab-executive).
+
+        Each macro is replaced in-place with a compact markdown table of
+        matching events. The query contract is defined in
+        ``specs/006-continuous-task-robustness/contracts/events-macro.md``.
+        Attributes:
+
+            since  — REQUIRED; duration (``30m``, ``2h``, ``1d``, ``3600s``)
+                     or ISO-8601 UTC timestamp
+            task   — optional; filter to a single task name
+            type   — optional; filter to a single event_type
+            limit  — optional; 1–1000, default 200
+
+        On malformed input the macro is replaced with a short
+        user-visible error note (the agent should apologise and retry
+        with corrected attributes).
+        """
+        from ai_invoke import GET_EVENTS_PATTERN
+
+        if not response:
+            return response
+        matches = list(GET_EVENTS_PATTERN.finditer(response))
+        if not matches:
+            return response
+
+        import events as events_mod
+
+        from datetime import datetime, timedelta, timezone
+
+        def _parse_since(raw: str) -> datetime | None:
+            raw = (raw or "").strip()
+            if not raw:
+                return None
+            # Duration forms: "30m", "2h", "1d", "3600s"
+            try:
+                if raw[-1:] in ("s", "m", "h", "d") and raw[:-1].isdigit():
+                    n = int(raw[:-1])
+                    unit = raw[-1]
+                    seconds = n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+                    return datetime.now(timezone.utc) - timedelta(seconds=seconds)
+            except (ValueError, KeyError):
+                pass
+            # ISO-8601
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except ValueError:
+                return None
+
+        def _render(entries: list[dict]) -> str:
+            if not entries:
+                return "_No events in the requested window._"
+            lines = [
+                "| ts | task | type | outcome |",
+                "|---|---|---|---|",
+            ]
+            for e in entries:
+                ts = e.get("ts", "")
+                # Compact to HH:MM:SS + date prefix for readability.
+                ts_display = ts[:19].replace("T", " ") if len(ts) >= 19 else ts
+                lines.append(
+                    "| %s | %s | %s | %s |"
+                    % (
+                        ts_display,
+                        e.get("task_name") or "-",
+                        e.get("event_type") or "-",
+                        e.get("outcome") or "-",
+                    )
+                )
+            return "\n".join(lines)
+
+        def _error(code: str, human: str, attrs: dict) -> str:
+            # Deliberately avoid the ``[GET_EVENTS …]`` shape so the
+            # rendered error cannot be re-matched as a macro on a
+            # subsequent pass.
+            attr_str = " ".join('%s=%r' % (k, v) for k, v in attrs.items()) or "(none)"
+            return (
+                "_events-query error: %s — %s_\n\n"
+                "_Attributes received: %s_"
+                % (code, human, attr_str)
+            )
+
+        out = response
+        # Replace in reverse order so offsets stay valid.
+        for match in reversed(matches):
+            raw_attrs = (match.group(1) or "").strip()
+            attrs = parse_collab_attrs(raw_attrs) if raw_attrs else {}
+
+            since_raw = attrs.get("since", "")
+            task_filter = attrs.get("task") or None
+            type_filter = attrs.get("type") or None
+            limit_raw = attrs.get("limit")
+
+            since_dt = _parse_since(since_raw) if since_raw else None
+            if since_dt is None:
+                rendered = _error(
+                    "INVALID_DURATION",
+                    "`since` must be a duration (30m, 2h, 1d) or ISO-8601",
+                    attrs,
+                )
+            else:
+                try:
+                    limit = int(limit_raw) if limit_raw else 200
+                    if not 1 <= limit <= 1000:
+                        raise ValueError
+                except ValueError:
+                    rendered = _error(
+                        "INVALID_LIMIT",
+                        "`limit` must be an integer in [1, 1000]",
+                        attrs,
+                    )
+                else:
+                    try:
+                        entries = events_mod.query(
+                            since=since_dt,
+                            task_name=task_filter,
+                            event_type=type_filter,
+                            limit=limit,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "[GET_EVENTS] query failed for %s: %s",
+                            agent_name, exc, exc_info=True,
+                        )
+                        rendered = _error("QUERY_FAILED", str(exc), attrs)
+                    else:
+                        rendered = "**Events since %s** (%d entries):\n\n%s" % (
+                            since_dt.isoformat(timespec="seconds"),
+                            len(entries),
+                            _render(entries),
+                        )
+                        log.info(
+                            "handlers.get_events agent=%s since=%s task=%s type=%s returned=%d",
+                            agent_name, since_raw, task_filter, type_filter,
+                            len(entries),
+                        )
+
+            out = out[: match.start()] + rendered + out[match.end():]
+
+        return out
 
     async def _handle_notify_hq(response, collab_ws, platform):
         """Process ``[NOTIFY_HQ ...]`` from a collaborative-workspace agent.
@@ -2157,6 +2311,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         "voice": handle_voice,
         "message": handle_message,
     }
+
+    # Spec 006 — [GET_EVENTS] handler is always exposed; it has no
+    # collab dependency and is used by every executive-authorised agent.
+    result["_handle_get_events"] = _handle_get_events
 
     if collab_store is not None:
         result["collab_bot_added"] = collab_bot_added
