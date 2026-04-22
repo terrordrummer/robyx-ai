@@ -48,7 +48,20 @@ class TestStateIO:
         state = {"name": "test", "status": "pending"}
         save_state(path, state)
         loaded = load_state(path)
-        assert loaded == state
+        # Spec 006: load_state applies defaults for missing additive fields,
+        # so the loaded dict is a superset of the original.
+        for key, value in state.items():
+            assert loaded[key] == value
+        # All spec-006 additive fields must be present post-load.
+        for spec_006_field in (
+            "dedicated_thread_id", "drain_timeout_seconds",
+            "awaiting_since_ts", "awaiting_pinned_msg_id",
+            "awaiting_reminder_sent_ts", "orphan_detect_count",
+            "orphan_last_detected_ts", "hq_fallback_sent",
+            "topic_unreachable_since_ts", "archived_at",
+            "migrated_v0_26_0",
+        ):
+            assert spec_006_field in loaded
 
     def test_atomic_write(self, tmp_path):
         path = tmp_path / "state.json"
@@ -156,11 +169,21 @@ class TestStatusTransitions:
         }
 
     def test_pause(self):
+        # Spec 006: pause_task now writes canonical "stopped" (was "paused").
+        # Legacy "paused" on disk is normalised to "stopped" by load_state.
         state = self._base_state()
         pause_task(state)
-        assert state["status"] == "paused"
+        assert state["status"] == "stopped"
 
     def test_resume(self):
+        # Spec 006: resume accepts canonical "stopped"; produces "pending".
+        state = self._base_state()
+        state["status"] = "stopped"
+        resume_task(state)
+        assert state["status"] == "pending"
+
+    def test_resume_legacy_paused_still_supported(self):
+        # Defensive: a state dict carrying legacy "paused" still resumes cleanly.
         state = self._base_state()
         state["status"] = "paused"
         resume_task(state)
@@ -176,15 +199,18 @@ class TestStatusTransitions:
         assert state["next_step"] is None
 
     def test_awaiting_input(self):
+        # Spec 006: canonical underscore form.
         state = self._base_state()
         set_awaiting_input(state, "Which approach should I use?")
-        assert state["status"] == "awaiting-input"
+        assert state["status"] == "awaiting_input"
         assert state["awaiting_question"] == "Which approach should I use?"
+        assert state["awaiting_since_ts"] is not None
 
     def test_rate_limited(self):
+        # Spec 006: canonical underscore form.
         state = self._base_state()
         set_rate_limited(state, retry_after_seconds=3600)
-        assert state["status"] == "rate-limited"
+        assert state["status"] == "rate_limited"
         assert state["rate_limited_until"] is not None
 
     def test_rate_limit_recovery_not_yet(self):
@@ -193,6 +219,13 @@ class TestStatusTransitions:
         assert check_rate_limit_recovery(state) is False
 
     def test_rate_limit_recovery_expired(self):
+        state = self._base_state()
+        state["status"] = "rate_limited"
+        past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        state["rate_limited_until"] = past
+        assert check_rate_limit_recovery(state) is True
+
+    def test_rate_limit_recovery_accepts_legacy_hyphen_form(self):
         state = self._base_state()
         state["status"] = "rate-limited"
         past = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()

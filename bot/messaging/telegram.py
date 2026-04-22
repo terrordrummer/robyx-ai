@@ -334,6 +334,159 @@ class TelegramPlatform(Platform):
             log.error("Failed to rename Telegram General topic: %s", e)
             return False
 
+    # ── Spec 006 — dedicated-topic operations ──────────────────────────
+
+    _TOPIC_UNREACHABLE_MARKERS = (
+        "TOPIC_ID_INVALID",
+        "TOPIC_DELETED",
+        "TOPIC_CLOSED",
+        "MESSAGE_THREAD_NOT_FOUND",
+        "chat not found",
+    )
+
+    def _is_topic_unreachable(self, result: dict) -> bool:
+        """True if the Bot API error payload signals a permanently gone topic."""
+        if result.get("ok"):
+            return False
+        desc = (result.get("description") or "").lower()
+        return any(m.lower() in desc for m in self._TOPIC_UNREACHABLE_MARKERS)
+
+    async def edit_topic_title(self, channel_id: int, new_title: str) -> bool:
+        """Rename a forum topic via ``editForumTopic``.
+
+        Raises :class:`TopicUnreachable` if Telegram reports the topic is
+        gone. Returns False on transient errors (logged).
+        """
+        from .base import TopicUnreachable
+        data = {
+            "chat_id": self._chat_id,
+            "message_thread_id": channel_id,
+            "name": new_title,
+        }
+        try:
+            client = self._get_client()
+            resp = await client.post(
+                "%s/editForumTopic" % self._api_base, data=data, timeout=30,
+            )
+            result = resp.json()
+            if result.get("ok"):
+                log.info(
+                    "Edited topic title (thread_id=%d) → %r",
+                    channel_id, new_title,
+                )
+                return True
+            if self._is_topic_unreachable(result):
+                raise TopicUnreachable(
+                    channel_id, reason=result.get("description", ""),
+                )
+            log.warning(
+                "editForumTopic failed for %d: %s", channel_id, result,
+            )
+            return False
+        except TopicUnreachable:
+            raise
+        except Exception as exc:
+            log.error(
+                "Error editing topic title %d: %s", channel_id, exc,
+            )
+            return False
+
+    async def pin_message(
+        self,
+        chat_id: int,
+        thread_id: int,
+        message_id: int,
+    ) -> bool:
+        """Pin a specific message in a forum topic via ``pinChatMessage``."""
+        from .base import TopicUnreachable
+        data = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "disable_notification": True,  # silent pin — no ping
+        }
+        try:
+            client = self._get_client()
+            resp = await client.post(
+                "%s/pinChatMessage" % self._api_base, data=data, timeout=30,
+            )
+            result = resp.json()
+            if result.get("ok"):
+                log.info(
+                    "Pinned message %d in topic %d", message_id, thread_id,
+                )
+                return True
+            if self._is_topic_unreachable(result):
+                raise TopicUnreachable(
+                    thread_id, reason=result.get("description", ""),
+                )
+            log.warning("pinChatMessage failed: %s", result)
+            return False
+        except TopicUnreachable:
+            raise
+        except Exception as exc:
+            log.error("Error pinning message %d: %s", message_id, exc)
+            return False
+
+    async def unpin_message(
+        self,
+        chat_id: int,
+        thread_id: int,
+        message_id: int | None = None,
+    ) -> bool:
+        """Unpin a specific message or all pins in a topic.
+
+        If ``message_id`` is None, uses ``unpinAllForumTopicMessages`` to
+        clear every pin in the topic in one shot.
+        """
+        from .base import TopicUnreachable
+        try:
+            client = self._get_client()
+            if message_id is None:
+                endpoint = "unpinAllForumTopicMessages"
+                data = {
+                    "chat_id": chat_id,
+                    "message_thread_id": thread_id,
+                }
+            else:
+                endpoint = "unpinChatMessage"
+                data = {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                }
+            resp = await client.post(
+                "%s/%s" % (self._api_base, endpoint),
+                data=data,
+                timeout=30,
+            )
+            result = resp.json()
+            if result.get("ok"):
+                log.info(
+                    "Unpinned in topic %d (message_id=%s)",
+                    thread_id, message_id,
+                )
+                return True
+            if self._is_topic_unreachable(result):
+                raise TopicUnreachable(
+                    thread_id, reason=result.get("description", ""),
+                )
+            log.warning("%s failed: %s", endpoint, result)
+            return False
+        except TopicUnreachable:
+            raise
+        except Exception as exc:
+            log.error(
+                "Error unpinning in topic %d: %s", thread_id, exc,
+            )
+            return False
+
+    async def close_topic(self, channel_id: int) -> bool:
+        """Close a forum topic to new messages.
+
+        Alias for :meth:`close_channel` with spec-006 semantics (history
+        visible; no new messages accepted).
+        """
+        return await self.close_channel(channel_id)
+
     def set_bot(self, bot):
         """Set the telegram Bot instance (called during app setup)."""
         self._bot = bot

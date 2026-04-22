@@ -40,6 +40,7 @@ import re
 import threading
 import time
 import uuid as _uuid
+from enum import Enum
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -832,9 +833,160 @@ async def _spawn_ai_subprocess(
 
 
 def _write_lock_file(lock_file: Path, pid: int) -> None:
-    """Write ``<pid> <ISO-utc>`` to the task lock file."""
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    lock_file.write_text("%d %s" % (pid, now_str))
+    """Write the initial lock file — spec 006 two-line format.
+
+    Line 1: ``<pid>``
+    Line 2: ``<iso8601_heartbeat_ts>``
+
+    The heartbeat timestamp is refreshed periodically by the subprocess
+    via :func:`refresh_heartbeat` so stale-lock detection can distinguish
+    "subprocess alive but slow" from "subprocess crashed/SIGKILL'd".
+    """
+    now_str = datetime.now(timezone.utc).isoformat()
+    # Pre-spec-006 single-line format kept as a subline-safe prefix: some
+    # readers that only look at line 1 still see the pid.
+    lock_file.write_text("%d\n%s\n" % (pid, now_str))
+
+
+def refresh_heartbeat(lock_file: Path, pid: int) -> None:
+    """Atomic heartbeat refresh — writes the same two-line lock format
+    via a temp file + ``os.replace`` so concurrent ``check_lock`` readers
+    never see a torn file.
+
+    Used by the subprocess-side heartbeat loop (spec 006 FR-019).
+    """
+    now_str = datetime.now(timezone.utc).isoformat()
+    tmp = lock_file.with_suffix(".lock.tmp-%d" % pid)
+    try:
+        tmp.write_text("%d\n%s\n" % (pid, now_str))
+        os.replace(str(tmp), str(lock_file))
+    except OSError:
+        # Best-effort — failure to refresh is non-fatal; scheduler will
+        # eventually detect the stale heartbeat and recover. Cleanup.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+class LockStatus(str, Enum):
+    """Outcome of ``check_lock`` — spec 006."""
+    ALIVE = "alive"
+    STALE_DEAD_PID = "stale_dead_pid"
+    STALE_ZOMBIE = "stale_zombie"
+    MISSING = "missing"
+
+
+def _parse_lock_content(content: str) -> tuple[int | None, datetime | None]:
+    """Parse a lock file body into ``(pid, heartbeat_ts)``.
+
+    Accepts three formats for backward compat:
+    * Legacy single-line ``<pid> <iso_ts>`` (space-separated).
+    * Legacy pid-only ``<pid>``.
+    * Spec 006 two-line ``<pid>\\n<iso_ts>\\n``.
+
+    Returns ``(None, None)`` on unparseable content.
+    """
+    content = content.strip()
+    if not content:
+        return None, None
+    pid: int | None = None
+    ts: datetime | None = None
+
+    if "\n" in content:
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        if not lines:
+            return None, None
+        try:
+            pid = int(lines[0])
+        except ValueError:
+            return None, None
+        if len(lines) >= 2:
+            try:
+                ts = datetime.fromisoformat(lines[1])
+            except ValueError:
+                ts = None
+    else:
+        parts = content.split()
+        try:
+            pid = int(parts[0])
+        except (ValueError, IndexError):
+            return None, None
+        if len(parts) >= 2:
+            try:
+                ts = datetime.fromisoformat(parts[1])
+            except ValueError:
+                ts = None
+
+    if ts is not None and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return pid, ts
+
+
+async def check_lock_status(task_name: str) -> tuple[LockStatus, int | None]:
+    """Spec 006 stale-aware lock check.
+
+    Returns the ``LockStatus`` and — when present and parseable — the pid
+    recorded in the lock file. Callers deciding whether to reclaim should
+    prefer this over the legacy bool-returning :func:`check_lock`.
+
+    Recovery semantics:
+      * ``ALIVE`` — subprocess is running AND heartbeat is fresh (or the
+        lock is in legacy pid-only format and the pid is alive). Skip
+        this task for the current scheduler cycle.
+      * ``STALE_DEAD_PID`` — pid is no longer on the OS. Scheduler may
+        delete the lock and reclaim.
+      * ``STALE_ZOMBIE`` — pid exists but heartbeat is older than the
+        configured threshold. Scheduler attempts SIGTERM + grace +
+        SIGKILL before deleting the lock.
+      * ``MISSING`` — no lock file. Task is not currently running.
+    """
+    try:
+        safe_name = validate_task_name(task_name)
+    except ValueError as exc:
+        log.error("Invalid task name for lock check %r: %s", task_name, exc)
+        return LockStatus.MISSING, None
+
+    lock_file = DATA_DIR / safe_name / "lock"
+    if not lock_file.exists():
+        return LockStatus.MISSING, None
+
+    try:
+        content = lock_file.read_text()
+    except OSError as exc:
+        log.warning(
+            "check_lock_status: read error on %s: %s — treating as missing",
+            lock_file, exc,
+        )
+        return LockStatus.MISSING, None
+
+    pid, heartbeat_ts = _parse_lock_content(content)
+    if pid is None:
+        # Unparseable lock — treat as missing so we don't deadlock.
+        try:
+            lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return LockStatus.MISSING, None
+
+    from process import is_pid_alive
+
+    if not is_pid_alive(pid):
+        return LockStatus.STALE_DEAD_PID, pid
+
+    # Pid alive. If heartbeat info is absent (legacy format), trust the
+    # pid — earlier Robyx never deadlocked on pid-alive-but-slow. If
+    # present, enforce the stale threshold.
+    if heartbeat_ts is not None:
+        try:
+            from config import LOCK_STALE_THRESHOLD_SECONDS as _threshold
+        except Exception:
+            _threshold = 300
+        age = (datetime.now(timezone.utc) - heartbeat_ts).total_seconds()
+        if age > _threshold:
+            return LockStatus.STALE_ZOMBIE, pid
+
+    return LockStatus.ALIVE, pid
 
 
 # ── Dispatch: agent tasks (one-shot / periodic) ─────────────────────────────
@@ -1144,8 +1296,15 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             if _maybe_demote_on_demand_awaiting_input(state, name):
                 save_state(Path(sf), state)
 
-            # Skip if not ready
-            if state["status"] in ("completed", "paused", "awaiting-input"):
+            # Skip if not ready.
+            # Spec 006: accept both legacy (hyphen / "paused") and canonical
+            # (underscore / "stopped") forms. Any of these means the task is
+            # not currently eligible for dispatch.
+            if state["status"] in (
+                "completed", "deleted", "error",
+                "stopped", "paused",
+                "awaiting_input", "awaiting-input",
+            ):
                 continue
 
             # Check if a subprocess is actually running (orphan detection)

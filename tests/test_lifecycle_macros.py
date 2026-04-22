@@ -373,7 +373,9 @@ class TestPauseResume:
         ))
         assert "pausa" in list(subs.values())[0].lower()
         reloaded = cont.load_state(cont.state_file_path("daily-report"))
-        assert reloaded["status"] == "paused"
+        # Spec 006: pause writes canonical "stopped" (legacy "paused" is
+        # normalised on load anyway, so either would appear here).
+        assert reloaded["status"] == "stopped"
 
         # RESUME
         state_map = {"daily-report": reloaded}

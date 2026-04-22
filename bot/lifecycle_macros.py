@@ -184,7 +184,14 @@ def _normalize_thread_id(raw: Any) -> Any:
 
 
 def _is_active_status(status: str) -> bool:
-    return status in {"pending", "running", "paused", "awaiting-input", "rate-limited"}
+    # Spec 006: accept both canonical underscore and legacy hyphen/paused forms.
+    return status in {
+        "pending", "running",
+        "stopped", "paused",
+        "awaiting_input", "awaiting-input",
+        "rate_limited", "rate-limited",
+        "error",
+    }
 
 
 def _load_scoped_entries(ctx: DispatchContext) -> list[dict]:
@@ -481,7 +488,13 @@ def _resume_task(t: dict, ctx: DispatchContext) -> str:
             "Resume non supportato per task di tipo `%s`." % tk
         )
     state = t["state"]
-    if state.get("status") not in ("paused", "rate-limited", "awaiting-input"):
+    # Spec 006: accept both legacy and canonical resumable states.
+    if state.get("status") not in (
+        "stopped", "paused",
+        "rate_limited", "rate-limited",
+        "awaiting_input", "awaiting-input",
+        "error",
+    ):
         _log_action(ctx, "resume_task", name, name, "noop")
         return (
             "Task `%s` non è in pausa (status: %s)." % (name, state.get("status"))

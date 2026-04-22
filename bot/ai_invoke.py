@@ -473,8 +473,14 @@ def _render_active_continuous_tasks(thread_id: Any) -> str:
         return raw
 
     target = _norm(thread_id)
+    # Spec 006: accept both canonical underscore and legacy hyphen/paused forms.
+    # Errored and deleted tasks are excluded from "active" rendering — the
+    # user sees the incident / archive notice in the dedicated topic.
     active_states = {
-        "pending", "running", "paused", "awaiting-input", "rate-limited",
+        "pending", "running",
+        "stopped", "paused",
+        "awaiting_input", "awaiting-input",
+        "rate_limited", "rate-limited",
     }
 
     items: list[dict] = []
