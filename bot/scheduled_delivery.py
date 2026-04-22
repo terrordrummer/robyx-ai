@@ -415,11 +415,47 @@ def start_task_delivery_watch(
     backend: AIBackend,
     logger: logging.Logger,
 ) -> asyncio.Task | None:
-    """Detach a watcher that relays output after the spawned task exits."""
+    """Detach a watcher that relays output after the spawned task exits.
+
+    Spec 006 US4: also spawns a heartbeat refresher that rewrites the
+    lock file's timestamp every ``LOCK_HEARTBEAT_INTERVAL_SECONDS`` while
+    the subprocess is alive. If the subprocess dies without clean
+    teardown (SIGKILL, OOM, host crash), the heartbeat goes stale within
+    ``LOCK_STALE_THRESHOLD_SECONDS`` and the scheduler reclaims on its
+    next cycle (FR-019/FR-020).
+    """
     if platform is None:
         return None
 
+    import asyncio as _asyncio
+    from scheduler import refresh_heartbeat
+
+    try:
+        from config import LOCK_HEARTBEAT_INTERVAL_SECONDS as _interval
+    except Exception:
+        _interval = 30
+
+    heartbeat_cancelled = _asyncio.Event()
+
+    async def _heartbeat_loop() -> None:
+        while not heartbeat_cancelled.is_set():
+            try:
+                refresh_heartbeat(lock_file, proc.pid)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "heartbeat refresh failed for '%s': %s",
+                    task.get("name"), exc,
+                )
+            try:
+                await _asyncio.wait_for(
+                    heartbeat_cancelled.wait(),
+                    timeout=_interval,
+                )
+            except _asyncio.TimeoutError:
+                continue
+
     async def _watch() -> None:
+        heartbeat_task = _asyncio.create_task(_heartbeat_loop())
         returncode = 1
         try:
             returncode = await proc.wait()
@@ -439,6 +475,11 @@ def start_task_delivery_watch(
                 exc_info=True,
             )
         finally:
+            heartbeat_cancelled.set()
+            try:
+                await _asyncio.wait_for(heartbeat_task, timeout=2.0)
+            except (_asyncio.TimeoutError, Exception):
+                heartbeat_task.cancel()
             lock_file.unlink(missing_ok=True)
 
     return asyncio.create_task(_watch())

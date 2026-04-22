@@ -249,6 +249,105 @@ def add_reminder(entry: dict) -> None:
         _save_queue_unlocked(entries)
 
 
+async def drain_and_cancel_continuous_task(
+    task_name: str,
+    *,
+    reason: str = "workspace closed",
+    drain_timeout_seconds: int | None = None,
+) -> dict:
+    """Spec 006 FR-021 — drain-on-close with a bounded window.
+
+    If the continuous task ``task_name`` has a running subprocess, wait
+    up to ``drain_timeout_seconds`` (or the task's per-state override,
+    or ``DRAIN_TIMEOUT_DEFAULT_SECONDS``) for it to exit naturally. If
+    the timeout elapses first, SIGTERM + 5s grace + SIGKILL, then
+    journal ``drain_timeout``. Finally cancel the queue entry.
+
+    Returns ``{"drained": bool, "timeout": bool, "waited_seconds": float}``.
+    """
+    import asyncio as _asyncio
+    import signal as _signal
+    from process import is_pid_alive
+
+    try:
+        from config import DRAIN_TIMEOUT_DEFAULT_SECONDS as _default_drain
+    except Exception:
+        _default_drain = 3600
+
+    from continuous import load_state, state_file_path
+
+    # Resolve effective drain window.
+    state_path = state_file_path(task_name)
+    state = load_state(state_path)
+    effective = drain_timeout_seconds
+    if effective is None and state is not None:
+        effective = state.get("drain_timeout_seconds")
+    if effective is None:
+        effective = _default_drain
+    effective = max(1, int(effective))
+
+    _journal_scheduler_event(
+        task_name=task_name,
+        event_type="drain_started",
+        outcome="ok",
+        payload={"timeout_seconds": effective, "reason": reason},
+    )
+
+    # Locate the running subprocess via lock file.
+    lock_file = DATA_DIR / task_name / "lock"
+    pid: int | None = None
+    if lock_file.exists():
+        pid_raw, _ = _parse_lock_content(lock_file.read_text())
+        pid = pid_raw
+
+    waited = 0.0
+    timed_out = False
+    drained = False
+
+    if pid is not None and is_pid_alive(pid):
+        # Poll for natural exit up to the drain window.
+        interval = 1.0
+        start = time.monotonic()
+        while waited < effective:
+            if not is_pid_alive(pid):
+                drained = True
+                break
+            await _asyncio.sleep(interval)
+            waited = time.monotonic() - start
+
+        if not drained and is_pid_alive(pid):
+            timed_out = True
+            try:
+                os.kill(pid, _signal.SIGTERM)
+                await _asyncio.sleep(5)
+                if is_pid_alive(pid):
+                    os.kill(pid, _signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            _journal_scheduler_event(
+                task_name=task_name,
+                event_type="drain_timeout",
+                outcome="killed",
+                payload={"pid": pid, "timeout_seconds": effective},
+            )
+
+    # Cancel the queue entry regardless of drain outcome.
+    cancel_task_by_name(task_name, reason=reason)
+
+    _journal_scheduler_event(
+        task_name=task_name,
+        event_type="drain_completed",
+        outcome="drained" if drained else ("timeout" if timed_out else "not_running"),
+        payload={"waited_seconds": round(waited, 2)},
+    )
+
+    return {
+        "drained": drained,
+        "timeout": timed_out,
+        "waited_seconds": round(waited, 2),
+    }
+
+
 def cancel_tasks_for_agent_file(
     agent_file: str, *, reason: str = "workspace closed"
 ) -> int:
@@ -1307,16 +1406,49 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             ):
                 continue
 
-            # Check if a subprocess is actually running (orphan detection).
-            # Spec 006: escalates with backoff — after ORPHAN_INCIDENT_THRESHOLD
-            # consecutive detections, marks status=error + emits a single
-            # incident (journal + dedicated-topic message in US4 T058).
+            # Spec 006 US4: stale-aware lock check. Decides between
+            # ALIVE (skip this cycle), STALE_DEAD_PID / STALE_ZOMBIE
+            # (clean the lock and run the orphan-backoff path), MISSING
+            # (subprocess already exited — fall through to orphan path).
             if state["status"] == "running":
-                is_locked, pid = await check_lock(name)
-                if is_locked:
-                    continue  # Subprocess still running
-                # Subprocess died without updating state — run the spec-006
-                # orphan-backoff path. State is modified in place.
+                lock_status, pid = await check_lock_status(name)
+                if lock_status == LockStatus.ALIVE:
+                    continue  # Subprocess still running and heartbeating
+
+                # Recovery: remove the stale lock. STALE_ZOMBIE means the
+                # pid is still alive but heartbeat died; attempt graceful
+                # termination before unlinking.
+                lock_file = DATA_DIR / name / "lock"
+                if lock_status == LockStatus.STALE_ZOMBIE and pid is not None:
+                    import signal as _signal
+                    try:
+                        os.kill(pid, _signal.SIGTERM)
+                        await asyncio.sleep(5)
+                    except ProcessLookupError:
+                        pass
+                    except OSError as exc:
+                        log.warning(
+                            "STALE_ZOMBIE SIGTERM failed for %s (pid=%d): %s",
+                            name, pid, exc,
+                        )
+                    try:
+                        from process import is_pid_alive
+                        if is_pid_alive(pid):
+                            os.kill(pid, _signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+
+                lock_file.unlink(missing_ok=True)
+                _journal_scheduler_event(
+                    task_name=name,
+                    event_type="lock_recovered",
+                    outcome=lock_status.value if lock_status != LockStatus.MISSING else "missing",
+                    payload={"pid": pid},
+                )
+
+                # Feed into the orphan-backoff path (writes state; the
+                # scheduler may re-dispatch on the next cycle if below
+                # threshold, or escalate to incident).
                 _handle_continuous_orphan(state, name)
                 save_state(Path(sf), state)
                 continue
