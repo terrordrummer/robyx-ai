@@ -585,7 +585,7 @@ async def apply_continuous_macros(
             outcomes.append(outcome)
             if reason == "name_taken":
                 lines.append(
-                    strings["continuous_task_error_name_taken"] % name
+                    strings["continuous_task_error_name_taken"] % (name, name)
                 )
             else:
                 lines.append(strings["continuous_task_error_downstream"])
