@@ -31,7 +31,7 @@
 
 ## Notes
 
-- Items marked incomplete require spec updates before `/speckit.clarify` or `/speckit.plan`.
+- Items marked incomplete require spec updates before `/speckit.plan`.
 - Implementation details intentionally kept in the user's original input (which referenced specific file paths and line numbers) but deliberately omitted from the spec body; they will be revisited during `/speckit.plan`.
 - "HQ" and "Continuous" task topic prefixes are user-facing choices, not implementation details, and are retained in spec.
-- A single "[NEEDS CLARIFICATION]"-class ambiguity exists in practice (exact mechanism by which the orchestrator queries the journal — tool, macro, or slash-command), but a reasonable default (the choice is left to the plan phase) was applied rather than recording a marker, since the user has explicitly signalled preference for the planning workflow to handle architectural details.
+- `/speckit.clarify` session 2026-04-22 resolved 5 ambiguity points: journal query mechanism, delete-topic semantics, HQ last-resort rule, drain-timeout configurability, journal task-type scope. See `## Clarifications` section of spec.md.
