@@ -126,17 +126,61 @@ then emit:
   "first_step": {
     "number": 1,
     "description": "..."
-  }
+  },
+  "drain_timeout_seconds": 3600
 }
 [/CONTINUOUS_PROGRAM]
 ```
 
+`drain_timeout_seconds` is optional (default 3600 / 1 h; range `[60, 21600]`).
+It bounds how long workspace-close waits for an in-flight step to finish.
+
 ### How It Works
 
-1. The scheduler checks continuous entries every 60 seconds
-2. If the last step completed and a `next_step` is planned, a new agent is spawned
-3. The agent executes the step, commits to the branch, updates the state file
-4. The agent plans the next step and terminates
+1. The scheduler checks continuous entries every 60 seconds.
+2. Each task owns a dedicated topic `[Continuous] <display_name>` with a
+   live state-marker suffix (`· ▶ / ⏸ / ⏳ / ⏹ / ✅ / ❌`); step
+   outputs, awaiting-input pins, and closure notices go there — not
+   into the parent workspace.
+3. The scheduler spawns a step agent when the task is `pending` with a
+   planned `next_step`. The parent bot runs a watchdog that refreshes
+   the lock file's heartbeat every 30 s while the subprocess lives.
+4. The agent executes, commits to the branch, updates state; scheduler
+   picks the next step on the following cycle.
+5. Routine scheduler activity (dispatches, completions, state
+   transitions, lock recoveries, rate-limit transitions) is appended
+   to the event journal at `data/events.jsonl` — NOT pushed to HQ.
+   HQ pull-queries the journal with `[GET_EVENTS]`.
+
+### Lifecycle operations
+
+Four distinct ops, invocable either from the orchestrator (macros) or
+from a workspace agent on its own tasks:
+
+| Macro | Semantics |
+|---|---|
+| `[STOP_TASK name="X"]` | Halt dispatches. State + history + topic preserved. Resumable. |
+| `[RESUME_TASK name="X"]` | From `stopped / awaiting_input / rate_limited / error` back to `pending`. |
+| `[COMPLETE_TASK name="X"]` | Terminal success. State + topic preserved as permanent record. Not resumable. |
+| `[DELETE_TASK name="X"]` | Archives the dedicated topic as `[Archived] <X>`, removes the agent file, frees the name for reuse. |
+
+If a user asks to "ricrea" a task and the name is still reserved from a
+stopped/completed task, you will get `name_taken`. The error message
+spells out exactly what to do: run `[DELETE_TASK name="X"]` first, or
+pick a different name.
+
+### Pull-based event history
+
+When the user asks "what happened in the last N hours?" or
+"cosa è successo?", emit:
+
+```
+[GET_EVENTS since="2h" task="X?" type="Y?" limit="200?"]
+```
+
+The handler substitutes the macro with a compact markdown table of
+events. `since` is REQUIRED (duration `30m / 2h / 1d` or ISO-8601);
+the rest are optional filters.
 5. The scheduler picks up the next step on the following cycle
 
 ### User Interaction
