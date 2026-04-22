@@ -344,6 +344,114 @@ def set_rate_limited(state: dict, retry_after_seconds: int = 3600) -> dict:
     return state
 
 
+async def update_topic_state_marker(state: dict, platform, display_name: str | None = None) -> bool:
+    """Spec 006 FR-009 — refresh the dedicated topic's title suffix from
+    the task's current ``status``.
+
+    No-op if the task has no ``dedicated_thread_id`` or the platform
+    lacks ``edit_topic_title``. Catches ``TopicUnreachable`` and
+    propagates it so the scheduler-side recovery path (FR-002a) can
+    engage. All other exceptions are logged and swallowed — a failed
+    title update must not block the state transition.
+    """
+    dedicated = state.get("dedicated_thread_id")
+    if dedicated is None or platform is None:
+        return False
+    if not hasattr(platform, "edit_topic_title"):
+        return False
+
+    from continuous_state_machine import marker_suffix
+    suffix = marker_suffix(state.get("status") or "running")
+    name = display_name or state.get("name") or "?"
+    new_title = "[Continuous] %s%s" % (name, suffix)
+
+    try:
+        return bool(await platform.edit_topic_title(dedicated, new_title))
+    except Exception as exc:
+        # TopicUnreachable is significant; re-raise so the scheduler's
+        # recovery layer can see it. Everything else: log + swallow.
+        from messaging.base import TopicUnreachable
+        if isinstance(exc, TopicUnreachable):
+            raise
+        log.warning(
+            "update_topic_state_marker failed for '%s' (thread=%s): %s",
+            name, dedicated, exc,
+        )
+        return False
+
+
+async def pin_awaiting_message(
+    state: dict,
+    platform,
+    chat_id,
+    message_id: int,
+) -> bool:
+    """Spec 006 FR-010 — pin an awaiting-input message in the task's
+    dedicated topic and record ``awaiting_pinned_msg_id`` in the state.
+    """
+    dedicated = state.get("dedicated_thread_id")
+    if dedicated is None or platform is None:
+        return False
+    if not hasattr(platform, "pin_message"):
+        return False
+
+    try:
+        ok = await platform.pin_message(
+            chat_id=chat_id,
+            thread_id=dedicated,
+            message_id=message_id,
+        )
+    except Exception as exc:
+        from messaging.base import TopicUnreachable
+        if isinstance(exc, TopicUnreachable):
+            raise
+        log.warning(
+            "pin_awaiting_message failed for task '%s': %s",
+            state.get("name"), exc,
+        )
+        return False
+    if ok:
+        state["awaiting_pinned_msg_id"] = message_id
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return bool(ok)
+
+
+async def unpin_awaiting_message(
+    state: dict,
+    platform,
+    chat_id,
+) -> bool:
+    """Spec 006 FR-012 — unpin the currently-pinned awaiting message
+    (if any) in the task's dedicated topic.
+    """
+    dedicated = state.get("dedicated_thread_id")
+    pinned = state.get("awaiting_pinned_msg_id")
+    if dedicated is None or platform is None or pinned is None:
+        return False
+    if not hasattr(platform, "unpin_message"):
+        return False
+
+    try:
+        ok = await platform.unpin_message(
+            chat_id=chat_id,
+            thread_id=dedicated,
+            message_id=pinned,
+        )
+    except Exception as exc:
+        from messaging.base import TopicUnreachable
+        if isinstance(exc, TopicUnreachable):
+            raise
+        log.warning(
+            "unpin_awaiting_message failed for task '%s': %s",
+            state.get("name"), exc,
+        )
+        return False
+    if ok:
+        state["awaiting_pinned_msg_id"] = None
+        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return bool(ok)
+
+
 def check_rate_limit_recovery(state: dict) -> bool:
     """Return True if a rate-limited task can be retried now.
 

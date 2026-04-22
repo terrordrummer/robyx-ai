@@ -1481,6 +1481,96 @@ def append_log(entry: str) -> None:
             f.write("[%s] %s\n" % (now, entry))
 
 
+async def _dispatch_awaiting_reminders(platform, default_chat_id) -> int:
+    """Spec 006 FR-011 — for each continuous task that has been
+    awaiting input for longer than ``AWAITING_REMINDER_SECONDS`` and has
+    not yet had a reminder for this episode, post exactly one reminder
+    into its dedicated topic.
+
+    Returns the number of reminders posted this cycle.
+    """
+    if platform is None:
+        return 0
+
+    try:
+        from config import AWAITING_REMINDER_SECONDS, CHAT_ID, CONTINUOUS_DIR
+    except Exception:
+        return 0
+
+    from continuous import load_state, save_state, state_file_path
+
+    continuous_dir = Path(CONTINUOUS_DIR)
+    if not continuous_dir.exists():
+        return 0
+
+    now = datetime.now(timezone.utc)
+    threshold = AWAITING_REMINDER_SECONDS
+    posted = 0
+
+    for task_dir in sorted(continuous_dir.iterdir()):
+        if not task_dir.is_dir():
+            continue
+        sf = task_dir / "state.json"
+        if not sf.exists():
+            continue
+        state = load_state(sf)
+        if state is None:
+            continue
+        if state.get("status") not in ("awaiting_input", "awaiting-input"):
+            continue
+        if state.get("awaiting_reminder_sent_ts"):
+            continue
+        since_iso = state.get("awaiting_since_ts")
+        if not since_iso:
+            continue
+        try:
+            since_dt = datetime.fromisoformat(since_iso)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if (now - since_dt).total_seconds() < threshold:
+            continue
+
+        dedicated = state.get("dedicated_thread_id")
+        if dedicated is None:
+            # No dedicated topic — rely on FR-002a last-resort or silent skip.
+            continue
+
+        question = state.get("awaiting_question") or "a user decision"
+        body = (
+            "⏸ Still awaiting your reply on *%s*:\n\n%s\n\n"
+            "Reply in this topic to resume the task."
+            % (state.get("name") or task_dir.name, question)
+        )
+        try:
+            await platform.send_to_channel(dedicated, body, parse_mode="markdown")
+        except Exception as exc:
+            log.warning(
+                "awaiting-reminder delivery failed for '%s': %s",
+                state.get("name"), exc,
+            )
+            continue
+
+        state["awaiting_reminder_sent_ts"] = now.isoformat()
+        try:
+            save_state(state_file_path(state.get("name") or task_dir.name), state)
+        except Exception:
+            pass
+
+        _journal_scheduler_event(
+            task_name=state.get("name") or task_dir.name,
+            event_type="awaiting_reminder_sent",
+            outcome="posted",
+            payload={"dedicated_thread_id": dedicated},
+        )
+        posted += 1
+
+    if posted:
+        log.info("Awaiting-input reminders posted this cycle: %d", posted)
+    return posted
+
+
 def _handle_continuous_orphan(state: dict, name: str) -> None:
     """Spec 006 FR-022 orphan backoff.
 
@@ -1683,6 +1773,12 @@ async def run_scheduler_cycle(
         events_mod.rotate_if_needed()
     except Exception as exc:
         log.error("events.rotate_if_needed failed: %s", exc, exc_info=True)
+
+    # Spec 006 FR-011 — 24h awaiting-input reminder per dedicated topic.
+    try:
+        await _dispatch_awaiting_reminders(platform, default_chat_id)
+    except Exception as exc:
+        log.error("awaiting-reminder loop failed: %s", exc, exc_info=True)
 
     return {
         "dispatched": dispatched,
