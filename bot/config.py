@@ -250,6 +250,55 @@ REMINDER_MAX_AGE_SECONDS = int(
 )  # reject reminders whose fire_at is older than this (default: 7 days).
 #  A bot offline for 2–3 days used to drop legitimate reminders at 24 h.
 
+# ── Spec 006 — Continuous-Task Observability & Lifecycle Robustness ──
+
+LOCK_HEARTBEAT_INTERVAL_SECONDS = int(
+    os.environ.get("LOCK_HEARTBEAT_INTERVAL_SECONDS", "30")
+)  # subprocess refreshes the lock file's heartbeat line every N seconds
+#  while alive. Half the stale threshold so a single missed refresh never
+#  triggers false-positive stale detection.
+
+LOCK_STALE_THRESHOLD_SECONDS = int(
+    os.environ.get("LOCK_STALE_THRESHOLD_SECONDS", "300")
+)  # scheduler considers a lock stale when its heartbeat is older than N
+#  seconds. Default 5 min = 10 expected heartbeats, safe tolerance for
+#  transient GC/disk stalls.
+
+ORPHAN_INCIDENT_THRESHOLD = int(
+    os.environ.get("ORPHAN_INCIDENT_THRESHOLD", "3")
+)  # number of consecutive scheduler cycles detecting an orphan before
+#  escalating to a single incident message + journal entry + state=error.
+
+EVENT_RETENTION_DAYS = int(
+    os.environ.get("EVENT_RETENTION_DAYS", "7")
+)  # event journal: rotated shards older than N days are pruned.
+
+EVENT_MAX_HOT_BYTES = int(
+    os.environ.get("EVENT_MAX_HOT_BYTES", str(10 * 1024 * 1024))
+)  # event journal: size-based rotation threshold for data/events.jsonl
+#  (default 10 MB) on top of hourly rotation.
+
+AWAITING_REMINDER_SECONDS = int(
+    os.environ.get("AWAITING_REMINDER_SECONDS", "86400")
+)  # awaiting-input reminder: if a continuous task has been waiting for
+#  user input longer than N seconds, post one (and only one) reminder in
+#  its dedicated topic. Default 24 h.
+
+DRAIN_TIMEOUT_DEFAULT_SECONDS = int(
+    os.environ.get("DRAIN_TIMEOUT_DEFAULT_SECONDS", "3600")
+)  # default per-task drain window on workspace-close. Tasks may override
+#  via [CONTINUOUS drain_timeout="…"]. Default 60 min — above the P95 of
+#  observed long research-loop steps (~28 min on zeus-rd-172).
+
+TOPIC_UNREACHABLE_RETRY_WINDOW_SECONDS = int(
+    os.environ.get("TOPIC_UNREACHABLE_RETRY_WINDOW_SECONDS", "300")
+)  # when a dedicated topic becomes unreachable, the scheduler retries
+#  silent recreation for N seconds before engaging the FR-002a last-resort
+#  HQ surface path.
+
+EVENTS_DIR = DATA_DIR / "events"
+EVENTS_HOT_FILE = DATA_DIR / "events.jsonl"
+
 # ── System Prompts ──
 
 ROBYX_SYSTEM_PROMPT = _load_prompt("prompt_orchestrator.md")
