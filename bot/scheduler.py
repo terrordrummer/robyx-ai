@@ -1307,14 +1307,17 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             ):
                 continue
 
-            # Check if a subprocess is actually running (orphan detection)
+            # Check if a subprocess is actually running (orphan detection).
+            # Spec 006: escalates with backoff — after ORPHAN_INCIDENT_THRESHOLD
+            # consecutive detections, marks status=error + emits a single
+            # incident (journal + dedicated-topic message in US4 T058).
             if state["status"] == "running":
                 is_locked, pid = await check_lock(name)
                 if is_locked:
                     continue  # Subprocess still running
-                # Subprocess died without updating state
-                log.warning("Continuous task '%s': state=running but no lock. Marking step failed.", name)
-                mark_step_failed(state, "subprocess exited unexpectedly")
+                # Subprocess died without updating state — run the spec-006
+                # orphan-backoff path. State is modified in place.
+                _handle_continuous_orphan(state, name)
                 save_state(Path(sf), state)
                 continue
 
@@ -1432,11 +1435,24 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                     "Continuous '%s': dispatched step %d (PID %d, model: %s)",
                     name, step_number, proc.pid, model,
                 )
+                # Spec 006 — journal the dispatch for [GET_EVENTS] queries.
+                _journal_scheduler_event(
+                    task_name=name,
+                    event_type="dispatched",
+                    outcome="ok",
+                    payload={"step": step_number, "pid": proc.pid, "model": model},
+                )
 
             except (OSError, ValueError) as exc:
                 errors.append(name)
                 append_log("%s -- ERROR -- step %d failed to spawn: %s" % (name, step_number, exc))
                 log.error("Continuous '%s': failed to spawn step %d: %s", name, step_number, exc, exc_info=True)
+                _journal_scheduler_event(
+                    task_name=name,
+                    event_type="error",
+                    outcome="spawn_failed",
+                    payload={"step": step_number, "exc": str(exc)},
+                )
 
         except Exception as exc:  # noqa: BLE001 - per-entry isolation boundary
             errors.append(name or "?")
@@ -1463,6 +1479,133 @@ def append_log(entry: str) -> None:
     with _append_log_lock:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write("[%s] %s\n" % (now, entry))
+
+
+def _handle_continuous_orphan(state: dict, name: str) -> None:
+    """Spec 006 FR-022 orphan backoff.
+
+    Counts consecutive orphan detections; once the threshold is reached
+    escalates to a single incident (state=error + journal
+    ``orphan_incident`` event with diagnostic payload). Below threshold:
+    journals ``orphan_detected`` silently and marks the step failed so
+    the next cycle can re-dispatch.
+
+    Consecutiveness: detections older than 2× SCHEDULER_INTERVAL reset
+    the counter to 1 (treat as a fresh episode).
+    """
+    try:
+        from config import ORPHAN_INCIDENT_THRESHOLD as _threshold
+        from config import SCHEDULER_INTERVAL as _cycle
+    except Exception:
+        _threshold, _cycle = 3, 60
+
+    now = datetime.now(timezone.utc)
+    last_iso = state.get("orphan_last_detected_ts")
+    if last_iso:
+        try:
+            last_dt = datetime.fromisoformat(last_iso)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            if (now - last_dt).total_seconds() > 2 * _cycle:
+                state["orphan_detect_count"] = 0
+        except ValueError:
+            state["orphan_detect_count"] = 0
+
+    state["orphan_detect_count"] = int(state.get("orphan_detect_count", 0)) + 1
+    state["orphan_last_detected_ts"] = now.isoformat()
+
+    count = state["orphan_detect_count"]
+
+    if count < _threshold:
+        # Below threshold — silent journal + mark step failed so
+        # dispatch can retry next cycle.
+        log.warning(
+            "Continuous task '%s': orphan detected (cycle %d/%d) — "
+            "marking step failed for re-dispatch",
+            name, count, _threshold,
+        )
+        from continuous import mark_step_failed as _mark_step_failed
+        _mark_step_failed(state, "subprocess exited unexpectedly")
+        # mark_step_failed sets status=error, but below-threshold we want
+        # to allow a retry — roll it back to 'pending' for the next tick.
+        state["status"] = "pending"
+        _journal_scheduler_event(
+            task_name=name,
+            event_type="orphan_detected",
+            outcome="below_threshold",
+            payload={"cycle": count, "threshold": _threshold},
+        )
+        return
+
+    # Threshold reached — escalate to single incident.
+    from pathlib import Path as _Path
+    from config import DATA_DIR as _DATA_DIR
+    output_tail = ""
+    last_exit_code = None
+    try:
+        log_path = _Path(_DATA_DIR) / name / "output.log"
+        if log_path.exists():
+            with log_path.open("rb") as fh:
+                try:
+                    fh.seek(-500, os.SEEK_END)
+                except OSError:
+                    fh.seek(0)
+                output_tail = fh.read().decode("utf-8", errors="replace")
+    except Exception:
+        output_tail = "(output.log not readable)"
+
+    payload = {
+        "detected_cycles": count,
+        "last_output_tail": output_tail[-500:],
+        "last_exit_code": last_exit_code,
+        "lock_last_heartbeat_ts": None,
+        "dedicated_thread_id": state.get("dedicated_thread_id"),
+    }
+
+    from continuous import mark_step_failed as _mark_step_failed
+    _mark_step_failed(state, "orphan incident — backoff threshold reached")
+    state["status"] = "error"
+
+    _journal_scheduler_event(
+        task_name=name,
+        event_type="orphan_incident",
+        outcome="escalated",
+        payload=payload,
+    )
+    log.error(
+        "Continuous task '%s': orphan incident after %d consecutive "
+        "detections — state=error",
+        name, count,
+    )
+
+
+def _journal_scheduler_event(
+    task_name: str,
+    event_type: str,
+    outcome: str,
+    payload: dict | None = None,
+    task_type: str = "continuous",
+) -> None:
+    """Append a scheduler-origin event to the spec-006 event journal.
+
+    Safe wrapper: silently swallows any journal error so a logging issue
+    never takes down a dispatch path. The journal itself logs at WARN/
+    ERROR level if writes fail.
+    """
+    try:
+        import events as events_mod
+        events_mod.append(
+            task_name=task_name,
+            task_type=task_type,
+            event_type=event_type,
+            outcome=outcome,
+            payload=payload,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        log.error(
+            "journal event append failed for %s (%s): %s",
+            task_name, event_type, exc,
+        )
 
 
 # ── Query helpers ────────────────────────────────────────────────────────────
@@ -1532,6 +1675,14 @@ async def run_scheduler_cycle(
         errors.extend(cont_errors)
     except Exception as exc:
         log.error("Continuous task handling failed: %s", exc, exc_info=True)
+
+    # Spec 006 — rotate the hot event journal (hourly + size-based) and
+    # prune retention once per cycle. Idempotent and cheap.
+    try:
+        import events as events_mod
+        events_mod.rotate_if_needed()
+    except Exception as exc:
+        log.error("events.rotate_if_needed failed: %s", exc, exc_info=True)
 
     return {
         "dispatched": dispatched,

@@ -186,6 +186,13 @@ NOTIFY_HQ_PATTERN = re.compile(
     r'\[NOTIFY_HQ\s+([^\]]+?)\]',
     re.DOTALL,
 )
+# Spec 006 — orchestrator pulls recent events on demand. Handler strips
+# the token from outgoing response and injects query results as a
+# system-role context message for the same turn.
+GET_EVENTS_PATTERN = re.compile(
+    r'\[GET_EVENTS(\s+[^\]]*?)?\s*\]',
+    re.DOTALL,
+)
 _COLLAB_ATTR_PATTERN = re.compile(r'(\w+)="([^"]*)"', re.DOTALL)
 
 

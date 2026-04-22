@@ -318,19 +318,52 @@ async def deliver_task_output(
     returncode: int,
     logger: logging.Logger,
 ) -> bool:
-    """Post the parsed task result into the task's target topic/channel."""
-    target_id = _coerce_target_id(task.get("thread_id"))
-    if platform is None or target_id is None:
-        logger.warning(
-            "No delivery target for scheduled task '%s' (thread_id=%r)",
-            task.get("name"),
-            task.get("thread_id"),
-        )
-        return False
+    """Post the parsed task result into the task's target topic/channel.
+
+    Spec 006: for continuous tasks, delivery prefers ``dedicated_thread_id``
+    (stored in the task's state.json) over the queue entry's ``thread_id``.
+    Falls back to the queue entry's thread_id when no dedicated topic is
+    set (pre-migration snapshots, platforms without topic primitives).
+    Emits a ``step_complete`` journal event even for ``[SILENT]`` steps
+    so pull-based queries reconstruct full history (FR-005).
+    """
+    task_name = task.get("name") or ""
+    task_type = task.get("type") or "continuous"
+    is_continuous = task_type == "continuous"
+
+    # Spec 006 — resolve the dedicated topic id, if present.
+    target_id: Any = None
+    if is_continuous and task_name:
+        try:
+            from continuous import load_state, state_file_path
+            state = load_state(state_file_path(task_name))
+            if state and state.get("dedicated_thread_id"):
+                target_id = state["dedicated_thread_id"]
+        except Exception:
+            pass
+    if target_id is None:
+        target_id = _coerce_target_id(task.get("thread_id"))
 
     raw_output = output_log.read_text(errors="replace") if output_log.exists() else ""
     parsed_response = backend.parse_response(raw_output, returncode)
     parsed_text = _normalize_backend_text(parsed_response)
+
+    # Spec 006 — journal step_complete for continuous tasks regardless of
+    # whether the delivery itself is SILENT. This keeps [GET_EVENTS]
+    # queries complete (FR-005 silent-step convention).
+    if is_continuous and task_name:
+        try:
+            import events as events_mod
+            outcome = "ok" if returncode == 0 else "failed"
+            events_mod.append(
+                task_name=task_name,
+                task_type="continuous",
+                event_type="step_complete",
+                outcome=outcome,
+                payload={"returncode": returncode},
+            )
+        except Exception:
+            pass
 
     if SILENT_PATTERN.search(parsed_text):
         residual = SILENT_PATTERN.sub("", parsed_text)
@@ -347,6 +380,14 @@ async def deliver_task_output(
             parsed_text = ""
         else:
             parsed_text = residual
+
+    if platform is None or target_id is None:
+        logger.warning(
+            "No delivery target for scheduled task '%s' (thread_id=%r)",
+            task.get("name"),
+            task.get("thread_id"),
+        )
+        return False
 
     message = _render_result_message(task, parsed_text, returncode, raw_output)
 
