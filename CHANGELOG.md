@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.27.1
+
+**Codex backend adapter for Codex CLI 0.124+.** Closes a field
+incident where every Codex-backed workspace failed on the first turn
+with `error: unexpected argument '-q' found`. Codex CLI 0.124 removed
+the legacy top-level `-q`, `--approval-policy`, and `--system-prompt`
+flags that `CodexBackend` had been emitting. No persisted state schema
+changes; the `v0_27_1` migration is a no-op. See `releases/0.27.1.md`
+for the full incident write-up.
+
+### Fixed
+
+- **`CodexBackend.build_command` rewritten for Codex CLI 0.124+.**
+  Now drives the `codex exec` subcommand with `--skip-git-repo-check`,
+  routes approval policy through `-c approval_policy="<value>"`
+  instead of the removed `--approval-policy` flag, and inlines the
+  system prompt into the user message between explicit
+  `<system_instructions>` / `<user_message>` tags (same pattern
+  OpenCode has used since 0.22.x). `--cd <work_dir>` and `--` always
+  emitted so prompts starting with a dash are not misread as flags.
+- **Spawn command parity.** `CodexBackend.build_spawn_command`
+  receives the same overhaul so scheduled / continuous Codex steps
+  also reach the model.
+
+### Tests
+
+- `tests/test_ai_backend.py` extended with regression coverage for the
+  new command shape (subcommand position, autonomy flags, `--cd`,
+  `--`, system-prompt inlining). 55 passed.
+
 ## 0.26.0
 
 **Continuous-task observability & lifecycle robustness** (spec 006).
