@@ -338,6 +338,30 @@ class TestReadStream:
         assert "Analyzing code" in call_kwargs.kwargs.get("text", call_kwargs[1].get("text", ""))
 
     @pytest.mark.asyncio
+    async def test_status_send_re_asserts_typing(self, mock_bot):
+        """Regression for v0.27.2: each interim STATUS message clears
+        Telegram's typing indicator visually, so _send_status must
+        immediately re-assert it. Without this re-assertion the user
+        sees a silent gap of up to one keep-alive interval (~3s) after
+        every status update."""
+        mock_proc = _make_mock_proc([
+            b'{"type":"assistant","message":{"content":[{"type":"text","text":"[STATUS Working] body"}]}}\n',
+            b'{"type":"result","subtype":"success","result":"done"}\n',
+            b"",
+        ])
+        backend = MagicMock()
+        await _read_stream(mock_proc, mock_bot, 123, 1, backend)
+
+        # Must have sent the status as a message AND re-asserted typing
+        # right after (in that order).
+        mock_bot.send_message.assert_called_once()
+        mock_bot.send_typing.assert_called_once()
+        # Both must target the same chat / thread the agent is reporting in.
+        typing_args = mock_bot.send_typing.await_args
+        assert typing_args.args[0] == 123
+        assert typing_args.args[1] == 1
+
+    @pytest.mark.asyncio
     async def test_strips_status_from_result(self, mock_bot):
         mock_proc = _make_mock_proc([
             b'{"type":"result","subtype":"success","result":"[STATUS Doing X] hello world"}\n',

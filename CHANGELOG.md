@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.27.2
+
+**Telegram typing-indicator continuity fix.** Closes a long-running
+UX complaint that the "writing..." indicator vanished for several
+seconds at a time while the agent was actively working — every
+interim STATUS message and every response chunk visually clears the
+indicator on the user's client, and the keep-alive loop alone left
+gaps of up to a full interval. No persisted state schema changes;
+the `v0_27_2` migration is a no-op. See `releases/0.27.2.md` for the
+full incident write-up.
+
+### Fixed
+
+- **Keep-alive cadence tightened from 4s to 3s.**
+  `bot/handlers.py::_typing_loop` now sleeps 3 seconds between
+  re-emissions, giving a ~2-second safety margin against Telegram's
+  ~5s chat-action TTL.
+- **`send_typing` re-asserted after every interim STATUS message.**
+  `bot/ai_invoke.py::_read_stream::_send_status` calls `send_typing`
+  immediately after the status `send_message` lands, so the indicator
+  is reinstated before the user perceives a gap.
+- **`send_typing` re-asserted between response chunks.**
+  `bot/handlers.py::_send_response` now calls `send_typing` between
+  every consecutive pair of chunks; deliberately not after the final
+  chunk so the indicator does not linger past the end of the response.
+
+### Tests
+
+- `tests/test_handlers.py::TestSendResponse::test_typing_re_asserted_between_response_chunks` —
+  records the order of `send_message` / `send_typing` calls during a
+  three-chunk response and asserts at least one `send_typing` lands
+  between every consecutive pair of chunks.
+- `tests/test_ai_invoke.py::TestReadStream::test_status_send_re_asserts_typing` —
+  asserts that after `_send_status` ships a `[STATUS …]` update the
+  platform's `send_typing` is called exactly once at the same chat /
+  thread coordinates. 245 passed (handlers + ai_invoke).
+
 ## 0.27.1
 
 **Codex backend adapter for Codex CLI 0.124+.** Closes a field

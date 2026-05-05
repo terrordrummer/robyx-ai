@@ -769,6 +769,55 @@ class TestSendResponse:
         assert "[robyx]" in fallback_kwargs["text"]
 
     @pytest.mark.asyncio
+    @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="long response")
+    @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
+    @patch("handlers.split_message", return_value=["chunk1", "chunk2", "chunk3"])
+    async def test_typing_re_asserted_between_response_chunks(
+        self, mock_split, mock_deleg, mock_focus, mock_invoke,
+        handlers, mock_platform, msg_ref,
+    ):
+        """Regression for v0.27.2: every outgoing message clears the
+        Telegram typing indicator visually on the user's client. When
+        the response is split into multiple chunks, the keep-alive loop
+        alone leaves up to ~3s of dead air between consecutive sends —
+        long enough that the user thinks the bot is done. Between every
+        pair of consecutive chunks there must be a send_typing call so
+        the indicator stays continuously visible."""
+        events: list[str] = []
+
+        async def record_send_message(*args, **kwargs):
+            events.append("send_message")
+
+        async def record_send_typing(*args, **kwargs):
+            events.append("send_typing")
+
+        mock_platform.send_message.side_effect = record_send_message
+        mock_platform.send_typing.side_effect = record_send_typing
+
+        msg = make_message(text="say a lot")
+        await handlers["message"](mock_platform, msg, msg_ref)
+
+        msg_indices = [i for i, e in enumerate(events) if e == "send_message"]
+        assert len(msg_indices) == 3, (
+            "expected 3 chunked send_message calls, got %d" % len(msg_indices)
+        )
+
+        # Between every consecutive pair of chunks there must be at
+        # least one send_typing event. We don't assert on what happens
+        # before the first chunk or after the last one because the
+        # early-typing fire-and-forget task and the keep-alive loop's
+        # first iteration may land in those positions depending on
+        # asyncio scheduling — those are tested elsewhere.
+        for i in range(len(msg_indices) - 1):
+            between = events[msg_indices[i] + 1 : msg_indices[i + 1]]
+            assert "send_typing" in between, (
+                "no send_typing between chunk %d and chunk %d — the "
+                "user would see the indicator vanish until the next "
+                "keep-alive tick" % (i, i + 1)
+            )
+
+    @pytest.mark.asyncio
     @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="x" * 5000)
     @patch("handlers.handle_focus_commands", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)
     @patch("handlers.handle_delegations", new_callable=AsyncMock, side_effect=lambda r, *a, **kw: r)

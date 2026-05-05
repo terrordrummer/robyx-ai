@@ -438,12 +438,19 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         stop_typing = asyncio.Event()
 
         async def _typing_loop():
+            # Telegram's typing chat-action TTL is ~5s. Re-assert every 3s
+            # so a missed tick (network blip, slow scheduler) still lands
+            # before the indicator vanishes on the user's client. Any
+            # outgoing message — interim STATUS update or response chunk —
+            # also clears the indicator visually, so the call sites that
+            # send during agent work re-trigger send_typing themselves;
+            # this loop is the safety net for the quiet stretches.
             while not stop_typing.is_set():
                 try:
                     await platform.send_typing(chat_id, thread_id)
                 except Exception:
                     pass
-                await asyncio.sleep(4)
+                await asyncio.sleep(3)
 
         typing_task = asyncio.create_task(_typing_loop())
         try:
@@ -1542,7 +1549,8 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         # Slack 4000). The tag prefix consumes a few dozen chars, leave a safe
         # margin so the prefixed payload still fits the platform cap.
         max_len = max(getattr(platform, "max_message_length", 4000) - 64, 256)
-        for chunk in split_message(response, max_len=max_len):
+        chunks = list(split_message(response, max_len=max_len))
+        for i, chunk in enumerate(chunks):
             try:
                 await platform.send_message(
                     chat_id=chat_id,
@@ -1556,6 +1564,16 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                     text="[%s]\n\n%s" % (agent.name, chunk),
                     thread_id=thread_id,
                 )
+            # Each outgoing message clears Telegram's typing indicator
+            # visually. Between chunks we re-assert it so the user keeps
+            # seeing "writing..." while more is on the way. Skip on the
+            # last chunk so the indicator doesn't linger after the
+            # response is complete.
+            if i < len(chunks) - 1:
+                try:
+                    await platform.send_typing(chat_id, thread_id)
+                except Exception:
+                    pass
 
     @owner_only
     async def handle_voice(platform, msg, msg_ref):

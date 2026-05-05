@@ -1010,6 +1010,16 @@ async def _read_stream(proc, platform, chat_id, effective_thread_id, backend):
             )
         except Exception as e:
             log.warning("Failed to send status update: %s", e)
+            return
+        # Telegram clears the typing indicator the moment any outgoing
+        # message lands. Re-assert it immediately so the user keeps
+        # seeing "writing..." while the agent continues to work between
+        # status updates — without this, every STATUS leaves up to one
+        # full keep-alive interval (~3s) of silent dead air.
+        try:
+            await platform.send_typing(chat_id, effective_thread_id)
+        except Exception:
+            pass
 
     # Liveness is idle-based: as long as the subprocess keeps emitting
     # stream-json lines we consider it alive and reset the timer at every
