@@ -72,6 +72,37 @@ def _validate_table_safe_display_name(display_name: str, kind: str) -> str:
     return value
 
 
+def _normalize_backend_choice(
+    backend: str | None,
+    *,
+    kind: str,
+    display_name: str,
+) -> str | None:
+    """Validate the optional per-agent backend override.
+
+    Returns ``None`` for empty / placeholder values (so the agent inherits
+    the global default), or the lowercased backend key for explicit
+    overrides. Unknown keys raise ``ValueError`` BEFORE any side effect:
+    callers create the channel / write the agent file / queue the task
+    *after* this validation, so a bad name never leaves debris.
+    """
+    if backend is None:
+        return None
+    value = str(backend).strip().lower()
+    if value in ("", "default", "none"):
+        return None
+    # Imported lazily so a future refactor of ai_backend cannot turn this
+    # into an import cycle (topics is imported very early by handlers).
+    from ai_backend import list_backends
+    supported = list_backends()
+    if value not in supported:
+        raise ValueError(
+            "cannot create %s '%s': unknown backend '%s' (supported: %s)"
+            % (kind, display_name, backend, ", ".join(sorted(supported)))
+        )
+    return value
+
+
 async def create_workspace(
     name: str,
     task_type: str,
@@ -82,14 +113,22 @@ async def create_workspace(
     manager: AgentManager,
     work_dir: str,
     platform=None,
+    backend: str | None = None,
 ) -> dict | None:
     """Full workspace creation: channel + agent file + tasks.md entry + agent registration.
+
+    ``backend`` is the optional per-workspace AI backend override. When set
+    (``"claude"`` / ``"codex"`` / ``"opencode"``) the workspace runs on that
+    CLI regardless of the global ``AI_BACKEND``. Unknown values are
+    rejected with ``ValueError`` BEFORE any side effect (channel, files,
+    queue entry) so a typo never leaves a half-created workspace behind.
 
     Returns dict with workspace info or None on failure.
     """
     display_name = _validate_table_safe_display_name(name, "workspace")
     safe_name = _sanitize_task_name(display_name)
     _validate_new_agent_name(safe_name, manager, "workspace")
+    backend = _normalize_backend_choice(backend, kind="workspace", display_name=display_name)
     normalized_scheduled_at = scheduled_at
     if task_type == "one-shot":
         normalized_scheduled_at = _validate_one_shot_scheduled_at(
@@ -120,7 +159,7 @@ async def create_workspace(
 
     # 3. Register the task in the unified queue
     if task_type == "one-shot":
-        _add_task({
+        entry = {
             "name": safe_name,
             "agent_file": "agents/%s.md" % safe_name,
             "prompt": "",
@@ -129,12 +168,15 @@ async def create_workspace(
             "model": model,
             "thread_id": str(thread_id),
             "description": display_name,
-        })
+        }
+        if backend:
+            entry["backend"] = backend
+        _add_task(entry)
     elif task_type == "scheduled":
         freq_str = frequency if frequency != "none" else "hourly"
         interval = FREQUENCY_SECONDS.get(freq_str, 3600)
         from datetime import datetime, timezone
-        _add_task({
+        entry = {
             "name": safe_name,
             "agent_file": "agents/%s.md" % safe_name,
             "type": "periodic",
@@ -143,7 +185,10 @@ async def create_workspace(
             "model": model,
             "thread_id": str(thread_id),
             "description": display_name,
-        })
+        }
+        if backend:
+            entry["backend"] = backend
+        _add_task(entry)
     # interactive workspaces don't go in the queue — agent-only
 
     # 4. Create data directory
@@ -157,6 +202,7 @@ async def create_workspace(
         agent_type="workspace",
         model=model,
         thread_id=thread_id,
+        backend=backend,
     )
 
     # 6. Send welcome message to the new channel
@@ -559,11 +605,19 @@ async def create_specialist(
     manager: AgentManager,
     work_dir: str,
     platform=None,
+    backend: str | None = None,
 ) -> dict | None:
-    """Create a cross-functional specialist agent."""
+    """Create a cross-functional specialist agent.
+
+    ``backend`` is the optional per-specialist AI backend override
+    (``"claude"`` / ``"codex"`` / ``"opencode"``); ``None`` keeps the
+    global default. Unknown values raise ``ValueError`` before any side
+    effect.
+    """
     display_name = _validate_table_safe_display_name(name, "specialist")
     safe_name = _sanitize_task_name(display_name)
     _validate_new_agent_name(safe_name, manager, "specialist")
+    backend = _normalize_backend_choice(backend, kind="specialist", display_name=display_name)
 
     # 1. Create channel/topic
     thread_id = await platform.create_channel("Specialist: %s" % display_name)
@@ -592,6 +646,7 @@ async def create_specialist(
         agent_type="specialist",
         model=model,
         thread_id=thread_id,
+        backend=backend,
     )
 
     # 5. Welcome message

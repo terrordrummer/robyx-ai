@@ -50,7 +50,7 @@ try:  # POSIX only; on Windows we fall back to thread-lock-only.
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
-from ai_backend import AIBackend
+from ai_backend import AIBackend, get_or_create_backend
 from config import (
     CLAIM_TIMEOUT_SECONDS,
     DATA_DIR,
@@ -1091,6 +1091,28 @@ async def check_lock_status(task_name: str) -> tuple[LockStatus, int | None]:
 # ── Dispatch: agent tasks (one-shot / periodic) ─────────────────────────────
 
 
+def _resolve_entry_backend(entry: dict, default: AIBackend) -> AIBackend:
+    """Return the backend to spawn this queue entry against.
+
+    A per-entry ``backend`` field (set by ``[CREATE_WORKSPACE ... backend="…"]``
+    when the workspace was created) wins over the global default. Lookup
+    failures (unknown name / missing CLI) log and fall back to *default*
+    so a misconfigured queue entry never silently halts the dispatch loop.
+    """
+    requested = entry.get("backend")
+    if not requested:
+        return default
+    try:
+        return get_or_create_backend(requested)
+    except (ValueError, FileNotFoundError) as exc:
+        log.error(
+            "Queue entry '%s' requested backend '%s' but it is unavailable (%s) — "
+            "falling back to global default",
+            entry.get("name"), requested, exc,
+        )
+        return default
+
+
 async def _spawn_agent_task(task: dict, backend: AIBackend, platform=None) -> int | None:
     """Spawn a one-shot or periodic task as an independent AI CLI process."""
     try:
@@ -1109,6 +1131,7 @@ async def _spawn_agent_task(task: dict, backend: AIBackend, platform=None) -> in
     runtime = resolve_task_runtime_context(task_for_runtime)
     lock_file = DATA_DIR / task_name / "lock"
     output_log = DATA_DIR / task_name / "output.log"
+    backend = _resolve_entry_backend(task, backend)
     model = resolve_model_preference(
         task.get("model"), backend, role=task.get("type", "one-shot"),
     )
@@ -1523,17 +1546,18 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             )
 
             # Spawn the step agent
+            step_backend = _resolve_entry_backend(entry, backend)
             model = resolve_model_preference(
-                entry.get("model"), backend, role="continuous",
+                entry.get("model"), step_backend, role="continuous",
             )
             work_dir = state.get("work_dir", "")
 
-            cmd = backend.build_spawn_command(
+            cmd = step_backend.build_spawn_command(
                 prompt=prompt,
                 model=model,
                 work_dir=work_dir,
             )
-            stdin_payload = backend.spawn_stdin_payload(prompt)
+            stdin_payload = step_backend.spawn_stdin_payload(prompt)
 
             (DATA_DIR / name).mkdir(parents=True, exist_ok=True)
             output_log = DATA_DIR / name / "output.log"
@@ -1559,7 +1583,7 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                 _write_lock_file(lock_file, proc.pid)
 
                 # Start delivery watcher for output relay
-                start_task_delivery_watch(entry, proc, output_log, lock_file, platform, backend, log)
+                start_task_delivery_watch(entry, proc, output_log, lock_file, platform, step_backend, log)
 
                 dispatched.append((name, proc.pid))
                 append_log("%s -- DISPATCHED -- step %d PID %d" % (name, step_number, proc.pid))

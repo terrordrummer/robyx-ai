@@ -645,3 +645,53 @@ class TestOnDemandAutoDemote:
                 state, "x",
             ) is False
             assert state["status"] == status
+
+
+class TestResolveEntryBackend:
+    """``_resolve_entry_backend`` powers the per-workspace backend
+    override on the scheduler side: it picks the backend that ``[CREATE_
+    WORKSPACE ... backend="…"]`` recorded in the queue entry, falling
+    back to the caller-supplied global default when the entry has no
+    preference or when the requested CLI is unavailable."""
+
+    def _default_backend(self):
+        from ai_backend import ClaudeBackend
+        return ClaudeBackend("/usr/bin/claude")
+
+    def test_returns_default_when_no_backend_field(self):
+        default = self._default_backend()
+        result = sched_mod._resolve_entry_backend({"name": "t"}, default)
+        assert result is default
+
+    def test_returns_default_when_backend_is_empty(self):
+        default = self._default_backend()
+        result = sched_mod._resolve_entry_backend(
+            {"name": "t", "backend": ""}, default,
+        )
+        assert result is default
+
+    def test_swaps_to_requested_backend(self):
+        from ai_backend import CodexBackend
+        default = self._default_backend()
+        codex = CodexBackend("/usr/bin/codex")
+        with patch.object(
+            sched_mod, "get_or_create_backend", return_value=codex,
+        ) as mock_lookup:
+            result = sched_mod._resolve_entry_backend(
+                {"name": "t", "backend": "codex"}, default,
+            )
+        assert result is codex
+        mock_lookup.assert_called_once_with("codex")
+
+    def test_falls_back_when_lookup_raises(self, caplog):
+        default = self._default_backend()
+        with patch.object(
+            sched_mod, "get_or_create_backend",
+            side_effect=FileNotFoundError("codex CLI missing"),
+        ):
+            with caplog.at_level("ERROR", logger="robyx.scheduler"):
+                result = sched_mod._resolve_entry_backend(
+                    {"name": "t", "backend": "codex"}, default,
+                )
+        assert result is default
+        assert any("unavailable" in r.getMessage() for r in caplog.records)

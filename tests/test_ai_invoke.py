@@ -105,6 +105,30 @@ class TestCreateWorkspacePattern:
         assert m.group(3) == "daily"
         assert m.group(4) == "sonnet"
         assert m.group(5) == "09:00"
+        # Backend is optional and absent here.
+        assert m.group(6) is None
+
+    def test_full_match_with_backend(self):
+        text = (
+            '[CREATE_WORKSPACE name="codex-app" type="interactive" '
+            'frequency="none" model="balanced" scheduled_at="none" '
+            'backend="codex"]'
+        )
+        m = CREATE_WORKSPACE_PATTERN.search(text)
+        assert m is not None
+        assert m.group(1) == "codex-app"
+        assert m.group(6) == "codex"
+
+    def test_match_without_backend_back_compat(self):
+        """0.26.x-shaped tags must keep matching after the optional
+        ``backend="…"`` group was added."""
+        text = (
+            '[CREATE_WORKSPACE name="legacy" type="interactive" '
+            'frequency="none" model="balanced" scheduled_at="none"]'
+        )
+        m = CREATE_WORKSPACE_PATTERN.search(text)
+        assert m is not None
+        assert m.group(6) is None
 
 
 class TestAgentInstructionsPattern:
@@ -135,6 +159,17 @@ class TestCreateSpecialistPattern:
         assert m is not None
         assert m.group(1) == "reviewer"
         assert m.group(2) == "opus"
+        # Backend is optional and absent here.
+        assert m.group(3) is None
+
+    def test_match_with_backend(self):
+        m = CREATE_SPECIALIST_PATTERN.search(
+            '[CREATE_SPECIALIST name="codex-pair" model="balanced" backend="codex"]'
+        )
+        assert m is not None
+        assert m.group(1) == "codex-pair"
+        assert m.group(2) == "balanced"
+        assert m.group(3) == "codex"
 
 
 class TestSpecialistInstructionsPattern:
@@ -656,6 +691,122 @@ class TestInvokeAiLocked:
         call_kwargs = mock_build.call_args
         prompt = call_kwargs.kwargs.get("system_prompt") or call_kwargs[1].get("system_prompt", "")
         assert WORKSPACE_AGENT_SYSTEM_PROMPT in prompt
+
+    @pytest.mark.asyncio
+    async def test_per_agent_backend_overrides_caller_default(
+        self, agent_manager, mock_bot, claude_backend, codex_backend, tmp_path
+    ):
+        """When ``agent.backend`` is set (``[CREATE_WORKSPACE ... backend="codex"]``),
+        the invocation must build the CLI command via the agent's backend
+        and ignore the caller-supplied global default."""
+        agent_manager.add_agent(
+            "codex-app", str(tmp_path), "Codex App",
+            agent_type="workspace", backend="codex",
+        )
+        agent = agent_manager.get("codex-app")
+        proc = _make_mock_process()
+
+        with patch(
+            "ai_invoke.get_or_create_backend",
+            return_value=codex_backend,
+        ) as mock_lookup, patch(
+            "ai_invoke.asyncio.create_subprocess_exec",
+            return_value=proc,
+        ), patch.object(
+            codex_backend, "supports_streaming", return_value=False,
+        ), patch.object(
+            codex_backend, "build_command", return_value=["codex"],
+        ) as mock_codex_build, patch.object(
+            codex_backend, "parse_response", return_value="ok",
+        ), patch.object(
+            claude_backend, "build_command",
+        ) as mock_claude_build:
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b"output", b""))
+            await _invoke_ai_locked(
+                agent, "hi", 123, mock_bot, agent_manager, claude_backend,
+                False, None, 0, None,
+            )
+
+        mock_lookup.assert_called_once_with("codex")
+        mock_codex_build.assert_called_once()
+        mock_claude_build.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_per_agent_backend_falls_back_when_lookup_fails(
+        self, agent_manager, mock_bot, claude_backend, tmp_path, caplog,
+    ):
+        """If the pinned backend is unavailable (CLI missing / unknown
+        name), the invocation falls back to the caller-supplied global
+        default rather than killing the turn — and logs the failure."""
+        agent_manager.add_agent(
+            "codex-app", str(tmp_path), "Codex App",
+            agent_type="workspace", backend="codex",
+        )
+        agent = agent_manager.get("codex-app")
+        proc = _make_mock_process()
+
+        with patch(
+            "ai_invoke.get_or_create_backend",
+            side_effect=FileNotFoundError("codex CLI not on PATH"),
+        ), patch(
+            "ai_invoke.asyncio.create_subprocess_exec",
+            return_value=proc,
+        ), patch.object(
+            claude_backend, "supports_streaming", return_value=False,
+        ), patch.object(
+            claude_backend, "build_command", return_value=["claude"],
+        ) as mock_claude_build, patch.object(
+            claude_backend, "parse_response", return_value="ok",
+        ):
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b"output", b""))
+            with caplog.at_level("ERROR", logger="robyx.invoke"):
+                result = await _invoke_ai_locked(
+                    agent, "hi", 123, mock_bot, agent_manager, claude_backend,
+                    False, None, 0, None,
+                )
+
+        assert result == "ok"
+        mock_claude_build.assert_called_once()
+        assert any(
+            "codex" in r.getMessage() and "unavailable" in r.getMessage()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_agent_backend_does_not_invoke_lookup(
+        self, agent_manager, mock_bot, claude_backend, tmp_path
+    ):
+        """Default workspaces (no ``agent.backend`` pinned) must NOT
+        touch the per-agent backend cache — preserves the 0.26.x code
+        path exactly."""
+        agent_manager.add_agent(
+            "default-bend", str(tmp_path), "Default", agent_type="workspace",
+        )
+        agent = agent_manager.get("default-bend")
+        proc = _make_mock_process()
+
+        with patch(
+            "ai_invoke.get_or_create_backend",
+        ) as mock_lookup, patch(
+            "ai_invoke.asyncio.create_subprocess_exec",
+            return_value=proc,
+        ), patch.object(
+            claude_backend, "supports_streaming", return_value=False,
+        ), patch.object(
+            claude_backend, "build_command", return_value=["claude"],
+        ), patch.object(
+            claude_backend, "parse_response", return_value="ok",
+        ):
+            proc.returncode = 0
+            proc.communicate = AsyncMock(return_value=(b"output", b""))
+            await _invoke_ai_locked(
+                agent, "hi", 123, mock_bot, agent_manager, claude_backend,
+                False, None, 0, None,
+            )
+
+        mock_lookup.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_workspace_invocation_uses_stored_work_dir_for_memory_and_subprocess(

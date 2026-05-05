@@ -41,7 +41,7 @@ def _scrubbed_child_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k not in _SCRUBBED_ENV_KEYS}
 
 from agents import Agent, AgentManager
-from ai_backend import AIBackend
+from ai_backend import AIBackend, get_or_create_backend
 from config import (
     AGENTS_DIR,
     AI_IDLE_TIMEOUT,
@@ -77,14 +77,23 @@ DELEGATION_PATTERN = re.compile(r'\[DELEGATE\s+@(\w+):\s*(.+?)\]', re.DOTALL)
 FOCUS_PATTERN = re.compile(r'\[FOCUS\s+@(\w+)\]')
 FOCUS_OFF_PATTERN = re.compile(r'\[FOCUS\s+off\]', re.IGNORECASE)
 
-# Workspace creation: [CREATE_WORKSPACE name="x" type="scheduled" frequency="hourly" model="sonnet" scheduled_at="none"]
+# Workspace creation. Required attributes (in order): ``name``, ``type``,
+# ``frequency``, ``model``, ``scheduled_at``. The trailing ``backend`` is
+# optional — when present, the workspace runs against a non-default AI CLI
+# (``claude`` / ``codex`` / ``opencode``) without changing the global
+# ``AI_BACKEND``. Capture groups: 1 name, 2 type, 3 frequency, 4 model,
+# 5 scheduled_at, 6 backend (None when omitted).
+#   [CREATE_WORKSPACE name="x" type="scheduled" frequency="hourly" model="sonnet" scheduled_at="none"]
+#   [CREATE_WORKSPACE name="codex-app" type="interactive" frequency="none" model="balanced" scheduled_at="none" backend="codex"]
 CREATE_WORKSPACE_PATTERN = re.compile(
     r'\[CREATE_WORKSPACE\s+'
     r'name="([^"]+)"\s+'
     r'type="([^"]+)"\s+'
     r'frequency="([^"]+)"\s+'
     r'model="([^"]+)"\s+'
-    r'scheduled_at="([^"]+)"\s*\]',
+    r'scheduled_at="([^"]+)"'
+    r'(?:\s+backend="([^"]+)")?'
+    r'\s*\]',
     re.DOTALL,
 )
 AGENT_INSTRUCTIONS_PATTERN = re.compile(
@@ -134,9 +143,14 @@ UPDATE_PLAN_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# Specialist creation
+# Specialist creation. Capture groups: 1 name, 2 model, 3 backend (None
+# when the optional ``backend="..."`` attribute is omitted).
+#   [CREATE_SPECIALIST name="reviewer" model="opus"]
+#   [CREATE_SPECIALIST name="codex-pair" model="balanced" backend="codex"]
 CREATE_SPECIALIST_PATTERN = re.compile(
-    r'\[CREATE_SPECIALIST\s+name="([^"]+)"\s+model="([^"]+)"\s*\]'
+    r'\[CREATE_SPECIALIST\s+name="([^"]+)"\s+model="([^"]+)"'
+    r'(?:\s+backend="([^"]+)")?'
+    r'\s*\]'
 )
 SPECIALIST_INSTRUCTIONS_PATTERN = re.compile(
     r'\[SPECIALIST_INSTRUCTIONS\](.*?)\[/SPECIALIST_INSTRUCTIONS\]', re.DOTALL
@@ -571,6 +585,24 @@ def _agent_model_role(agent: Agent) -> str:
     return "workspace"
 
 
+def _backend_short_name(backend: AIBackend) -> str:
+    """Return the short config key for a backend instance.
+
+    Mirrors :func:`bot.model_preferences.get_backend_key` but kept local to
+    avoid a circular import; both helpers must agree on the same short
+    keys (``claude`` / ``codex`` / ``opencode``) used by ``[CREATE_WORKSPACE
+    ... backend="…"]`` and ``models.yaml``.
+    """
+    name_attr = getattr(backend, "name", "") or ""
+    first = name_attr.split()[0].strip().lower() if name_attr else ""
+    if first in ("claude", "codex", "opencode"):
+        return first
+    cls_name = backend.__class__.__name__.lower()
+    if cls_name.endswith("backend"):
+        cls_name = cls_name[:-7]
+    return cls_name
+
+
 def _is_rate_limited(text: str) -> bool:
     return any(kw in text for kw in RATE_LIMIT_KEYWORDS)
 
@@ -647,6 +679,22 @@ async def _invoke_ai_locked(
     agent, message, chat_id, platform, manager, backend,
     is_orchestrator_call, model, _retry, thread_id,
 ):
+    # Per-agent backend override. The caller passes the global default; if
+    # this agent pinned itself to a different backend at creation time
+    # (``[CREATE_WORKSPACE ... backend="codex"]``) we swap to that one for
+    # the rest of the invocation. On lookup failure we keep the supplied
+    # default rather than fail the turn — the user gets *some* answer
+    # instead of a hard error every time the configured CLI is missing.
+    if agent.backend and agent.backend != _backend_short_name(backend):
+        try:
+            backend = get_or_create_backend(agent.backend)
+        except (ValueError, FileNotFoundError) as exc:
+            log.error(
+                "Agent [%s] requested backend '%s' but it is unavailable (%s) — "
+                "falling back to global default '%s'",
+                agent.name, agent.backend, exc, _backend_short_name(backend),
+            )
+
     # Resolve the actual model id to pass to the backend. Caller-provided
     # value wins; otherwise we use the agent's stored preference; otherwise
     # the role default from models.yaml.

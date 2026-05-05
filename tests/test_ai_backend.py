@@ -11,7 +11,9 @@ from ai_backend import (
     CodexBackend,
     OpenCodeBackend,
     create_backend,
+    get_or_create_backend,
     list_backends,
+    reset_backend_cache,
 )
 
 
@@ -500,3 +502,36 @@ class TestFactory:
     def test_list_backends(self):
         result = list_backends()
         assert result == ["claude", "codex", "opencode"]
+
+
+class TestBackendInstanceCache:
+    """``get_or_create_backend`` powers the per-agent backend override:
+    invocations may swap backends per turn, so the factory must cache
+    instances rather than re-run init side effects (notably OpenCode's
+    managed-config write) on every call."""
+
+    def test_returns_same_instance_on_repeat_calls(self):
+        reset_backend_cache()
+        a = get_or_create_backend("claude", "/path/to/claude")
+        b = get_or_create_backend("claude", "/path/to/claude")
+        assert a is b
+
+    def test_different_cli_paths_get_distinct_instances(self):
+        reset_backend_cache()
+        a = get_or_create_backend("claude", "/path/A/claude")
+        b = get_or_create_backend("claude", "/path/B/claude")
+        assert a is not b
+        assert a.cli_path == "/path/A/claude"
+        assert b.cli_path == "/path/B/claude"
+
+    def test_unknown_backend_propagates_value_error(self):
+        reset_backend_cache()
+        with pytest.raises(ValueError, match="Unknown backend"):
+            get_or_create_backend("nonsense", "/whatever")
+
+    def test_reset_clears_cache(self):
+        reset_backend_cache()
+        a = get_or_create_backend("claude", "/path/to/claude")
+        reset_backend_cache()
+        b = get_or_create_backend("claude", "/path/to/claude")
+        assert a is not b

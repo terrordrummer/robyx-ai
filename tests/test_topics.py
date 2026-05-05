@@ -691,6 +691,171 @@ class TestCreateWorkspacePersistsModel:
 
 
 # ---------------------------------------------------------------------------
+# Per-workspace / per-specialist backend override (0.27.0)
+# ---------------------------------------------------------------------------
+
+
+class TestPerAgentBackendOverride:
+    """``[CREATE_WORKSPACE ... backend="…"]`` and the matching specialist
+    form must record the chosen backend on the in-memory Agent so future
+    interactive turns route to that CLI, AND on the queue entry so the
+    scheduler dispatches the same way for periodic / one-shot runs.
+    Unknown backends are rejected up front, before any side effect."""
+
+    @pytest.mark.asyncio
+    async def test_workspace_stores_backend_on_agent(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        mock_platform.create_channel = AsyncMock(return_value=901)
+
+        await topics.create_workspace(
+            name="Codex App",
+            task_type="interactive",
+            frequency="none",
+            model="balanced",
+            scheduled_at="none",
+            instructions="x",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+            backend="codex",
+        )
+
+        agent = agent_manager.get("codex-app")
+        assert agent is not None
+        assert agent.backend == "codex"
+
+    @pytest.mark.asyncio
+    async def test_specialist_stores_backend_on_agent(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        mock_platform.create_channel = AsyncMock(return_value=902)
+
+        await topics.create_specialist(
+            name="Codex Pair",
+            model="balanced",
+            instructions="x",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+            backend="codex",
+        )
+
+        agent = agent_manager.get("codex-pair")
+        assert agent is not None
+        assert agent.backend == "codex"
+
+    @pytest.mark.asyncio
+    async def test_workspace_writes_backend_into_queue_entry(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        """Periodic workspaces must carry their backend preference into
+        ``queue.json`` so the scheduler dispatches against the right CLI."""
+        mock_platform.create_channel = AsyncMock(return_value=903)
+
+        await topics.create_workspace(
+            name="Codex Monitor",
+            task_type="scheduled",
+            frequency="hourly",
+            model="balanced",
+            scheduled_at="none",
+            instructions="x",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+            backend="codex",
+        )
+
+        queue_path = tmp_path / "data" / "queue.json"
+        queue = json.loads(queue_path.read_text())
+        entry = next(e for e in queue if e.get("name") == "codex-monitor")
+        assert entry.get("backend") == "codex"
+
+    @pytest.mark.asyncio
+    async def test_workspace_without_backend_does_not_emit_field(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        """Default-backend workspaces must keep the queue entry shape
+        identical to what 0.26.x wrote — no spurious ``"backend": null``
+        keys that would surface in the live state."""
+        mock_platform.create_channel = AsyncMock(return_value=904)
+
+        await topics.create_workspace(
+            name="Default Bend",
+            task_type="scheduled",
+            frequency="hourly",
+            model="balanced",
+            scheduled_at="none",
+            instructions="x",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+        )
+
+        queue_path = tmp_path / "data" / "queue.json"
+        queue = json.loads(queue_path.read_text())
+        entry = next(e for e in queue if e.get("name") == "default-bend")
+        assert "backend" not in entry
+
+    @pytest.mark.asyncio
+    async def test_unknown_backend_rejected_with_value_error(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        """Bad backend names must not leave a half-created workspace
+        behind — channel creation, agent file, queue entry must all be
+        skipped."""
+        mock_platform.create_channel = AsyncMock(return_value=905)
+
+        with pytest.raises(ValueError, match="unknown backend"):
+            await topics.create_workspace(
+                name="Bad Backend",
+                task_type="interactive",
+                frequency="none",
+                model="balanced",
+                scheduled_at="none",
+                instructions="x",
+                manager=agent_manager,
+                work_dir=str(tmp_path),
+                platform=mock_platform,
+                backend="nonsense-cli",
+            )
+
+        # No agent registered; no channel attempted; no queue entry.
+        assert agent_manager.get("bad-backend") is None
+        mock_platform.create_channel.assert_not_awaited()
+        queue_path = tmp_path / "data" / "queue.json"
+        if queue_path.exists():
+            queue = json.loads(queue_path.read_text())
+            assert all(e.get("name") != "bad-backend" for e in queue)
+
+    @pytest.mark.asyncio
+    async def test_blank_backend_is_treated_as_default(
+        self, tmp_path, agent_manager, mock_platform
+    ):
+        """An empty / placeholder backend string must fall back to the
+        global default rather than raise — so an orchestrator that
+        emits ``backend=""`` by accident does not block creation."""
+        mock_platform.create_channel = AsyncMock(return_value=906)
+
+        await topics.create_workspace(
+            name="Blank Bend",
+            task_type="interactive",
+            frequency="none",
+            model="balanced",
+            scheduled_at="none",
+            instructions="x",
+            manager=agent_manager,
+            work_dir=str(tmp_path),
+            platform=mock_platform,
+            backend="",
+        )
+
+        agent = agent_manager.get("blank-bend")
+        assert agent is not None
+        assert agent.backend is None
+
+
+# ---------------------------------------------------------------------------
 # _update_table_thread_id helpers
 # ---------------------------------------------------------------------------
 

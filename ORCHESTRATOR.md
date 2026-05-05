@@ -18,6 +18,17 @@ When the user asks for something that needs its own space (monitoring, reminders
    [CREATE_WORKSPACE name="<display name>" type="<interactive|scheduled|one-shot>" frequency="<hourly|every-6h|daily|none>" model="<fast|balanced|powerful or explicit model id>" scheduled_at="<ISO datetime or none>"]
    ```
 
+   **Optional `backend="…"` attribute** (placed after `scheduled_at`):
+   pins this single workspace to a non-default AI CLI without touching
+   the global `AI_BACKEND`. Supported values: `claude`, `codex`,
+   `opencode`. Use this only when the user explicitly asks for a
+   different model provider for one specific workspace
+   (e.g. *"create a workspace that works with Codex"*).
+
+   ```
+   [CREATE_WORKSPACE name="codex-app" type="interactive" frequency="none" model="balanced" scheduled_at="none" backend="codex"]
+   ```
+
 2. Follow it with the agent instructions:
    ```
    [AGENT_INSTRUCTIONS]
@@ -49,6 +60,13 @@ When you notice a need for a horizontal expert, or the user asks for one:
 [SPECIALIST_INSTRUCTIONS]
 <full instructions for the specialist>
 [/SPECIALIST_INSTRUCTIONS]
+```
+
+`[CREATE_SPECIALIST]` accepts the same optional `backend="…"` attribute as
+`[CREATE_WORKSPACE]` for the rare case where one specialist must run on
+a different AI CLI than the rest of the fleet:
+```
+[CREATE_SPECIALIST name="codex-pair" model="balanced" backend="codex"]
 ```
 
 ### Delegating Work

@@ -42,6 +42,7 @@ class TestAgent:
         d = a.to_dict()
         expected_keys = {
             "name", "work_dir", "description", "agent_type", "model",
+            "backend",
             "session_id", "created_at", "last_used", "message_count",
             "session_started", "thread_id", "collab_workspace_id",
         }
@@ -125,6 +126,24 @@ class TestAgent:
 
         a = Agent(name="m", work_dir="/w", description="d")
         assert a.model is None
+
+    def test_backend_field_round_trips(self):
+        """``Agent.backend`` is the per-agent AI-backend override. It must
+        survive a to_dict/from_dict round trip so a workspace pinned to
+        Codex stays on Codex across bot restarts."""
+        from agents import Agent
+
+        a = Agent(
+            name="b", work_dir="/w", description="d", backend="codex",
+        )
+        restored = Agent.from_dict(a.to_dict())
+        assert restored.backend == "codex"
+
+    def test_backend_defaults_to_none(self):
+        from agents import Agent
+
+        a = Agent(name="b", work_dir="/w", description="d")
+        assert a.backend is None
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +571,32 @@ class TestAddRemoveAgents:
         fresh_manager.add_agent("k", "/k", "k", "workspace", model="fast")
         fresh_manager.add_agent("k", "/k", "k", "workspace", model="powerful")
         assert fresh_manager.get("k").model == "powerful"
+
+    def test_add_agent_persists_backend_preference(self, fresh_manager):
+        """A workspace pinned to a non-default backend at creation time
+        (``[CREATE_WORKSPACE ... backend="codex"]``) must keep that
+        preference across bot restarts."""
+        a = fresh_manager.add_agent(
+            "cx", "/cx", "cx", "workspace", backend="codex",
+        )
+        assert a.backend == "codex"
+        from agents import AgentManager
+        reloaded = AgentManager()
+        assert reloaded.get("cx").backend == "codex"
+
+    def test_add_agent_preserves_existing_backend_when_none_supplied(
+        self, fresh_manager
+    ):
+        """Re-adding the same agent without a backend arg must NOT erase
+        the previously stored override (same protection as ``model``)."""
+        fresh_manager.add_agent(
+            "cx2", "/cx", "cx", "workspace", backend="codex",
+        )
+        fresh_manager.add_agent(
+            "cx2", "/cx", "new desc", "workspace", thread_id=33,
+        )
+        assert fresh_manager.get("cx2").backend == "codex"
+        assert fresh_manager.get("cx2").thread_id == 33
 
     def test_remove_normal_agent(self, fresh_manager):
         fresh_manager.add_agent("tmp", "/tmp", "temp", "workspace")

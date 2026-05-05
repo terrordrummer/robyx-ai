@@ -497,3 +497,35 @@ def create_backend(backend_name: str, cli_path: str | None = None) -> AIBackend:
 def list_backends() -> list[str]:
     """Return list of supported backend names."""
     return list(_BACKENDS.keys())
+
+
+# Per-agent backend selection (workspaces / specialists / scheduled tasks may
+# pin themselves to a non-default backend) calls the factory at invocation
+# time, so we cache instances to avoid re-running per-backend init side
+# effects on every turn — most importantly OpenCode's managed-config write.
+_BACKEND_INSTANCE_CACHE: dict[tuple[str, str], AIBackend] = {}
+
+
+def get_or_create_backend(backend_name: str, cli_path: str | None = None) -> AIBackend:
+    """Return a cached backend instance, creating it on first use.
+
+    Intended for the per-agent backend override path: when many turns may
+    flow through ``invoke_ai`` for an agent whose ``backend`` differs from
+    the global default, we don't want to pay the construction cost (and,
+    for OpenCode, the on-disk config write) on every call.
+
+    Tests that mutate environment between calls can clear the cache via
+    :func:`reset_backend_cache`.
+    """
+    key = (backend_name, cli_path or "")
+    cached = _BACKEND_INSTANCE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    instance = create_backend(backend_name, cli_path)
+    _BACKEND_INSTANCE_CACHE[key] = instance
+    return instance
+
+
+def reset_backend_cache() -> None:
+    """Clear the per-agent backend instance cache. Test-only helper."""
+    _BACKEND_INSTANCE_CACHE.clear()

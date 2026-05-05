@@ -44,6 +44,7 @@ class Agent:
     description: str
     agent_type: str = "workspace"  # workspace, specialist, orchestrator
     model: str | None = None  # semantic alias or explicit backend model id
+    backend: str | None = None  # per-agent backend override ("claude", "codex", "opencode"); None ⇒ global default
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     created_at: float = field(default_factory=time.time)
     last_used: float = field(default_factory=time.time)
@@ -114,6 +115,7 @@ class Agent:
             "description": self.description,
             "agent_type": self.agent_type,
             "model": self.model,
+            "backend": self.backend,
             "session_id": self.session_id,
             "created_at": self.created_at,
             "last_used": self.last_used,
@@ -307,10 +309,13 @@ class AgentManager:
         agent_type: str = "workspace",
         model: str | None = None,
         thread_id: Any = None,
+        backend: str | None = None,
     ) -> Agent:
         """Concurrent-safe variant of :meth:`add_agent`."""
         async with self._agents_lock:
-            return self.add_agent(name, work_dir, description, agent_type, model, thread_id)
+            return self.add_agent(
+                name, work_dir, description, agent_type, model, thread_id, backend,
+            )
 
     def add_agent(
         self,
@@ -320,6 +325,7 @@ class AgentManager:
         agent_type: str = "workspace",
         model: str | None = None,
         thread_id: Any = None,
+        backend: str | None = None,
     ) -> Agent:
         """Add or update an agent.
 
@@ -327,6 +333,13 @@ class AgentManager:
         explicit backend model id the agent should run with by default.
         Resolved to a concrete model id at invocation time by
         :func:`bot.model_preferences.resolve_model_preference`.
+
+        ``backend`` overrides the global ``AI_BACKEND`` for this agent only
+        (``"claude"`` / ``"codex"`` / ``"opencode"``). ``None`` keeps the
+        installation-wide default — that is the normal case. Setting it lets
+        a single workspace run on a different CLI without touching the rest
+        of the fleet (e.g. a Codex-driven workspace alongside Claude-driven
+        ones).
 
         For concurrent-safe usage from async code, prefer :meth:`async_add_agent`.
         """
@@ -338,6 +351,8 @@ class AgentManager:
             agent.description = description or agent.description
             if model:
                 agent.model = model
+            if backend:
+                agent.backend = backend
         else:
             agent = Agent(
                 name=name,
@@ -345,6 +360,7 @@ class AgentManager:
                 description=description,
                 agent_type=agent_type,
                 model=model,
+                backend=backend,
                 thread_id=thread_id,
             )
             self.agents[name] = agent

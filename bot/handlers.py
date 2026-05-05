@@ -1161,6 +1161,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 ws_freq = ws_match.group(3)
                 ws_model = ws_match.group(4)
                 ws_sched = ws_match.group(5)
+                ws_backend = ws_match.group(6)  # None when backend="..." omitted
                 instructions = instr_matches[i].group(1).strip() if i < len(instr_matches) else ""
 
                 if len(ws_matches) > 1:
@@ -1186,6 +1187,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                         manager=manager,
                         work_dir=str(WORKSPACE),
                         platform=platform,
+                        backend=ws_backend,
                     )
                 except ValueError as e:
                     # Reserved name / duplicate name — surface the reason
@@ -1231,6 +1233,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             for i, spec_match in enumerate(spec_matches):
                 spec_name = spec_match.group(1)
                 spec_model = spec_match.group(2)
+                spec_backend = spec_match.group(3)  # None when backend="..." omitted
                 instructions = spec_instr_matches[i].group(1).strip() if i < len(spec_instr_matches) else ""
 
                 rejection_reason = None
@@ -1242,6 +1245,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                         manager=manager,
                         work_dir=str(WORKSPACE),
                         platform=platform,
+                        backend=spec_backend,
                     )
                 except ValueError as e:
                     log.warning("create_specialist(%s) rejected: %s", spec_name, e)
