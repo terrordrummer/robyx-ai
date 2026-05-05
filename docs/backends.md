@@ -19,7 +19,7 @@ When using Claude Code, responses are **streamed in real-time**. Agents can emit
 Robyx ships every backend with the most permissive, non-interactive execution policy, since agents run headless and cannot answer approval prompts:
 
 - **Claude Code** — `--permission-mode bypassPermissions`. Override with `CLAUDE_PERMISSION_MODE`.
-- **Codex** — `--approval-policy never --sandbox danger-full-access`. Override with `CODEX_APPROVAL_POLICY` / `CODEX_SANDBOX`.
+- **Codex** — invoked as `codex exec` (Codex CLI 0.124+) with `-c approval_policy="never" --sandbox danger-full-access`. Override with `CODEX_APPROVAL_POLICY` / `CODEX_SANDBOX`.
 - **OpenCode** — managed `opencode-managed.json` config with `"permission": "allow"`, wired via `OPENCODE_CONFIG`. Override with `OPENCODE_PERMISSION` (or set `OPENCODE_CONFIG` explicitly to point at your own config).
 
 This is **intentionally unsafe**: agents can read/write anywhere on the disk and run any shell command. If you need stricter isolation, flip the relevant env var. On Linux systems with enterprise MDM that sets `permissions.disableBypassPermissionsMode: disable`, Claude will enforce the restriction regardless of what Robyx asks for.

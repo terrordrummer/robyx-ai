@@ -181,11 +181,13 @@ class ClaudeBackend(AIBackend):
 class CodexBackend(AIBackend):
     """OpenAI Codex CLI backend.
 
-    Defaults to unsafe autonomous execution (``--approval-policy never
-    --sandbox danger-full-access``) so spawned agents can actually modify the
-    workspace without human prompts. Override per-deployment via
-    ``CODEX_APPROVAL_POLICY`` / ``CODEX_SANDBOX`` env vars when a stricter
-    policy is explicitly required.
+    Targets ``codex exec`` (non-interactive subcommand) on Codex CLI 0.124+,
+    where the legacy top-level ``-q``/``--approval-policy``/``--system-prompt``
+    flags no longer exist. Defaults to unsafe autonomous execution
+    (``approval_policy=never`` + ``--sandbox danger-full-access``) so spawned
+    agents can modify the workspace without human prompts. Override
+    per-deployment via ``CODEX_APPROVAL_POLICY`` / ``CODEX_SANDBOX`` env vars
+    when a stricter policy is explicitly required.
     """
 
     DEFAULT_APPROVAL_POLICY = "never"
@@ -219,29 +221,60 @@ class CodexBackend(AIBackend):
         return False
 
     def _autonomy_flags(self) -> list[str]:
+        # Codex CLI 0.124+ removed --approval-policy in favour of TOML
+        # config overrides (-c approval_policy=...). --sandbox still exists.
         flags: list[str] = []
         if self.approval_policy:
-            flags.extend(["--approval-policy", self.approval_policy])
+            flags.extend(["-c", 'approval_policy="%s"' % self.approval_policy])
         if self.sandbox:
             flags.extend(["--sandbox", self.sandbox])
         return flags
 
+    @staticmethod
+    def _compose_message(message: str, system_prompt: str | None) -> str:
+        """Inline the system prompt into the user message.
+
+        Codex `exec` does not accept a separate system-prompt flag, so the
+        orchestrator's system instructions are wrapped in tagged sections
+        inside the user message — same pattern used for OpenCode.
+        """
+        if not system_prompt:
+            return message
+        return (
+            "Follow these system instructions exactly. They override any "
+            "conflicting defaults.\n\n"
+            "<system_instructions>\n"
+            "%s\n"
+            "</system_instructions>\n\n"
+            "<user_message>\n"
+            "%s\n"
+            "</user_message>"
+        ) % (system_prompt, message)
+
     def build_command(self, message, session_id, system_prompt, model, work_dir, is_resume):
-        cmd = [self.cli_path, "-q", message]
+        cmd = [self.cli_path, "exec", "--skip-git-repo-check"]
         cmd.extend(self._autonomy_flags())
         if model:
             cmd.extend(["--model", model])
-        if system_prompt:
-            cmd.extend(["--system-prompt", system_prompt])
+        if work_dir:
+            cmd.extend(["--cd", work_dir])
+        # `--` terminates option parsing so a prompt that happens to start
+        # with a dash isn't misread as a flag.
+        cmd.append("--")
+        cmd.append(self._compose_message(message, system_prompt))
         return cmd
 
     def build_spawn_command(self, prompt, model, work_dir):
-        cmd = [self.cli_path, "-q", prompt]
-        # Spawned tasks run without a terminal — always force full autonomy so
-        # they never block on an approval prompt nobody can answer.
-        cmd.extend(["--approval-policy", "never", "--sandbox", "danger-full-access"])
+        cmd = [self.cli_path, "exec", "--skip-git-repo-check"]
+        # Spawned tasks run without a terminal — always force full autonomy
+        # so they never block on an approval prompt nobody can answer.
+        cmd.extend(["-c", 'approval_policy="never"', "--sandbox", "danger-full-access"])
         if model:
             cmd.extend(["--model", model])
+        if work_dir:
+            cmd.extend(["--cd", work_dir])
+        cmd.append("--")
+        cmd.append(prompt)
         return cmd
 
     def parse_response(self, stdout, returncode):

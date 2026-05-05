@@ -217,13 +217,45 @@ class TestCodexBackend:
             work_dir="/tmp",
             is_resume=False,
         )
+        # Codex CLI 0.124+ uses the `exec` subcommand for non-interactive runs.
         assert cmd[0] == "/usr/bin/codex"
-        assert "-q" in cmd
-        assert cmd[cmd.index("-q") + 1] == "explain this"
+        assert cmd[1] == "exec"
+        assert "--skip-git-repo-check" in cmd
         assert "--model" in cmd
         assert cmd[cmd.index("--model") + 1] == "gpt-4"
-        assert "--system-prompt" in cmd
-        assert cmd[cmd.index("--system-prompt") + 1] == "Be concise."
+        # `--system-prompt` no longer exists; the system prompt is inlined
+        # into the user message between explicit tags.
+        assert "--system-prompt" not in cmd
+        assert cmd[-2] == "--"
+        composed = cmd[-1]
+        assert "<system_instructions>" in composed
+        assert "Be concise." in composed
+        assert "<user_message>" in composed
+        assert "explain this" in composed
+
+    def test_build_command_without_system_prompt_passes_message_verbatim(self, codex_backend):
+        cmd = codex_backend.build_command(
+            message="explain this",
+            session_id=None,
+            system_prompt=None,
+            model="gpt-4",
+            work_dir="/tmp",
+            is_resume=False,
+        )
+        assert cmd[-2] == "--"
+        assert cmd[-1] == "explain this"
+
+    def test_build_command_includes_work_dir(self, codex_backend):
+        cmd = codex_backend.build_command(
+            message="hi",
+            session_id=None,
+            system_prompt=None,
+            model="gpt-4",
+            work_dir="/home/user/project",
+            is_resume=False,
+        )
+        assert "--cd" in cmd
+        assert cmd[cmd.index("--cd") + 1] == "/home/user/project"
 
     # ── build_spawn_command ──
 
@@ -233,10 +265,13 @@ class TestCodexBackend:
             model="gpt-4",
             work_dir="/tmp",
         )
-        assert "-q" in cmd
-        assert cmd[cmd.index("-q") + 1] == "run task"
+        assert cmd[0] == "/usr/bin/codex"
+        assert cmd[1] == "exec"
+        assert "--skip-git-repo-check" in cmd
         assert "--model" in cmd
         assert cmd[cmd.index("--model") + 1] == "gpt-4"
+        assert cmd[-2] == "--"
+        assert cmd[-1] == "run task"
 
     # ── parse_response ──
 
@@ -253,8 +288,9 @@ class TestCodexBackend:
             message="hi", session_id=None, system_prompt=None,
             model="gpt-4", work_dir="/tmp", is_resume=False,
         )
-        assert "--approval-policy" in cmd
-        assert cmd[cmd.index("--approval-policy") + 1] == "never"
+        # approval_policy is now a TOML config override (-c key=value).
+        assert "-c" in cmd
+        assert 'approval_policy="never"' in cmd
         assert "--sandbox" in cmd
         assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
 
@@ -262,7 +298,7 @@ class TestCodexBackend:
         cmd = codex_backend.build_spawn_command(
             prompt="t", model="gpt-4", work_dir="/tmp",
         )
-        assert cmd[cmd.index("--approval-policy") + 1] == "never"
+        assert 'approval_policy="never"' in cmd
         assert cmd[cmd.index("--sandbox") + 1] == "danger-full-access"
 
     def test_env_overrides_approval_policy_and_sandbox(self, monkeypatch):
@@ -274,7 +310,7 @@ class TestCodexBackend:
             message="hi", session_id=None, system_prompt=None,
             model="gpt-4", work_dir="/tmp", is_resume=False,
         )
-        assert cmd[cmd.index("--approval-policy") + 1] == "on-request"
+        assert 'approval_policy="on-request"' in cmd
         assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
 
 
