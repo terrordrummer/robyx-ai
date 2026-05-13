@@ -82,6 +82,8 @@ STRINGS = {
         "/status — System overview (agents, focus, scheduler)\n"
         "/focus `<name|off>` — Route all messages to a specific agent (or disable)\n"
         "/reset `<name>` — Reset an agent's session (fresh conversation)\n"
+        "/clear — Archive the current conversation and reset the session "
+        "(use inside any non-HQ topic — workspace, collaborative, specialist)\n"
         "/ping — Quick health check\n"
         "/checkupdate — Check if a new Robyx version is available\n"
         "/doupdate — Download and apply a pending update\n\n"
@@ -143,18 +145,36 @@ STRINGS = {
         "I can't be added to external groups by this account. Leaving."
     ),
     "collab_unauthorised_adder_hq": (
-        "Unauthorised add attempt to group *%s* (chat_id `%d`) by user `%s`; "
+        "Unauthorised add attempt to group *%s* (chat_id `%s`) by user `%s`; "
         "left the group."
     ),
-    "collab_unsupported_platform_discord": (
-        "External collaborative groups are not yet supported on Discord. "
-        "Use Telegram for external groups. The bot will take no further "
-        "action here."
-    ),
+    # Spec 007: ``collab_unsupported_platform_discord`` removed — Discord
+    # is now a first-class collaborative-workspace platform. The Slack
+    # variant remains until spec 008 closes the corresponding gap.
     "collab_unsupported_platform_slack": (
         "External collaborative groups are not yet supported on Slack. "
         "Use Telegram for external groups. The bot will take no further "
         "action here."
+    ),
+    # Spec 007 — Discord audit-log fallback advisories. The lifecycle
+    # handler posts ``discord_audit_log_unavailable`` in the first
+    # writable channel of a guild when the audit-log inviter lookup
+    # fails (Forbidden / empty / sustained errors). The user can then
+    # claim a pre-announced workspace via ``/im-the-owner <name>``.
+    "discord_audit_log_unavailable": (
+        "I couldn't determine who added me to this Discord guild. Please "
+        "ensure I have the *View Audit Log* permission, or use "
+        "`/im-the-owner <workspace-name>` in any channel of this guild "
+        "to manually claim a pending workspace."
+    ),
+    "discord_audit_log_empty": (
+        "I couldn't find the audit-log entry for my recent add to this "
+        "guild. If you pre-announced a workspace for this guild, type "
+        "`/im-the-owner <workspace-name>` here to claim it."
+    ),
+    "discord_no_writable_channel_hq": (
+        "I was added to Discord guild *%s* (`%s`) but I have no writable "
+        "text channel there — I have left the guild."
     ),
     "collab_announce_ok": "[COLLAB_ANNOUNCE ok: name=%s]",
     "collab_announce_error": "[COLLAB_ANNOUNCE error: %s]",
@@ -167,25 +187,25 @@ STRINGS = {
         "Workspace *%s* (`%s`) is now active.\n"
         "Purpose: %s\n"
         "Inherits: %s (memory: %s)\n"
-        "chat_id: `%d`"
+        "chat_id: `%s`"
     ),
     "collab_setup_failed_group": (
         "Couldn't save setup — please try again."
     ),
     "collab_bot_added_hq_pending": (
-        "I've been added to group *%s* (chat_id `%d`). "
+        "I've been added to group *%s* (chat_id `%s`). "
         "Setup conversation in progress."
     ),
     "collab_bot_added_hq_matched": (
         "*Collaborative workspace configured*\n\n"
-        "Workspace *%s* is now linked to group _%s_ (chat_id `%d`).\n"
+        "Workspace *%s* is now linked to group _%s_ (chat_id `%s`).\n"
         "Purpose: %s%s"
     ),
     "collab_bot_removed_hq": (
         "Collaborative workspace *%s* has been closed (bot removed from group)."
     ),
     "collab_migrated_hq": (
-        "Workspace *%s* migrated to new chat_id `%d`."
+        "Workspace *%s* migrated to new chat_id `%s`."
     ),
     "collab_welcome_pending": (
         "*%s* — collaborative workspace is ready.\n\n"
@@ -195,8 +215,56 @@ STRINGS = {
         "when appropriate."
     ),
 
+    # /im-the-owner manual claim (spec 007 — Discord audit-log fallback)
+    "im_the_owner_usage": (
+        "Usage: `/im-the-owner <workspace-name>`"
+    ),
+    "im_the_owner_unknown_workspace": (
+        "I don't know about a pending workspace named *%s*. List pending "
+        "workspaces from HQ to confirm the name."
+    ),
+    "im_the_owner_already_bound": (
+        "Workspace *%s* is already bound (status `%s`). Manual claim is "
+        "only allowed for pending workspaces."
+    ),
+    "im_the_owner_platform_mismatch": (
+        "Workspace *%s* was pre-announced for *%s*, not Discord. Manual "
+        "claim is refused."
+    ),
+    "im_the_owner_creator_mismatch": (
+        "Workspace *%s* was pre-announced for a different user. Ask the "
+        "original announcer to claim it, or recreate the workspace pinned "
+        "to your Discord id."
+    ),
+    "im_the_owner_success": (
+        "Workspace *%s* is now active in this channel. HQ has been notified."
+    ),
+
     # Commands (usage and progress)
     "reset_usage": "Usage: /reset <name>",
+
+    # /clear — spec 007.1 conversation archive + session reset.
+    "clear_usage": (
+        "Usage: type `/clear` inside a workspace, collaborative, or specialist "
+        "topic to archive the current conversation and start fresh. From HQ "
+        "you can also pass an explicit name: `/clear <agent-name>`."
+    ),
+    "clear_refused_in_hq": (
+        "`/clear` is not available in the HQ orchestrator topic — it stays "
+        "session-continuous on purpose. Use `/clear` inside a workspace, "
+        "collaborative group, or specialist topic instead."
+    ),
+    "clear_archived": (
+        "Session reset for *%s*. The previous conversation was archived to "
+        "`data/conversations/%s`. The next message starts a fresh session."
+    ),
+    "clear_no_history": (
+        "Session reset for *%s*. No history to archive (no turns recorded "
+        "since the last reset)."
+    ),
+    "archive_unknown_agent": (
+        "Unknown agent *%s* — no conversation archive available."
+    ),
     "update_checking_manual": "Checking for pending update...",
 
     # Continuous-task macro (feature 004)

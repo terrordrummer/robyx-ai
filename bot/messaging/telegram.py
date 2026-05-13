@@ -496,3 +496,125 @@ class TelegramPlatform(Platform):
         if self._bot is None:
             return None
         return getattr(self._bot, "username", None)
+
+    @property
+    def bot_user_id(self) -> int | None:
+        """Telegram bot user id, available after the ``Bot`` is set.
+
+        Spec 007: introduced for symmetry with Discord/Slack adapters.
+        Returns ``None`` if the bot has not been attached yet via
+        :meth:`set_bot`.
+        """
+        if self._bot is None:
+            return None
+        return getattr(self._bot, "id", None)
+
+    def register_lifecycle(self, application) -> None:
+        """Spec 007: register the PTB ``ChatMemberHandler`` that
+        translates Telegram's ``my_chat_member`` updates into platform-
+        agnostic :class:`bot.messaging.base.LifecycleAdded` /
+        :class:`LifecycleRemoved` / :class:`LifecycleMigrated` events
+        and dispatches them via ``self.on_added`` / ``on_removed`` /
+        ``on_migrated``.
+
+        Replaces the pre-spec-007 inline registration in
+        ``bot/bot.py:_run_telegram`` so every adapter exposes lifecycle
+        plumbing via the same shape — Discord and Slack (spec 008) do
+        the same in their own ``register_lifecycle`` methods.
+
+        Idempotent: PTB tolerates re-registering a ``ChatMemberHandler``
+        with the same callback.
+        """
+        # Imports are local to avoid pulling python-telegram-bot into
+        # the test environment for adapters that do not need it.
+        from telegram.ext import ChatMemberHandler
+
+        from .base import ChatRef, LifecycleAdded, LifecycleMigrated, LifecycleRemoved
+
+        async def _on_my_chat_member(update, context):
+            member_update = update.my_chat_member
+            if member_update is None:
+                return
+            new_status = member_update.new_chat_member.status
+            old_status = member_update.old_chat_member.status
+            chat = member_update.chat
+            added_by = member_update.from_user
+            old_chat_id = getattr(member_update, "migrate_from_chat_id", None) or None
+            new_chat_id = getattr(member_update, "migrate_to_chat_id", None) or None
+
+            # Supergroup migration: old chat becomes unusable, new chat
+            # replaces it. Telegram sets ``migrate_to_chat_id`` on the
+            # old-chat update and ``migrate_from_chat_id`` on the new-chat
+            # update; either half triggers the rebind.
+            if new_chat_id and self.on_migrated is not None:
+                event = LifecycleMigrated(
+                    old_chat_ref=ChatRef("telegram", str(chat.id)),
+                    new_chat_ref=ChatRef("telegram", str(new_chat_id)),
+                    raw_event=member_update,
+                )
+                try:
+                    await self.on_migrated(event)
+                except Exception:
+                    log.error(
+                        "collab.telegram.on_migrated handler raised",
+                        exc_info=True,
+                    )
+                return
+            if old_chat_id and self.on_migrated is not None:
+                event = LifecycleMigrated(
+                    old_chat_ref=ChatRef("telegram", str(old_chat_id)),
+                    new_chat_ref=ChatRef("telegram", str(chat.id)),
+                    raw_event=member_update,
+                )
+                try:
+                    await self.on_migrated(event)
+                except Exception:
+                    log.error(
+                        "collab.telegram.on_migrated handler raised",
+                        exc_info=True,
+                    )
+                return
+
+            if new_status in ("member", "administrator") and old_status in ("left", "kicked"):
+                if self.on_added is None:
+                    return
+                event = LifecycleAdded(
+                    chat_ref=ChatRef("telegram", str(chat.id)),
+                    chat_title=getattr(chat, "title", None),
+                    added_by_id=added_by.id if added_by else None,
+                    added_by_name=(
+                        getattr(added_by, "username", None) if added_by else None
+                    ),
+                    raw_event=member_update,
+                )
+                try:
+                    await self.on_added(event)
+                except Exception:
+                    log.error(
+                        "collab.telegram.on_added handler raised",
+                        exc_info=True,
+                    )
+                return
+
+            if (
+                new_status in ("left", "kicked")
+                and old_status in ("member", "administrator")
+                and self.on_removed is not None
+            ):
+                event = LifecycleRemoved(
+                    chat_ref=ChatRef("telegram", str(chat.id)),
+                    chat_title=getattr(chat, "title", None),
+                    raw_event=member_update,
+                )
+                try:
+                    await self.on_removed(event)
+                except Exception:
+                    log.error(
+                        "collab.telegram.on_removed handler raised",
+                        exc_info=True,
+                    )
+                return
+
+        application.add_handler(
+            ChatMemberHandler(_on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER),
+        )

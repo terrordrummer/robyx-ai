@@ -1,5 +1,123 @@
 # Changelog
 
+## 0.28.0
+
+**Discord parity for collaborative workspaces + conversation archive
+(`/clear`).** Closes the spec 003 FR-013 justified violation of
+Constitution Principle I for Discord — collaborative workspaces are
+now first-class on Telegram **and** Discord. Slack remains a documented
+limitation pending spec 008. See `releases/0.28.0.md` for the full
+write-up.
+
+### Added
+
+- **Discord collaborative-workspace lifecycle (spec 007).** Flow A
+  pre-announce from Telegram HQ with `[COLLAB_ANNOUNCE platform="discord"
+  creator_id="<discord-id>" ...]`; Flow B ad-hoc add via OAuth; on_guild_join
+  / on_guild_remove plumbing through `DiscordPlatform.register_lifecycle`;
+  audit-log inviter lookup with 3-retry exponential backoff (1s/2s/4s);
+  `/im-the-owner <workspace-name>` chat-command escape hatch for
+  audit-log failures.
+- **Platform-agnostic lifecycle abstraction.** `bot/messaging/base.py`
+  gains `ChatRef`, `LifecycleAdded`, `LifecycleRemoved`,
+  `LifecycleMigrated` dataclasses + `Platform.on_added` / `on_removed` /
+  `on_migrated` callable attributes + `bot_user_id` property. Spec 008
+  (Slack) will reuse the abstraction verbatim.
+- **`CollabStore.find_active_in_guild` + `find_active_by_platform`.**
+  Used by the shared-guild `leave_chat` policy in
+  `bot/handlers.py:collab_bot_added` — refuses to evict the bot from a
+  Discord guild when other active workspaces share the guild.
+- **`DISCORD_INVITE_TTL_DAYS` (default 7) and `DISCORD_INVITE_MAX_USES`
+  (default 10) env knobs.** Invalid / negative values fall back to the
+  defaults with a WARN log; `0` is accepted verbatim as Discord's
+  "no limit" sentinel.
+- **Cross-platform mention parser.** `_parse_user_id` now accepts
+  Discord `<@123>` / `<@!123>` (returns int), Slack `<@U…>` (returns
+  str — reserved for spec 008), plus the existing Telegram legacy
+  forms.
+- **`expected_platform` field on `CollabWorkspace`.** Pending workspaces
+  pre-announced for one platform refuse to bind on a different platform
+  even if the user id matches (FR-013 — cross-platform user-id
+  collision guard).
+- **`/clear` slash command (spec 007.1).** Archives the conversation
+  since the previous `/clear` (or since the agent was created) to
+  `data/conversations/<agent>/archive-<UTC>.md`, then regenerates the
+  agent's AI-CLI session id. Refused bare in HQ; `/clear <name>` from
+  HQ targets a named agent. Workspace / specialist auth = bot owner;
+  collaborative-workspace auth = OWNER or OPERATOR.
+- **`[GET_ARCHIVE]` macro.** Any non-orchestrator agent can pull its
+  own (or another named agent's) archived conversations back into the
+  current turn — same lifecycle pattern as `[GET_EVENTS]`. Accepts
+  `since` (duration or ISO-8601), `name` (defaults to self), `limit`
+  (1..50, default 10).
+- **`bot/conversations.py` module.** Per-agent turn logger
+  (`current.jsonl`) with atomic line-append; `archive_and_clear` /
+  `query_archives` for the `/clear` and `[GET_ARCHIVE]` paths.
+
+### Changed
+
+- **`CollabWorkspace.chat_id` is now `str`.** Was `int`; legacy
+  on-disk records are tolerated by `from_dict` and normalised on the
+  next save. Telegram chat_ids round-trip as `str(int)`; Discord chat_ids
+  encode as `"<guild>:<channel>"`; Slack will use `"<team>:<channel>"`
+  in spec 008.
+- **Collaborative-workspace handlers take `LifecycleAdded` /
+  `LifecycleRemoved` / `LifecycleMigrated` dataclasses.** Was bare PTB
+  `chat` + `added_by` mocks. `bot/bot.py:_run_telegram` no longer
+  registers `ChatMemberHandler` inline — `TelegramPlatform.register_lifecycle`
+  owns that.
+- **`bot/bot.py:_run_discord` swaps the "not yet supported" notice for
+  the real lifecycle wiring.** The `collab_unsupported_platform_discord`
+  STRING was removed from `bot/i18n.py`.
+- **Discord audit-log failure now posts an advisory in the channel.**
+  When `LifecycleAdded.added_by_id` arrives as `None` (Forbidden /
+  empty / sustained errors), the handler short-circuits to a chat
+  message asking the user to type `/im-the-owner` — does NOT fall
+  through to the unauthorised-adder refusal flow, which would have
+  orphaned legitimate pending workspaces.
+- **`is_authorised_adder` / `get_user_role` / `CollabWorkspace.set_role`
+  type hints widened to `int | str`.** Internal storage was already
+  string-keyed; this exposes the existing tolerance to type-checkers.
+- **`_handle_collab_announce` accepts `platform="..."` and
+  `creator_id="..."`.** Both optional — defaults preserve pre-007
+  Telegram-only behaviour. Unknown platforms are rejected with a
+  user-visible error.
+
+### Migration
+
+- **`bot/migrations/v0_28_0.py` runs at first 0.28.0 boot.** Reads
+  `data/collaborative_workspaces.json`, sets `platform: "telegram"` on
+  records that lack it, coerces `chat_id: int → str`. Atomic write,
+  strictly idempotent. No platform side effects.
+
+### Tests
+
+- 2075 tests pass on a fresh checkout (was 1957 pre-spec-007). New
+  modules:
+  - `tests/test_collab_chat_ref.py` — `ChatRef`, helpers, schema,
+    store lookups, `expected_platform` gate, cross-platform
+    `migrate_chat_id` refusal.
+  - `tests/test_collab_discord_lifecycle.py` — adapter `bot_user_id`,
+    `_resolve_inviter` retry matrix, `_pick_writable_channel`,
+    `register_lifecycle` event dispatch.
+  - `tests/test_collab_discord_flow.py` — end-to-end Flow A audit-log
+    → bind, Flow B ad-hoc setup, `on_guild_remove` sentinel,
+    cross-platform refusal.
+  - `tests/test_collab_discord_invite.py` — config env fallback,
+    `leave_chat`, `get_invite_link`.
+  - `tests/test_collab_im_the_owner.py` — manual-claim refusal matrix
+    + success path.
+  - `tests/test_collab_multiplatform.py` — shared-guild `leave_chat`
+    policy, audit-log advisory.
+  - `tests/test_parse_user_id.py` — Discord / Slack / Telegram dialect
+    parsing.
+  - `tests/test_migration_v0_28_0.py` — idempotency, mixed file
+    normalisation, JSON-decode-error abort.
+  - `tests/test_conversations.py` — turn logger, archive generator,
+    query.
+  - `tests/test_clear_and_archive.py` — `/clear` + `[GET_ARCHIVE]`
+    handler integration.
+
 ## 0.27.2
 
 **Telegram typing-indicator continuity fix.** Closes a long-running

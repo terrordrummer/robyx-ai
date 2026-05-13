@@ -31,7 +31,6 @@ from logging.handlers import RotatingFileHandler
 from telegram import Update
 from telegram.ext import (
     Application,
-    ChatMemberHandler,
     CommandHandler,
     MessageHandler,
     TypeHandler,
@@ -371,6 +370,32 @@ def main():
         _run_telegram(plat, h, backend, manager)
 
 
+def _wire_lifecycle(plat, h) -> None:
+    """Spec 007: register the platform-agnostic collaborative-workspace
+    lifecycle callbacks on ``plat`` so every adapter dispatches through
+    the same handlers regardless of class.
+
+    Adapters that emit lifecycle events (Telegram, Discord post-007,
+    Slack post-008) invoke ``plat.on_added`` / ``on_removed`` /
+    ``on_migrated`` with the platform-agnostic event dataclasses; the
+    handlers in ``bot.handlers`` branch on ``event.chat_ref.platform``
+    rather than the adapter class. Adapters that do not yet emit (Slack
+    in 007) leave their native event handler unregistered — the
+    callbacks stay set but are simply never fired.
+
+    Telegram's wiring still lives inline in ``_run_telegram`` for now
+    (Phase 3 of spec 007 will move it into ``TelegramPlatform.register_lifecycle``
+    for symmetry); this helper currently registers only the shared
+    callback attributes that all adapters can use.
+    """
+    if "collab_bot_added" in h:
+        plat.on_added = lambda evt: h["collab_bot_added"](plat, evt)
+    if "collab_bot_removed" in h:
+        plat.on_removed = lambda evt: h["collab_bot_removed"](plat, evt)
+    if "collab_bot_migrated" in h:
+        plat.on_migrated = lambda evt: h["collab_bot_migrated"](plat, evt)
+
+
 def _run_telegram(plat, h, backend, manager):
     """Start the Telegram event loop."""
     # Build Telegram application
@@ -462,7 +487,7 @@ def _run_telegram(plat, h, backend, manager):
         return wrapper
 
     # Register command handlers
-    for name in ("start", "help", "workspaces", "specialists", "status", "reset", "focus", "ping", "checkupdate", "doupdate"):
+    for name in ("start", "help", "workspaces", "specialists", "status", "reset", "clear", "focus", "ping", "checkupdate", "doupdate"):
         app.add_handler(CommandHandler(name, _wrap_command(h[name])))
 
     # Register voice handler (always — replies gracefully if Whisper not configured)
@@ -472,59 +497,12 @@ def _run_telegram(plat, h, backend, manager):
     # Register text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _wrap_message(h["message"])))
 
-    # Collaborative workspaces: dispatch on bot added / removed / migrated.
-    if "collab_bot_added" in h:
-        async def _on_my_chat_member(update, context):
-            member_update = update.my_chat_member
-            if member_update is None:
-                return
-            new_status = member_update.new_chat_member.status
-            old_status = member_update.old_chat_member.status
-            chat = member_update.chat
-            added_by = member_update.from_user
-            old_chat_id = getattr(member_update, "migrate_from_chat_id", None) or None
-            new_chat_id = getattr(member_update, "migrate_to_chat_id", None) or None
-
-            # Supergroup migration: old chat becomes unusable, new chat_id
-            # replaces it. Telegram sets ``migrate_to_chat_id`` on the
-            # old-chat update and ``migrate_from_chat_id`` on the new-chat
-            # update; either half triggers the rebind.
-            if new_chat_id and "collab_bot_migrated" in h:
-                log.info(
-                    "Bot chat migrated: %s → %s title=%r",
-                    chat.id, new_chat_id, chat.title,
-                )
-                await h["collab_bot_migrated"](plat, chat.id, new_chat_id)
-                return
-            if old_chat_id and "collab_bot_migrated" in h:
-                log.info(
-                    "Bot chat migrated: %s ← %s title=%r",
-                    chat.id, old_chat_id, chat.title,
-                )
-                await h["collab_bot_migrated"](plat, old_chat_id, chat.id)
-                return
-
-            if new_status in ("member", "administrator") and old_status in ("left", "kicked"):
-                log.info(
-                    "Bot added to group: chat_id=%s title=%r by user=%s",
-                    chat.id, chat.title, added_by.id if added_by else "unknown",
-                )
-                await h["collab_bot_added"](plat, chat, added_by)
-                return
-
-            if (
-                new_status in ("left", "kicked")
-                and old_status in ("member", "administrator")
-                and "collab_bot_removed" in h
-            ):
-                log.info(
-                    "Bot removed from group: chat_id=%s title=%r",
-                    chat.id, chat.title,
-                )
-                await h["collab_bot_removed"](plat, chat)
-                return
-
-        app.add_handler(ChatMemberHandler(_on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    # Spec 007: lifecycle dispatch is now adapter-side. The
+    # TelegramPlatform.register_lifecycle method registers the PTB
+    # ChatMemberHandler and translates updates into platform-agnostic
+    # LifecycleAdded / LifecycleRemoved / LifecycleMigrated events.
+    _wire_lifecycle(plat, h)
+    plat.register_lifecycle(app)
 
     # Unified scheduler: runs every SCHEDULER_INTERVAL seconds (default 60s).
     # Handles periodic tasks, one-shot tasks, reminders, and continuous tasks.
@@ -661,7 +639,7 @@ def _run_slack(plat, h, backend, manager):
     plat.set_bot(app.client)
 
     COMMANDS = ("start", "help", "workspaces", "specialists", "status",
-                "reset", "focus", "ping", "checkupdate", "doupdate")
+                "reset", "clear", "focus", "ping", "checkupdate", "doupdate")
 
     @app.event("message")
     async def handle_message(event, say, client):
@@ -726,7 +704,16 @@ def _run_slack(plat, h, backend, manager):
         )
         await h["message"](plat, msg, msg_ref)
 
-    # External collaborative groups are Telegram-only for now (FR-013).
+    # Spec 007: scaffold the platform-agnostic lifecycle callbacks so
+    # spec 008's Slack ``member_joined_channel`` wiring binds without
+    # any change here. The Slack adapter does NOT emit LifecycleAdded /
+    # LifecycleRemoved in spec 007 — the legacy notice below remains
+    # the user-visible behaviour until spec 008 swaps it for a real
+    # lifecycle handler.
+    _wire_lifecycle(plat, h)
+
+    # External collaborative groups are Telegram + Discord only for now;
+    # Slack remains a documented limitation (spec 008 closes it).
     # When the Slack bot is added to a channel, post a single notice so
     # the add isn't a silent no-op.
     @app.event("member_joined_channel")
@@ -779,8 +766,13 @@ def _run_discord(plat, h, backend, manager):
     client = discord.Client(intents=intents)
     plat.set_bot(client)
 
+    # Spec 007: ``im-the-owner`` is the Discord-only manual-claim escape
+    # hatch when the audit-log inviter lookup fails (Forbidden / empty
+    # / sustained API errors). Slash on Discord = text command parsed by
+    # on_message; the same handler is exposed on Slack post-spec-008.
     COMMANDS = ("start", "help", "workspaces", "specialists", "status",
-                "reset", "focus", "ping", "checkupdate", "doupdate")
+                "reset", "focus", "ping", "checkupdate", "doupdate",
+                "im-the-owner")
 
     @client.event
     async def on_ready():
@@ -792,29 +784,14 @@ def _run_discord(plat, h, backend, manager):
         client.loop.create_task(_background_scheduler_loop(plat, backend, control_room))
         client.loop.create_task(_background_update_loop(plat, control_room, manager))
 
-    # External collaborative groups are Telegram-only for now (FR-013).
-    # When the bot is added to a new Discord guild, post a single message
-    # explaining the limitation so the add isn't a silent no-op.
-    @client.event
-    async def on_guild_join(guild):
-        from i18n import STRINGS
-        log.info(
-            "collab.unsupported_platform platform=discord guild=%s name=%r",
-            guild.id, getattr(guild, "name", None),
-        )
-        try:
-            target = None
-            if guild.system_channel and guild.system_channel.permissions_for(guild.me).send_messages:
-                target = guild.system_channel
-            else:
-                for ch in guild.text_channels:
-                    if ch.permissions_for(guild.me).send_messages:
-                        target = ch
-                        break
-            if target is not None:
-                await target.send(STRINGS["collab_unsupported_platform_discord"])
-        except Exception as e:
-            log.warning("Failed to send Discord unsupported-platform notice: %s", e)
+    # Spec 007: Discord collaborative-workspace lifecycle is now wired.
+    # DiscordPlatform.register_lifecycle attaches on_guild_join /
+    # on_guild_remove handlers that emit LifecycleAdded / LifecycleRemoved
+    # events; _wire_lifecycle binds the platform-agnostic
+    # collab_bot_added / collab_bot_removed handlers to them. Closes the
+    # spec 003 FR-013 justified violation of Principle I for Discord.
+    _wire_lifecycle(plat, h)
+    plat.register_lifecycle(client)
 
     @client.event
     async def on_message(message):

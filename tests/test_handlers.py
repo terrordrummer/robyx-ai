@@ -96,10 +96,12 @@ class TestMakeHandlers:
     def test_returns_correct_keys(self, handlers):
         expected = {
             "start", "help", "workspaces", "specialists", "status",
-            "reset", "focus", "ping", "checkupdate", "doupdate",
+            "reset", "clear", "focus", "ping", "checkupdate", "doupdate",
             "voice", "message",
             # Spec 006: [GET_EVENTS] handler always exposed (no collab dep).
             "_handle_get_events",
+            # Spec 007.1: [GET_ARCHIVE] handler always exposed.
+            "_handle_get_archive",
         }
         assert set(handlers.keys()) == expected
 

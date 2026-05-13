@@ -190,7 +190,7 @@ Three ways to interact with a workspace agent:
 
 ## Collaborative Workspaces
 
-Collaborative workspaces let external collaborators join a **separate Telegram group** with a dedicated AI agent. Unlike standard workspaces (which live as topics in the HQ supergroup and are owner-only), collaborative workspaces support multiple users with role-based authorization.
+Collaborative workspaces let external collaborators join a **separate Telegram group, Discord guild (since v0.28.0), or Slack channel (post spec 008)** with a dedicated AI agent. Unlike standard workspaces (which live as topics in the HQ supergroup and are owner-only), collaborative workspaces support multiple users with role-based authorization.
 
 ### Roles
 
@@ -212,9 +212,32 @@ Collaborative workspaces let external collaborators join a **separate Telegram g
 
 ### Creation Flows
 
-**Flow A (planned):** Robyx or a workspace agent creates a pending collaborative workspace, then the owner adds the bot to a new Telegram group. The bot matches the pending request and configures itself automatically.
+**Flow A (planned):** Robyx or a workspace agent creates a pending collaborative workspace, then the owner adds the bot to a new chat (Telegram group, Discord guild). The bot matches the pending request and configures itself automatically.
 
-**Flow B (ad-hoc):** The owner adds the bot to a group with no prior setup. The bot creates a provisional workspace and asks directly in the group what it should focus on and whether to inherit from an existing workspace.
+**Flow B (ad-hoc):** The owner adds the bot to a chat with no prior setup. The bot creates a provisional workspace and asks directly in the chat what it should focus on and whether to inherit from an existing workspace.
+
+### Platform lifecycle abstraction (spec 007)
+
+Lifecycle events — "bot added", "bot removed", "supergroup migrated" — are dispatched through three platform-agnostic dataclasses defined in `bot/messaging/base.py`:
+
+```
+ChatRef(platform, chat_id)         # canonical identifier per platform
+LifecycleAdded(chat_ref, chat_title, added_by_id, added_by_name, raw_event)
+LifecycleRemoved(chat_ref, chat_title, raw_event)
+LifecycleMigrated(old_chat_ref, new_chat_ref, raw_event)
+```
+
+Each adapter (`TelegramPlatform`, `DiscordPlatform`, `SlackPlatform`) translates its native event into the matching dataclass and dispatches via the `Platform.on_added` / `on_removed` / `on_migrated` callback attributes. `bot/bot.py` wires the same `collab_bot_added` / `collab_bot_removed` / `collab_bot_migrated` handlers to every adapter — handler bodies branch on `event.chat_ref.platform` only where strictly required (`find_active_in_guild` for Discord's shared-guild safety; the audit-log advisory; the mention parser's dialect table).
+
+`chat_id` is the canonical string form per platform:
+
+| Platform | Form | Example |
+|---|---|---|
+| Telegram | `"<chat_id_int>"` | `"-1001234567890"` |
+| Discord | `"<guild_id>:<channel_id>"` | `"123456789012345678:987654321098765432"` |
+| Slack | `"<team_id>:<channel_id>"` (post spec 008) | `"T01ABC:C02DEF"` |
+
+Discord's `on_guild_join` does not carry the inviter; the adapter resolves it via the guild's audit log with three-retry exponential backoff (1s/2s/4s) and falls back to the `/im-the-owner <workspace-name>` chat command when the lookup fails. See [Building Your Team — Collaborative workspaces — Discord](team.md#collaborative-workspaces--discord).
 
 ### In-Group Commands
 
@@ -228,7 +251,7 @@ These commands work inside a collaborative workspace group:
 
 ### Data
 
-Collaborative workspace state is persisted in `data/collaborative_workspaces.json`. Each workspace tracks its chat_id, roles, interaction mode, invite link, and parent workspace reference.
+Collaborative workspace state is persisted in `data/collaborative_workspaces.json`. Each workspace tracks its `platform` (one of `telegram`, `discord`, `slack`), `chat_id` (canonical string form), roles, interaction mode, invite link, parent workspace reference, and `expected_platform` for pending workspaces (cross-platform user-id collision guard, spec 007). The on-disk migration `bot/migrations/v0_28_0.py` normalises pre-007 records (legacy `chat_id: int` → `str`; default `platform: "telegram"`).
 
 ---
 

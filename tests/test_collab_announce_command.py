@@ -6,6 +6,7 @@ import pytest
 
 from ai_invoke import COLLAB_ANNOUNCE_PATTERN, parse_collab_attrs
 from collaborative import CollabStore
+from messaging.base import ChatRef, LifecycleAdded
 from handlers import make_handlers
 
 
@@ -205,16 +206,17 @@ class TestFlowAUsesPreAnnouncedPurpose:
         mock_platform.get_invite_link = AsyncMock(return_value=None)
 
         # Act: simulate the bot being added to the group by the owner.
-        chat = MagicMock()
-        chat.id = -100777
-        chat.title = "Nebula Research"
-        added_by = MagicMock()
-        added_by.id = 12345  # OWNER_ID from conftest
-        await handlers["collab_bot_added"](mock_platform, chat, added_by)
+        event = LifecycleAdded(
+            chat_ref=ChatRef("telegram", "-100777"),
+            chat_title="Nebula Research",
+            added_by_id=12345,  # OWNER_ID from conftest
+        )
+        await handlers["collab_bot_added"](mock_platform, event)
 
         # Assert: in-group welcome references the pre-announced purpose.
         sends = mock_platform.send_message.call_args_list
-        group_sends = [c for c in sends if c.kwargs.get("chat_id") == -100777]
+        # Spec 007: ws.chat_id is the canonical str form.
+        group_sends = [c for c in sends if c.kwargs.get("chat_id") == "-100777"]
         assert group_sends, "No message sent to the group"
         group_text = group_sends[0].kwargs["text"]
         assert "Collab on Nebula with Alice and Bob" in group_text

@@ -64,6 +64,19 @@ class DiscordPlatform(Platform):
         self._client = client
 
     @property
+    def bot_user_id(self) -> int | None:
+        """Discord bot user id, available after ``on_ready`` has fired.
+
+        Spec 007: used by lifecycle dispatch and by future code that
+        needs to filter "is this me?" events. Returns ``None`` before
+        the client has logged in.
+        """
+        if self._client is None:
+            return None
+        user = getattr(self._client, "user", None)
+        return getattr(user, "id", None) if user is not None else None
+
+    @property
     def max_message_length(self) -> int:
         return 2000
 
@@ -356,10 +369,116 @@ class DiscordPlatform(Platform):
             return False
 
     async def leave_chat(self, chat_id: Any) -> None:
-        raise NotImplementedError(
-            "leave_chat is not yet supported on Discord — external collaborative "
-            "groups are Telegram-only in this iteration"
-        )
+        """Spec 007: leave a Discord guild. ``chat_id`` is the canonical
+        ``"<guild>:<channel>"`` form; only the guild half is used (Discord
+        has no per-channel leave — the bot is a member of the whole
+        guild). The handler-side shared-guild policy MUST run BEFORE
+        calling this method — see ``bot/handlers.py:collab_bot_added`` and
+        ``CollabStore.find_active_in_guild``.
+
+        Idempotent at the operational level: if the guild is already gone
+        from the bot's cache (kicked, deleted), ``get_guild`` returns
+        ``None`` and ``fetch_guild`` raises ``discord.NotFound`` — both
+        are treated as "already left, nothing to do".
+        """
+        import discord
+        from collaborative import parse_discord_chat_id
+
+        try:
+            guild_id, _ = parse_discord_chat_id(str(chat_id))
+        except ValueError as exc:
+            log.warning(
+                "discord.leave_chat: malformed chat_id %r — refusing: %s",
+                chat_id, exc,
+            )
+            return
+
+        if self._client is None:
+            log.warning(
+                "discord.leave_chat: client not set (called before on_ready?)",
+            )
+            return
+
+        guild = self._client.get_guild(guild_id)
+        if guild is None:
+            try:
+                guild = await self._client.fetch_guild(guild_id)
+            except discord.NotFound:
+                log.info(
+                    "discord.leave_chat: guild %d already gone — no-op",
+                    guild_id,
+                )
+                return
+            except Exception as exc:
+                log.warning(
+                    "discord.leave_chat: fetch_guild %d failed: %s",
+                    guild_id, exc,
+                )
+                return
+        try:
+            await guild.leave()
+            log.info("discord.leave_chat: left guild %d", guild_id)
+        except Exception as exc:
+            log.error(
+                "discord.leave_chat: guild.leave() raised for %d: %s",
+                guild_id, exc,
+            )
+
+    async def get_invite_link(self, chat_id: Any) -> str | None:
+        """Spec 007: generate a channel-scoped invite for the given Discord
+        chat. ``chat_id`` is the canonical ``"<guild>:<channel>"`` form;
+        the invite is created on the channel half.
+
+        TTL and usage caps come from the env knobs
+        :data:`config.DISCORD_INVITE_TTL_DAYS` and
+        :data:`config.DISCORD_INVITE_MAX_USES`. ``0`` is the operator
+        sentinel for "no limit" per Discord's ``create_invite`` API.
+
+        Returns the invite URL (``"https://discord.gg/..."``) on success,
+        or ``None`` if the channel is unreachable or the API refused
+        (missing ``Create Instant Invite`` permission, channel deleted,
+        etc.).
+        """
+        from collaborative import parse_discord_chat_id
+        from .base import TopicUnreachable
+
+        try:
+            _, channel_id = parse_discord_chat_id(str(chat_id))
+        except ValueError as exc:
+            log.warning(
+                "discord.get_invite_link: malformed chat_id %r: %s",
+                chat_id, exc,
+            )
+            return None
+
+        try:
+            channel = await self._fetch_channel(channel_id)
+        except TopicUnreachable:
+            log.warning(
+                "discord.get_invite_link: channel %d is unreachable",
+                channel_id,
+            )
+            return None
+        if channel is None:
+            return None
+
+        # Pull config lazily so tests can monkeypatch the values without
+        # re-importing the adapter module.
+        from config import DISCORD_INVITE_TTL_DAYS, DISCORD_INVITE_MAX_USES
+
+        try:
+            invite = await channel.create_invite(
+                max_age=DISCORD_INVITE_TTL_DAYS * 86400,
+                max_uses=DISCORD_INVITE_MAX_USES,
+                reason="Robyx collaborative workspace invite",
+            )
+        except Exception as exc:
+            log.warning(
+                "discord.get_invite_link: create_invite on %d failed: %s",
+                channel_id, exc,
+            )
+            return None
+        return str(invite)
 
     # ── Spec 006 — dedicated-topic operations ──────────────────────────
 
@@ -499,3 +618,200 @@ class DiscordPlatform(Platform):
         except Exception as exc:
             log.error("Failed to close Discord channel %d: %s", channel_id, exc)
             return False
+
+    # ── Spec 007 — collaborative-workspace lifecycle plumbing ──────────
+
+    # Backoff sequence between audit-log retries. Exposed as a class-level
+    # tuple so tests can monkeypatch a faster schedule.
+    _AUDIT_LOG_BACKOFF = (1.0, 2.0, 4.0)
+
+    async def _resolve_inviter(self, guild) -> tuple[int | None, str | None]:
+        """Resolve "who added the bot" by scanning the guild's audit log.
+
+        Discord's gateway does not carry the inviter on ``on_guild_join``
+        (a deliberate API choice). The bot must look up the most recent
+        ``bot_add`` entry. The lookup retries with exponential backoff
+        (1s / 2s / 4s) to absorb Discord's occasional write lag between
+        the join event and the audit-log entry.
+
+        Returns ``(user_id, username)`` on success, or ``(None, None)``
+        on:
+
+        - ``discord.Forbidden`` — bot lacks the ``View Audit Log``
+          permission (fail-closed, no retries).
+        - Empty audit log across all retries.
+        - Sustained transient errors across all retries.
+
+        See ``specs/007-discord-parity/contracts/discord-audit-log.md``.
+        """
+        import asyncio
+        import discord
+
+        last_error: Exception | None = None
+        attempts = len(self._AUDIT_LOG_BACKOFF)
+        for attempt in range(1, attempts + 1):
+            try:
+                entries = [
+                    e async for e in guild.audit_logs(
+                        action=discord.AuditLogAction.bot_add, limit=5,
+                    )
+                ]
+            except discord.Forbidden:
+                log.warning(
+                    "collab.discord.audit_log.forbidden guild=%s",
+                    getattr(guild, "id", None),
+                )
+                return None, None
+            except Exception as exc:  # noqa: BLE001 - we want any error to retry
+                last_error = exc
+                log.warning(
+                    "collab.discord.audit_log.error guild=%s attempt=%d err=%r",
+                    getattr(guild, "id", None), attempt, exc,
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(self._AUDIT_LOG_BACKOFF[attempt - 1])
+                continue
+
+            if entries:
+                user = entries[0].user
+                user_id = getattr(user, "id", None) if user is not None else None
+                user_name = getattr(user, "name", None) if user is not None else None
+                log.info(
+                    "collab.discord.audit_log.success guild=%s user=%s",
+                    getattr(guild, "id", None), user_id,
+                )
+                return user_id, user_name
+
+            # Empty result — retry within budget.
+            if attempt < attempts:
+                await asyncio.sleep(self._AUDIT_LOG_BACKOFF[attempt - 1])
+
+        if last_error is not None:
+            log.info(
+                "collab.discord.audit_log.exhausted guild=%s last_error=%r",
+                getattr(guild, "id", None), last_error,
+            )
+        else:
+            log.info(
+                "collab.discord.audit_log.empty guild=%s attempts=%d",
+                getattr(guild, "id", None), attempts,
+            )
+        return None, None
+
+    def _pick_writable_channel(self, guild):
+        """Return the first text channel in ``guild`` where the bot can
+        post, or ``None`` if no such channel exists.
+
+        Preference order (matches the existing Telegram-only Discord
+        unsupported-platform notice path in ``bot/bot.py`` so the
+        behaviour is familiar):
+
+        1. ``guild.system_channel`` if writable.
+        2. The first entry of ``guild.text_channels`` that is writable.
+
+        "Writable" means
+        ``channel.permissions_for(guild.me).send_messages is True``.
+        """
+        me = getattr(guild, "me", None)
+        if me is None:
+            return None
+
+        def _writable(ch) -> bool:
+            try:
+                perms = ch.permissions_for(me)
+            except Exception:
+                return False
+            return bool(getattr(perms, "send_messages", False))
+
+        system = getattr(guild, "system_channel", None)
+        if system is not None and _writable(system):
+            return system
+        for ch in getattr(guild, "text_channels", []) or []:
+            if _writable(ch):
+                return ch
+        return None
+
+    def register_lifecycle(self, client) -> None:
+        """Register the Discord-native ``on_guild_join`` /
+        ``on_guild_remove`` handlers that translate Discord events into
+        :class:`bot.messaging.base.LifecycleAdded` /
+        :class:`LifecycleRemoved` and dispatch them through
+        ``self.on_added`` / ``self.on_removed``.
+
+        Called once from ``bot.bot._run_discord`` after the client is
+        constructed and ``self.set_bot(client)`` has been invoked. Idempotent
+        with respect to multiple calls — discord.py replaces handlers of
+        the same name on re-registration.
+
+        The Discord adapter does NOT emit :class:`LifecycleMigrated` —
+        Discord has no supergroup-migration equivalent. ``self.on_migrated``
+        therefore stays ``None`` for Discord guilds.
+        """
+        from collaborative import make_discord_chat_id
+        from .base import ChatRef, LifecycleAdded, LifecycleRemoved
+
+        @client.event
+        async def on_guild_join(guild):
+            inviter_id, inviter_name = await self._resolve_inviter(guild)
+            channel = self._pick_writable_channel(guild)
+            if channel is None:
+                log.warning(
+                    "collab.discord.no_writable_channel guild=%s name=%r — leaving",
+                    getattr(guild, "id", None), getattr(guild, "name", None),
+                )
+                try:
+                    await guild.leave()
+                except Exception as exc:
+                    log.error(
+                        "collab.discord.leave_failed guild=%s err=%r",
+                        getattr(guild, "id", None), exc,
+                    )
+                return
+
+            if self.on_added is None:
+                # No handler wired — adapter is operating without the
+                # collaborative-workspace handler. Nothing to do.
+                return
+
+            event = LifecycleAdded(
+                chat_ref=ChatRef(
+                    platform="discord",
+                    chat_id=make_discord_chat_id(guild.id, channel.id),
+                ),
+                chat_title=getattr(guild, "name", None),
+                added_by_id=inviter_id,
+                added_by_name=inviter_name,
+                raw_event=guild,
+            )
+            try:
+                await self.on_added(event)
+            except Exception as exc:
+                log.error(
+                    "collab.discord.on_added handler raised: %r", exc,
+                    exc_info=True,
+                )
+
+        @client.event
+        async def on_guild_remove(guild):
+            if self.on_removed is None:
+                return
+            # We do not know which specific channel triggered the removal
+            # at the gateway level — the bot leaves the guild atomically.
+            # The handler iterates ``find_active_in_guild(guild.id)`` and
+            # closes every matching workspace. ``chat_id`` carries
+            # ``"<guild>:0"`` as a sentinel that callers ignore.
+            event = LifecycleRemoved(
+                chat_ref=ChatRef(
+                    platform="discord",
+                    chat_id=make_discord_chat_id(guild.id, 0),
+                ),
+                chat_title=getattr(guild, "name", None),
+                raw_event=guild,
+            )
+            try:
+                await self.on_removed(event)
+            except Exception as exc:
+                log.error(
+                    "collab.discord.on_removed handler raised: %r", exc,
+                    exc_info=True,
+                )

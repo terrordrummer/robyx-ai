@@ -6,6 +6,7 @@ import pytest
 
 from ai_invoke import COLLAB_SETUP_COMPLETE_PATTERN, parse_collab_attrs
 from collaborative import CollabStore, CollabWorkspace
+from messaging.base import ChatRef, LifecycleAdded
 from handlers import make_handlers
 
 
@@ -150,7 +151,8 @@ class TestHandleSetupComplete:
         assert store.get("collab-photon").status == "setup"
         # recoverable failure surfaced in the group
         sends = mock_platform.send_message.call_args_list
-        group_sends = [c for c in sends if c.kwargs.get("chat_id") == -100555]
+        # Spec 007: ws.chat_id is the canonical str form.
+        group_sends = [c for c in sends if c.kwargs.get("chat_id") == "-100555"]
         assert group_sends, "Expected recoverable-failure note in group"
 
 
@@ -170,12 +172,12 @@ class TestFlowBBootstrapIsRealAITurn:
 
         # Intercept invoke_ai so the bootstrap call succeeds without a real CLI.
         with patch("handlers.invoke_ai", new=AsyncMock(return_value="Hi group.")):
-            chat = MagicMock()
-            chat.id = -100888
-            chat.title = "Ad-hoc Group"
-            added_by = MagicMock()
-            added_by.id = 12345  # OWNER_ID from conftest
-            await handlers["collab_bot_added"](mock_platform, chat, added_by)
+            event = LifecycleAdded(
+                chat_ref=ChatRef("telegram", "-100888"),
+                chat_title="Ad-hoc Group",
+                added_by_id=12345,  # OWNER_ID from conftest
+            )
+            await handlers["collab_bot_added"](mock_platform, event)
 
         # Assert: no message sent with the old canned template.
         for call in mock_platform.send_message.call_args_list:

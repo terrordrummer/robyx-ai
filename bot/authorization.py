@@ -16,10 +16,10 @@ log = logging.getLogger("robyx.authorization")
 
 
 def get_user_role(
-    user_id: int,
+    user_id: int | str,
     chat_id: Any,
     collab_store: CollabStore,
-    owner_id: int | None,
+    owner_id: int | str | None,
 ) -> tuple[Role | None, CollabWorkspace | None]:
     """Resolve a user's role in the context of a specific chat.
 
@@ -57,9 +57,9 @@ def can_send_executive(role: Role | None) -> bool:
 
 def can_close_workspace(
     role: Role | None,
-    user_id: int,
+    user_id: int | str,
     ws: CollabWorkspace,
-    owner_id: int | None = None,
+    owner_id: int | str | None = None,
 ) -> bool:
     """Return True if ``user_id`` may close ``ws``.
 
@@ -85,10 +85,10 @@ _ACTIVE_STATUSES = frozenset({"active", "setup", "pending"})
 
 
 def is_authorised_adder(
-    user_id: int | None,
+    user_id: int | str | None,
     collab_store: CollabStore,
     *,
-    owner_id: int | None,
+    owner_id: int | str | None,
 ) -> bool:
     """Return True if ``user_id`` may provision an external collaborative group.
 

@@ -41,10 +41,49 @@ except ImportError:  # pragma: no cover
     msvcrt = None  # type: ignore[assignment]
 
 from config import DATA_DIR
+from messaging.base import ChatRef
 
 log = logging.getLogger("robyx.collaborative")
 
 COLLAB_FILE = DATA_DIR / "collaborative_workspaces.json"
+
+
+# ── Spec 007 — chat-id encoding helpers (Discord) ────────────────────────
+
+
+def parse_discord_chat_id(chat_id: str) -> tuple[int, int]:
+    """Split a canonical Discord ``chat_id`` (``"<guild>:<channel>"``)
+    into the integer guild and channel ids.
+
+    Raises ``ValueError`` on malformed input.
+    """
+    parts = chat_id.split(":", 1)
+    if len(parts) != 2:
+        raise ValueError("malformed Discord chat_id: %r" % chat_id)
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError as e:
+        raise ValueError(
+            "non-integer Discord chat_id components: %r (%s)" % (chat_id, e),
+        ) from e
+
+
+def make_discord_chat_id(guild_id: int, channel_id: int) -> str:
+    """Build the canonical Discord ``chat_id`` string."""
+    return "%d:%d" % (guild_id, channel_id)
+
+
+def _normalise_chat_ref(value: Any, *, default_platform: str = "telegram") -> ChatRef:
+    """Coerce a legacy raw chat_id or a ChatRef instance into a ChatRef.
+
+    Used by :class:`CollabStore` to keep backwards compatibility with
+    pre-007 callers that pass a raw integer ``chat_id`` (assumed
+    Telegram). New code SHOULD pass a :class:`ChatRef` explicitly so the
+    platform is unambiguous.
+    """
+    if isinstance(value, ChatRef):
+        return value
+    return ChatRef(platform=default_platform, chat_id=str(value))
 
 # Shape that a collaborative workspace name is allowed to take. Names are
 # used as filename segments (``data/agents/<name>.md``) and as the suffix
@@ -94,24 +133,48 @@ class Role(enum.Enum):
 
 @dataclass
 class CollabWorkspace:
-    """A collaborative workspace backed by an external Telegram group."""
+    """A collaborative workspace backed by an external chat on Telegram,
+    Discord (post-spec-007), or Slack (post-spec-008).
+
+    ``chat_id`` is the canonical string form per
+    :class:`bot.messaging.base.ChatRef`. Legacy on-disk records that
+    stored ``chat_id`` as ``int`` are accepted by :meth:`from_dict` and
+    coerced to ``str``; the on-disk migration ``v0_28_0`` normalises the
+    persisted file. ``__post_init__`` coerces in-memory construction so
+    existing tests that pass ``chat_id=-100…`` (int) keep working.
+    """
 
     id: str
     name: str
     display_name: str
     agent_name: str
-    chat_id: int
+    chat_id: str = "0"
     interaction_mode: str = "intelligent"
     parent_workspace: str | None = None
     inherit_memory: bool = True
     invite_link: str | None = None
     status: str = "active"
     created_at: float = field(default_factory=time.time)
-    created_by: int = 0
-    expected_creator_id: int | None = None
+    created_by: int | str = 0
+    expected_creator_id: int | str | None = None
     roles: dict[str, str] = field(default_factory=dict)
+    # Spec 007 additions.
+    platform: str = "telegram"
+    expected_platform: str | None = None
 
-    def get_role(self, user_id: int) -> Role | None:
+    def __post_init__(self) -> None:
+        # Coerce legacy int chat_ids passed by pre-spec-007 callers
+        # (tests, in-process state) to the canonical string form. The
+        # migration v0_28_0 normalises the on-disk representation.
+        if not isinstance(self.chat_id, str):
+            self.chat_id = str(self.chat_id)
+
+    @property
+    def chat_ref(self) -> ChatRef:
+        """Platform-agnostic identifier for this workspace's chat."""
+        return ChatRef(platform=self.platform, chat_id=self.chat_id)
+
+    def get_role(self, user_id: int | str) -> Role | None:
         key = str(user_id)
         role_str = self.roles.get(key)
         if role_str is None:
@@ -121,26 +184,35 @@ class CollabWorkspace:
         except ValueError:
             return None
 
-    def set_role(self, user_id: int, role: Role) -> None:
+    def set_role(self, user_id: int | str, role: Role) -> None:
         self.roles[str(user_id)] = role.value
 
-    def remove_user(self, user_id: int) -> bool:
+    def remove_user(self, user_id: int | str) -> bool:
         return self.roles.pop(str(user_id), None) is not None
 
-    def is_owner(self, user_id: int) -> bool:
+    def is_owner(self, user_id: int | str) -> bool:
         return self.get_role(user_id) == Role.OWNER
 
-    def can_execute(self, user_id: int) -> bool:
+    def can_execute(self, user_id: int | str) -> bool:
         role = self.get_role(user_id)
         return role in (Role.OWNER, Role.OPERATOR)
 
-    def list_users(self) -> list[tuple[int, Role]]:
-        result = []
+    def list_users(self) -> list[tuple[int | str, Role]]:
+        """Return ``(user_id, role)`` pairs. ``user_id`` is returned as
+        ``int`` when the stored key parses as integer (Telegram/Discord
+        ids), or as ``str`` otherwise (Slack ``"U…"`` ids — reserved for
+        spec 008)."""
+        result: list[tuple[int | str, Role]] = []
         for uid_str, role_str in self.roles.items():
             try:
-                result.append((int(uid_str), Role(role_str)))
+                role = Role(role_str)
             except (ValueError, KeyError):
                 continue
+            try:
+                uid: int | str = int(uid_str)
+            except ValueError:
+                uid = uid_str
+            result.append((uid, role))
         return result
 
     def to_dict(self) -> dict:
@@ -149,7 +221,9 @@ class CollabWorkspace:
             "name": self.name,
             "display_name": self.display_name,
             "agent_name": self.agent_name,
-            "chat_id": self.chat_id,
+            "chat_id": str(self.chat_id),
+            "platform": self.platform,
+            "expected_platform": self.expected_platform,
             "interaction_mode": self.interaction_mode,
             "parent_workspace": self.parent_workspace,
             "inherit_memory": self.inherit_memory,
@@ -163,12 +237,16 @@ class CollabWorkspace:
 
     @classmethod
     def from_dict(cls, d: dict) -> CollabWorkspace:
+        raw_chat_id = d.get("chat_id", "0")
+        chat_id = str(raw_chat_id) if raw_chat_id is not None else "0"
         return cls(
             id=d["id"],
             name=d["name"],
             display_name=d.get("display_name", d["name"]),
             agent_name=d["agent_name"],
-            chat_id=d["chat_id"],
+            chat_id=chat_id,
+            platform=d.get("platform", "telegram"),
+            expected_platform=d.get("expected_platform"),
             interaction_mode=d.get("interaction_mode", "intelligent"),
             parent_workspace=d.get("parent_workspace"),
             inherit_memory=d.get("inherit_memory", True),
@@ -190,7 +268,10 @@ class CollabStore:
     def __init__(self, path: Path | None = None):
         self._path = path or COLLAB_FILE
         self._workspaces: dict[str, CollabWorkspace] = {}
-        self._chat_map: dict[int, str] = {}
+        # Spec 007: keyed by (platform, chat_id) tuple. Pre-007 stored
+        # ``dict[int, str]`` (Telegram-only). Pending workspaces with
+        # ``chat_id == "0"`` are NOT in the map.
+        self._chat_map: dict[tuple[str, str], str] = {}
         self._lock = threading.Lock()
         self._load()
 
@@ -292,8 +373,8 @@ class CollabStore:
     def _rebuild_chat_map(self) -> None:
         self._chat_map = {}
         for ws in self._workspaces.values():
-            if ws.status in _ROUTABLE_STATUSES and ws.chat_id:
-                self._chat_map[ws.chat_id] = ws.id
+            if ws.status in _ROUTABLE_STATUSES and ws.chat_id and ws.chat_id != "0":
+                self._chat_map[(ws.platform, ws.chat_id)] = ws.id
 
     def _write_unlocked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,8 +434,16 @@ class CollabStore:
     def get(self, ws_id: str) -> CollabWorkspace | None:
         return self._workspaces.get(ws_id)
 
-    def get_by_chat_id(self, chat_id: int) -> CollabWorkspace | None:
-        ws_id = self._chat_map.get(chat_id)
+    def get_by_chat_id(self, chat_ref_or_id: Any) -> CollabWorkspace | None:
+        """Look up an active/setup workspace by its chat identifier.
+
+        Spec 007: accepts either a :class:`ChatRef` (preferred) or a
+        legacy raw chat_id (``int`` / ``str`` — assumed Telegram) for
+        backwards compatibility with pre-007 callers. New code SHOULD
+        pass ``ChatRef`` so the platform is explicit.
+        """
+        chat_ref = _normalise_chat_ref(chat_ref_or_id)
+        ws_id = self._chat_map.get((chat_ref.platform, chat_ref.chat_id))
         return self._workspaces.get(ws_id) if ws_id else None
 
     def get_by_agent_name(self, agent_name: str) -> CollabWorkspace | None:
@@ -377,14 +466,38 @@ class CollabStore:
             and ws.status == "pending"
         ]
 
-    def list_pending_for_creator(self, creator_id: int) -> list[CollabWorkspace]:
-        """Return pending workspaces explicitly bound to this creator id."""
-        return [
-            ws for ws in self._workspaces.values()
-            if ws.status == "pending"
-            and ws.chat_id == 0
-            and ws.expected_creator_id == creator_id
-        ]
+    def list_pending_for_creator(
+        self,
+        creator_id: int | str,
+        *,
+        platform: str | None = None,
+    ) -> list[CollabWorkspace]:
+        """Return pending workspaces explicitly bound to this creator id.
+
+        Spec 007: optional ``platform`` filter rejects pending records
+        whose ``expected_platform`` does not match (cross-platform user
+        id collision guard, FR-013). When ``platform`` is ``None`` (the
+        default — preserves pre-007 Telegram callers), records that
+        have no ``expected_platform`` set OR have it set to any value
+        are returned. When ``platform`` is given, a record is included
+        iff ``expected_platform`` is ``None`` or equal to ``platform``.
+        """
+        out: list[CollabWorkspace] = []
+        for ws in self._workspaces.values():
+            if ws.status != "pending":
+                continue
+            if ws.chat_id != "0":
+                continue
+            if ws.expected_creator_id != creator_id:
+                continue
+            if (
+                platform is not None
+                and ws.expected_platform is not None
+                and ws.expected_platform != platform
+            ):
+                continue
+            out.append(ws)
+        return out
 
     def create_pending(
         self,
@@ -394,7 +507,9 @@ class CollabStore:
         agent_name: str,
         parent_workspace: str | None,
         inherit_memory: bool,
-        creator_id: int,
+        creator_id: int | str,
+        platform: str = "telegram",
+        expected_platform: str | None = None,
     ) -> CollabWorkspace:
         """Persist a pre-announced collaborative workspace.
 
@@ -433,7 +548,9 @@ class CollabStore:
                 name=name,
                 display_name=display_name,
                 agent_name=agent_name,
-                chat_id=0,
+                chat_id="0",
+                platform=platform,
+                expected_platform=expected_platform,
                 interaction_mode="intelligent",
                 parent_workspace=parent_workspace,
                 inherit_memory=inherit_memory,
@@ -479,25 +596,35 @@ class CollabStore:
             self._write_unlocked()
             return True
 
-    def migrate_chat_id(self, old_chat_id: int, new_chat_id: int) -> bool:
-        """Rebind a workspace from ``old_chat_id`` to ``new_chat_id``
-        without changing status. Used for Telegram supergroup migration.
+    def migrate_chat_id(self, old: Any, new: Any) -> bool:
+        """Rebind a workspace from ``old`` to ``new`` without changing
+        status. Used for Telegram supergroup migration.
 
-        Refuses to act unless there is a workspace bound to
-        ``old_chat_id`` in a routable status (active or setup).
+        Spec 007: accepts either :class:`ChatRef` instances (preferred)
+        or legacy raw chat_ids (assumed Telegram). Refuses cross-platform
+        migrations — both ``old`` and ``new`` MUST share the same
+        platform.
         """
-        if new_chat_id == 0:
+        old_ref = _normalise_chat_ref(old)
+        new_ref = _normalise_chat_ref(new)
+        if old_ref.platform != new_ref.platform:
+            log.warning(
+                "Refusing migrate_chat_id: cross-platform migration %s → %s",
+                old_ref.platform, new_ref.platform,
+            )
+            return False
+        if not new_ref.chat_id or new_ref.chat_id == "0":
             return False
         with self._mutex():
-            ws_id = self._chat_map.get(old_chat_id)
+            ws_id = self._chat_map.get((old_ref.platform, old_ref.chat_id))
             ws = self._workspaces.get(ws_id) if ws_id else None
             if not ws:
                 log.warning(
-                    "Refusing migrate_chat_id: no routable workspace at chat_id=%s",
-                    old_chat_id,
+                    "Refusing migrate_chat_id: no routable workspace at %s/%s",
+                    old_ref.platform, old_ref.chat_id,
                 )
                 return False
-            ws.chat_id = new_chat_id
+            ws.chat_id = new_ref.chat_id
             self._rebuild_chat_map()
             self._write_unlocked()
             return True
@@ -545,26 +672,39 @@ class CollabStore:
     def update_chat_id(
         self,
         ws_id: str,
-        chat_id: int,
+        chat_ref_or_id: Any,
         *,
-        expected_creator_id: int | None = None,
+        expected_creator_id: int | str | None = None,
     ) -> bool:
-        """Bind a pending workspace to a chat_id and promote it to active.
+        """Bind a pending workspace to a chat reference and promote to active.
 
-        Refuses to promote a workspace unless it is currently ``pending`` and
-        still unlinked (``chat_id == 0``). When ``expected_creator_id`` is
-        provided, it must match the workspace's bound creator — this prevents
-        a Flow-A race where an outsider adds the bot to a group and hijacks
-        another user's pending workspace.
+        Spec 007: accepts either a :class:`ChatRef` (preferred) or a
+        legacy raw chat_id (``int`` / ``str`` — assumed Telegram).
+        Refuses cross-platform binds when the pending workspace has
+        ``expected_platform`` set and the new chat reference's platform
+        does not match (FR-013). Refuses to promote a workspace unless
+        it is currently ``pending`` and still unlinked (``chat_id == "0"``).
+        Refuses creator mismatches in the same conditions as pre-007.
         """
+        new_ref = _normalise_chat_ref(chat_ref_or_id)
         with self._mutex():
             ws = self._workspaces.get(ws_id)
             if not ws:
                 return False
-            if ws.status != "pending" or ws.chat_id != 0:
+            if ws.status != "pending" or ws.chat_id != "0":
                 log.warning(
                     "Refusing update_chat_id for %s: status=%s chat_id=%s",
                     ws_id, ws.status, ws.chat_id,
+                )
+                return False
+            if (
+                ws.expected_platform is not None
+                and ws.expected_platform != new_ref.platform
+            ):
+                log.warning(
+                    "Refusing update_chat_id for %s: platform mismatch "
+                    "(expected=%s got=%s)",
+                    ws_id, ws.expected_platform, new_ref.platform,
                 )
                 return False
             if (
@@ -578,13 +718,14 @@ class CollabStore:
                     ws_id, ws.expected_creator_id, expected_creator_id,
                 )
                 return False
-            ws.chat_id = chat_id
+            ws.platform = new_ref.platform
+            ws.chat_id = new_ref.chat_id
             ws.status = "active"
             self._rebuild_chat_map()
             self._write_unlocked()
             return True
 
-    def update_roles(self, ws_id: str, user_id: int, role: Role) -> bool:
+    def update_roles(self, ws_id: str, user_id: int | str, role: Role) -> bool:
         with self._mutex():
             ws = self._workspaces.get(ws_id)
             if not ws:
@@ -615,4 +756,56 @@ class CollabStore:
 
     @property
     def chat_ids(self) -> set[int]:
+        """Legacy Telegram-only routable chat_ids as a ``set[int]``.
+
+        Preserved for backwards compatibility with pre-spec-007 callers
+        (currently only one assertion in ``tests/test_collaborative.py``).
+        For platform-aware iteration use :meth:`find_active_by_platform`
+        or :meth:`chat_keys`.
+        """
+        out: set[int] = set()
+        for plat, chat_id in self._chat_map:
+            if plat != "telegram":
+                continue
+            try:
+                out.add(int(chat_id))
+            except ValueError:
+                continue
+        return out
+
+    @property
+    def chat_keys(self) -> set[tuple[str, str]]:
+        """Multi-platform routable chat keys as ``set[(platform, chat_id)]``.
+
+        Spec 007: introduced as the platform-aware replacement for
+        :attr:`chat_ids`. Handler-layer callers migrate to this in
+        spec 007 Phase 3.
+        """
         return set(self._chat_map.keys())
+
+    def find_active_in_guild(self, guild_id: str | int) -> list[CollabWorkspace]:
+        """Return active/setup Discord workspaces whose ``chat_id``
+        starts with ``f"{guild_id}:"``.
+
+        Used by the spec-007 ``leave_chat`` policy in
+        ``bot/handlers.py:collab_bot_added`` to refuse leaving a guild
+        that hosts other legitimate workspaces. ``guild_id`` is accepted
+        as ``str`` or ``int`` for caller ergonomics.
+        """
+        prefix = "%s:" % guild_id
+        return [
+            ws for ws in self._workspaces.values()
+            if ws.platform == "discord"
+            and ws.status in _ROUTABLE_STATUSES
+            and ws.chat_id.startswith(prefix)
+        ]
+
+    def find_active_by_platform(self, platform: str) -> list[CollabWorkspace]:
+        """Return active/setup workspaces on a given platform.
+
+        Reserved for spec 008 (Slack) but harmless to expose now.
+        """
+        return [
+            ws for ws in self._workspaces.values()
+            if ws.platform == platform and ws.status in _ROUTABLE_STATUSES
+        ]

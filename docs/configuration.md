@@ -44,6 +44,17 @@ All env vars use the `ROBYX_` prefix. Legacy `KAELOPS_` prefixes are still accep
 | `DISCORD_GUILD_ID` | Yes | Server ID (right-click server → Copy Server ID) |
 | `DISCORD_OWNER_ID` | Yes | Your Discord user ID |
 | `DISCORD_CONTROL_CHANNEL_ID` | Yes | Control-room channel ID. The interactive setup usually discovers or creates it for you; manual `.env` or non-interactive setup should set it explicitly |
+| `DISCORD_INVITE_TTL_DAYS` | No (default `7`) | Spec 007 — TTL of the invite link Robyx generates when a collaborative-workspace guild is bound. `0` = no expiry (Discord sentinel). Invalid or negative values fall back to the default with a WARN log. |
+| `DISCORD_INVITE_MAX_USES` | No (default `10`) | Spec 007 — usage cap on generated invite links. `0` = unlimited (Discord sentinel). Invalid or negative values fall back to the default. |
+
+**Required Discord bot OAuth permissions** for collaborative workspaces (spec 007 — set on the bot invite URL):
+
+| Permission | Why |
+|---|---|
+| `Send Messages` | Post responses in the bound channel and in HQ. |
+| `Manage Channels` | Rename topics/threads when continuous-task state markers change (spec 006); needed for forum-topic operations. |
+| `Create Instant Invite` | Generate the invite URL Robyx attaches to the HQ notification when binding a workspace. |
+| `View Audit Log` | Resolve "who added me" on `on_guild_join`. Without this permission the bot falls back to the `/im-the-owner <workspace-name>` manual claim — workflows still work, but each Flow A bind requires a manual step. |
 
 ## Slack
 

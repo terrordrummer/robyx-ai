@@ -75,6 +75,41 @@ DISCORD_GUILD_ID = _int_env("DISCORD_GUILD_ID", "", 0)
 DISCORD_OWNER_ID = _int_env("DISCORD_OWNER_ID", "", 0)
 DISCORD_CONTROL_CHANNEL_ID = _int_env("DISCORD_CONTROL_CHANNEL_ID", "", 0)
 
+
+def _int_env_with_default(name: str, default: int) -> int:
+    """Read an integer env var, falling back to ``default`` on missing,
+    non-numeric, or negative values (with a WARN log on the bad-value
+    path). Spec 007: used for the ``DISCORD_INVITE_*`` knobs where
+    ``0`` is the operator's "no limit" sentinel — accepted — but a
+    negative value is operator error and must fall back rather than
+    propagate into ``channel.create_invite(max_age=...)``.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        _log.warning(
+            "Invalid integer value for %s: %r — falling back to default %d",
+            name, raw, default,
+        )
+        return default
+    if value < 0:
+        _log.warning(
+            "Negative value for %s: %d — falling back to default %d",
+            name, value, default,
+        )
+        return default
+    return value
+
+
+# Spec 007 — Discord invite-link knobs. ``0`` is the operator-allowed
+# "no limit" sentinel per Discord's create_invite API; negative values
+# are operator errors and fall back to the defaults with a WARN log.
+DISCORD_INVITE_TTL_DAYS = _int_env_with_default("DISCORD_INVITE_TTL_DAYS", 7)
+DISCORD_INVITE_MAX_USES = _int_env_with_default("DISCORD_INVITE_MAX_USES", 10)
+
 # ── Optional ──
 WORKSPACE = Path(_env("ROBYX_WORKSPACE", "KAELOPS_WORKSPACE", os.path.expanduser("~/Workspace")))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")

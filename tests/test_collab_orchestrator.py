@@ -49,7 +49,8 @@ class TestHandleCollabSend:
         assert "[COLLAB_SEND name=" not in out
         delivery = [
             c for c in mock_platform.send_message.call_args_list
-            if c.kwargs.get("chat_id") == -100777
+            # Spec 007: ws.chat_id is the canonical str form.
+            if c.kwargs.get("chat_id") == "-100777"
         ]
         assert delivery, "Expected delivery to the Nebula group"
         assert delivery[0].kwargs["text"] == "Hello Nebula"

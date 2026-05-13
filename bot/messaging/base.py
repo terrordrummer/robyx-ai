@@ -13,6 +13,80 @@ _log = logging.getLogger("robyx.messaging")
 _T = TypeVar("_T")
 
 
+# ── Spec 007 — platform-agnostic chat identifier ────────────────────────
+
+
+@dataclass(frozen=True)
+class ChatRef:
+    """Platform-agnostic chat identifier used by every lifecycle event
+    and by :class:`bot.collaborative.CollabStore` lookups.
+
+    Canonical ``chat_id`` encodings:
+
+    - Telegram: ``"<chat_id_int>"`` (e.g. ``"-1001234567890"``)
+    - Discord: ``"<guild_id>:<channel_id>"`` (e.g. ``"1234:5678"``)
+    - Slack: ``"<team_id>:<channel_id>"`` (reserved for spec 008)
+
+    Frozen, hashable, and JSON-serialisable via :meth:`to_dict` /
+    :meth:`from_dict`. See ``specs/007-discord-parity/contracts/chat-ref.md``.
+    """
+
+    platform: str
+    chat_id: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"platform": self.platform, "chat_id": self.chat_id}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ChatRef":
+        return cls(platform=d["platform"], chat_id=str(d["chat_id"]))
+
+
+# ── Spec 007 — lifecycle event dataclasses ──────────────────────────────
+
+
+@dataclass(frozen=True)
+class LifecycleAdded:
+    """Bot was added to a chat (Telegram group, Discord guild, Slack
+    channel). Emitted by every adapter that supports lifecycle events;
+    consumed by ``bot.handlers.collab_bot_added``.
+
+    ``added_by_id`` is ``int`` for Telegram/Discord, ``str`` for Slack,
+    or ``None`` when the platform cannot resolve the inviter (e.g.
+    Discord audit-log lookup failed). ``raw_event`` carries the
+    platform-specific payload for diagnostic logging only — handlers
+    MUST NOT branch on it.
+    """
+
+    chat_ref: ChatRef
+    chat_title: str | None = None
+    added_by_id: int | str | None = None
+    added_by_name: str | None = None
+    raw_event: Any = None
+
+
+@dataclass(frozen=True)
+class LifecycleRemoved:
+    """Bot was removed from a chat (kicked, banned, or the chat/guild
+    was deleted). Emitted by every adapter that supports lifecycle
+    events; consumed by ``bot.handlers.collab_bot_removed``."""
+
+    chat_ref: ChatRef
+    chat_title: str | None = None
+    raw_event: Any = None
+
+
+@dataclass(frozen=True)
+class LifecycleMigrated:
+    """A chat's identity changed (Telegram supergroup migration). The
+    workspace must be rebound from ``old_chat_ref`` to ``new_chat_ref``
+    without changing status. Discord/Slack do not emit this event."""
+
+    old_chat_ref: ChatRef
+    new_chat_ref: ChatRef
+    raw_event: Any = None
+
+
 async def retry_send(
     op: Callable[[], Awaitable[_T]],
     *,
@@ -82,6 +156,34 @@ class PlatformMessage:
 
 class Platform(abc.ABC):
     """Abstract interface that every messaging platform adapter must implement."""
+
+    # ── Spec 007 — lifecycle callbacks (observer pattern) ──────────────
+    #
+    # ``bot.bot._wire_lifecycle`` assigns these once at startup. Adapters
+    # invoke them when their native lifecycle event fires (Telegram
+    # ``ChatMemberHandler``, Discord ``on_guild_join``/``on_guild_remove``,
+    # Slack ``member_joined_channel`` — last is stubbed in 007; filled in
+    # by spec 008). Handlers branch on ``event.chat_ref.platform`` rather
+    # than on the adapter class.
+    on_added: Callable[[LifecycleAdded], Awaitable[None]] | None = None
+    on_removed: Callable[[LifecycleRemoved], Awaitable[None]] | None = None
+    on_migrated: Callable[[LifecycleMigrated], Awaitable[None]] | None = None
+
+    @property
+    def bot_user_id(self) -> int | str | None:
+        """Return the bot's user id on this platform, or ``None`` if it
+        is not yet resolved (e.g. Discord adapter before ``on_ready``,
+        Slack adapter before ``auth.test``).
+
+        - Telegram: ``int`` (set by the adapter after first ``getMe``)
+        - Discord: ``int`` (set after ``on_ready``)
+        - Slack: ``str`` like ``"U01ABC"`` (set after ``auth.test``)
+
+        Used by Slack's ``member_joined_channel`` handler (spec 008) to
+        filter "is this me?" events, and by any future code that needs
+        to compare user ids against the bot's own id.
+        """
+        return None
 
     @property
     @abc.abstractmethod

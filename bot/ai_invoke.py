@@ -207,6 +207,14 @@ GET_EVENTS_PATTERN = re.compile(
     r'\[GET_EVENTS(\s+[^\]]*?)?\s*\]',
     re.DOTALL,
 )
+# Spec 007.1 — any non-orchestrator agent can pull archived conversations
+# of itself (or another named agent) on demand. Same lifecycle pattern as
+# [GET_EVENTS]: handler strips the token, queries the archive layer, and
+# injects the result as system-context for the same turn.
+GET_ARCHIVE_PATTERN = re.compile(
+    r'\[GET_ARCHIVE(\s+[^\]]*?)?\s*\]',
+    re.DOTALL,
+)
 _COLLAB_ATTR_PATTERN = re.compile(r'(\w+)="([^"]*)"', re.DOTALL)
 
 
@@ -949,6 +957,25 @@ async def _invoke_ai_locked(
         agent.message_count += 1
         agent.session_started = True
         manager.save_state()
+
+        # Spec 007.1 — conversation archive. Log this turn so /clear can
+        # produce a markdown transcript before resetting the session.
+        # Orchestrator turns are intentionally excluded (Roberto's design
+        # choice — the HQ agent needs full cross-session context). The
+        # log call is defensive (swallows all exceptions) so a failure
+        # never breaks message delivery.
+        if not is_orchestrator_call and agent.agent_type != "orchestrator":
+            try:
+                from conversations import append_turn
+                append_turn(
+                    agent.name,
+                    user_text=message,
+                    agent_text=text,
+                    platform=getattr(platform, "__class__", type(platform)).__name__,
+                )
+            except Exception:
+                # append_turn is already defensive; this is belt-and-braces.
+                pass
         return text
 
     except AIIdleTimeout as exc:

@@ -166,7 +166,10 @@ class TestCollabStore:
         ws2 = store2.get("collab-test1")
         assert ws2 is not None
         assert ws2.name == "test-project"
-        assert ws2.chat_id == -1001234567890
+        # Spec 007: chat_id is the canonical string form. The dataclass
+        # __post_init__ coerces int constructions to str, and from_dict
+        # accepts both shapes on load. Either equality form is true.
+        assert ws2.chat_id == "-1001234567890"
         assert ws2.get_role(111) == Role.OWNER
 
     def test_corrupt_json_is_quarantined(self, tmp_path):
@@ -238,7 +241,7 @@ class TestCollabStore:
         ws = store.get("collab-rec-1")
         assert ws is not None
         assert ws.name == "recovered-project"
-        assert ws.chat_id == -100123
+        assert ws.chat_id == "-100123"  # spec 007: canonical str form
 
         # Quarantine record preserved.
         siblings = list(collab_path.parent.glob(
@@ -286,9 +289,11 @@ class TestCollabStore:
         store = CollabStore(tmp_path / "collab.json")
         ws = _make_ws(chat_id=0, status="pending")
         store.add(ws)
+        # Spec 007: legacy int chat_id is accepted by the dual-mode API
+        # (assumed Telegram), but the stored form is canonical str.
         assert store.get_by_chat_id(0) is None
         assert store.update_chat_id("collab-test1", -100999) is True
-        assert ws.chat_id == -100999
+        assert ws.chat_id == "-100999"
         assert ws.status == "active"
         assert store.get_by_chat_id(-100999) is ws
 
@@ -393,7 +398,7 @@ class TestCreatePending:
             creator_id=777,
         )
         assert ws.status == "pending"
-        assert ws.chat_id == 0
+        assert ws.chat_id == "0"  # spec 007: canonical str form for pending
         assert ws.expected_creator_id == 777
         assert ws.parent_workspace == "astro-research"
         assert ws.inherit_memory is True
@@ -510,7 +515,7 @@ class TestMigrateChatId:
                       chat_id=-100111, status="active")
         store.add(ws)
         assert store.migrate_chat_id(-100111, -100999) is True
-        assert ws.chat_id == -100999
+        assert ws.chat_id == "-100999"  # spec 007: canonical str form
         assert ws.status == "active"
         assert store.get_by_chat_id(-100999) is ws
         assert store.get_by_chat_id(-100111) is None

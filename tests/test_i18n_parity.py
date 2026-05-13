@@ -130,9 +130,16 @@ def _extract_handler_commands() -> set[str]:
     # commands the user types in chat. Keys starting with "_" are
     # internal helpers exposed for tests (e.g. ``_handle_collab_announce``)
     # and are never user-facing.
+    #
+    # ``im-the-owner`` is a Discord-only audit-log-failure recovery
+    # command (spec 007). It is surfaced contextually in the fallback
+    # message that the bot posts when the audit-log lookup fails —
+    # exposing it in the global /help list would advertise a recovery
+    # path that has no meaning to Telegram users.
     internal = {
         "message", "voice", "collab_bot_added", "collab_bot_removed",
         "collab_bot_migrated", "start", "help",
+        "im-the-owner",
     }
     return {
         k for k in handlers.keys()

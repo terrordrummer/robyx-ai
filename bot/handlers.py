@@ -25,6 +25,7 @@ from ai_invoke import (
     CREATE_SPECIALIST_PATTERN,
     FOCUS_OFF_PATTERN,
     FOCUS_PATTERN,
+    GET_ARCHIVE_PATTERN,
     GET_EVENTS_PATTERN,
     NOTIFY_HQ_PATTERN,
     REMIND_PATTERN,
@@ -78,6 +79,7 @@ _EXECUTIVE_MARKERS = (
     ("COLLAB_SETUP_COMPLETE", COLLAB_SETUP_COMPLETE_PATTERN),
     ("NOTIFY_HQ", NOTIFY_HQ_PATTERN),
     ("GET_EVENTS", GET_EVENTS_PATTERN),
+    ("GET_ARCHIVE", GET_ARCHIVE_PATTERN),
 )
 
 
@@ -269,6 +271,123 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             )
         else:
             await platform.reply(msg_ref, STRINGS["agent_not_found"] % name)
+
+    async def cmd_clear(platform, msg, msg_ref):
+        """Spec 007.1 — archive the current conversation as a markdown
+        file and reset the agent's AI-CLI session.
+
+        Identifies the target agent from the topic/channel where the
+        command was issued (``manager.get_by_thread(msg.thread_id)``).
+        Refuses in the orchestrator's main topic (HQ) — the orchestrator
+        needs full cross-session context to coordinate.
+
+        Authorisation:
+
+        - Workspace / specialist agents: bot owner only (same as ``/reset``).
+        - Collaborative workspaces: OWNER or OPERATOR of that workspace.
+
+        On success, writes ``data/conversations/<agent>/archive-<UTC>.md``
+        with the markdown transcript of every turn since the previous
+        ``/clear`` (or since the agent was created), then regenerates
+        ``session_id`` and resets ``message_count`` / ``session_started``.
+        The next message starts a fresh session on the AI backend.
+        """
+        from conversations import archive_and_clear
+
+        # HQ guard — refuse a bare ``/clear`` in the orchestrator's
+        # topic. ``/clear <name>`` from HQ is allowed because it
+        # explicitly targets a non-orchestrator agent (useful when a
+        # specialist's topic isn't easy to navigate to). The
+        # orchestrator's own session is never cleared via this command.
+        in_hq = platform.is_main_thread(msg.chat_id, msg.thread_id)
+        if in_hq and not msg.args:
+            await platform.reply(
+                msg_ref,
+                STRINGS["clear_refused_in_hq"],
+                parse_mode="markdown",
+            )
+            return
+
+        agent = None
+        # Identify the target agent. Priority: explicit name arg (so
+        # ``/clear specialist-x`` from HQ resolves cleanly), then
+        # thread_id lookup (the topic the user typed /clear in).
+        if msg.args:
+            agent = manager.get(msg.args[0].lower())
+        if agent is None and msg.thread_id is not None:
+            agent = manager.get_by_thread(msg.thread_id)
+
+        if agent is None:
+            await platform.reply(msg_ref, STRINGS["clear_usage"])
+            return
+
+        # Defensive: if the topic-map miraculously routed back to the
+        # orchestrator (would be a bug, but cheap to guard), refuse.
+        if agent.agent_type == "orchestrator":
+            await platform.reply(
+                msg_ref,
+                STRINGS["clear_refused_in_hq"],
+                parse_mode="markdown",
+            )
+            return
+
+        # Authorisation. For collaborative workspaces the chat permits
+        # OWNER / OPERATOR roles (managed via ``can_execute``). For
+        # standalone workspace / specialist agents the bot owner is the
+        # only caller, mirroring ``/reset``.
+        if collab_store is not None:
+            collab_ws = collab_store.get_by_chat_id(msg.chat_id)
+        else:
+            collab_ws = None
+        if collab_ws is not None:
+            from authorization import can_send_executive
+            role = collab_ws.get_role(msg.user_id)
+            owner_id = getattr(_config, "OWNER_ID", None)
+            is_global_owner = owner_id is not None and msg.user_id == owner_id
+            if not (is_global_owner or can_send_executive(role)):
+                await platform.reply(msg_ref, STRINGS["collab_not_owner"])
+                return
+        else:
+            if not platform.is_owner(msg.user_id):
+                # Mirror the @owner_only convention used by /reset etc.
+                return
+
+        # Archive (best-effort — failure here MUST NOT block the reset).
+        archive_path = None
+        try:
+            archive_path = archive_and_clear(
+                agent.name,
+                display_name=agent.description or agent.name,
+                session_id=agent.session_id,
+            )
+        except Exception as exc:
+            log.warning(
+                "cmd_clear: archive_and_clear raised for %s: %s",
+                agent.name, exc, exc_info=True,
+            )
+
+        # Reset the session — same surgery as ``/reset``.
+        agent.session_id = str(uuid.uuid4())
+        agent.message_count = 0
+        agent.session_started = False
+        manager.save_state()
+
+        if archive_path is None:
+            await platform.reply(
+                msg_ref,
+                STRINGS["clear_no_history"] % agent.name,
+                parse_mode="markdown",
+            )
+        else:
+            await platform.reply(
+                msg_ref,
+                STRINGS["clear_archived"] % (agent.name, archive_path.name),
+                parse_mode="markdown",
+            )
+        log.info(
+            "cmd_clear agent=%s archive=%s by=%s",
+            agent.name, archive_path, msg.user_id,
+        )
 
     @owner_only
     async def cmd_focus(platform, msg, msg_ref):
@@ -542,6 +661,12 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 # push-notifications to HQ — this is the pull-based
                 # query path that makes FR-002 ("scheduler silence") safe.
                 response = await _handle_get_events(response, agent.name)
+                # Spec 007.1 — [GET_ARCHIVE since="…" name="…"]. Same
+                # lifecycle as GET_EVENTS: strip the macro, read the
+                # archive *.md files, inject as system-context for the
+                # same turn. Available to every executive-authorised
+                # agent (orchestrator excluded inside the handler).
+                response = await _handle_get_archive(response, agent.name)
 
                 if is_robyx:
                     response = await handle_delegations(
@@ -667,6 +792,28 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             inherit = attrs.get("inherit", "").strip()
             inherit_memory_raw = attrs.get("inherit_memory", "true").strip().lower()
             inherit_memory = inherit_memory_raw != "false"
+            # Spec 007 — optional target-platform + per-announce creator
+            # override. Default ``"telegram"`` and ``OWNER_ID`` preserve
+            # pre-007 announce semantics. When ``platform="discord"`` is
+            # specified, the matching pending workspace is bound only
+            # when a Discord lifecycle event from ``creator_id`` arrives
+            # (cross-platform user-id collision guard, FR-013).
+            target_platform = attrs.get("platform", "telegram").strip().lower() or "telegram"
+            creator_id_raw = attrs.get("creator_id", "").strip()
+
+            if target_platform not in ("telegram", "discord", "slack"):
+                log.warning(
+                    "[COLLAB_ANNOUNCE] rejected: unknown platform %r",
+                    target_platform,
+                )
+                out = out.replace(
+                    match.group(0),
+                    STRINGS["collab_announce_error"] % (
+                        "unknown platform: %s" % target_platform
+                    ),
+                    1,
+                )
+                continue
 
             if not name or not purpose:
                 log.warning(
@@ -720,6 +867,24 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 )
                 continue
 
+            # Spec 007 — resolve creator_id. Default to ``OWNER_ID`` for
+            # back-compat with pre-007 Telegram announces. When the
+            # orchestrator specifies ``creator_id="..."`` (e.g. a Discord
+            # user id that is unrelated to the Telegram OWNER_ID), use
+            # that verbatim — int if numeric, str otherwise (reserved
+            # for Slack's ``"U..."`` ids in spec 008).
+            if creator_id_raw:
+                try:
+                    resolved_creator: int | str = int(creator_id_raw)
+                except ValueError:
+                    resolved_creator = creator_id_raw
+            else:
+                resolved_creator = OWNER_ID
+            # Set expected_platform only when explicitly targeting a
+            # non-default platform — pre-007 Telegram announces leave
+            # the field None (back-compat).
+            expected_platform = target_platform if target_platform != "telegram" else None
+
             try:
                 collab_store.create_pending(
                     name=name,
@@ -727,7 +892,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                     agent_name=name,
                     parent_workspace=inherit or None,
                     inherit_memory=inherit_memory,
-                    creator_id=OWNER_ID,
+                    creator_id=resolved_creator,
+                    platform=target_platform,
+                    expected_platform=expected_platform,
                 )
             except ValueError as e:
                 # Roll back the agent file so the next announce can
@@ -745,8 +912,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 continue
 
             log.info(
-                "collab.announce name=%s creator_id=%s purpose=%r inherit=%r",
-                name, OWNER_ID, purpose, inherit,
+                "collab.announce name=%s platform=%s creator_id=%s "
+                "purpose=%r inherit=%r",
+                name, target_platform, resolved_creator, purpose, inherit,
             )
             out = out.replace(
                 match.group(0),
@@ -1096,6 +1264,125 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                             "handlers.get_events agent=%s since=%s task=%s type=%s returned=%d",
                             agent_name, since_raw, task_filter, type_filter,
                             len(entries),
+                        )
+
+            out = out[: match.start()] + rendered + out[match.end():]
+
+        return out
+
+    async def _handle_get_archive(response: str, agent_name: str) -> str:
+        """Spec 007.1 — process ``[GET_ARCHIVE since="…" name="…" limit="…"]``
+        macros. Returns the response with each macro replaced by the
+        concatenated markdown bodies of the matching archive files.
+
+        Attributes:
+
+        - ``since`` — REQUIRED; duration (``30m``, ``2h``, ``1d``,
+          ``3600s``) or ISO-8601 UTC timestamp.
+        - ``name`` — optional; defaults to the calling agent (so an
+          agent can pull its own past conversations without naming
+          itself explicitly).
+        - ``limit`` — optional integer in [1, 50]; default 10.
+        """
+        from ai_invoke import GET_ARCHIVE_PATTERN
+        from conversations import query_archives
+
+        if not response:
+            return response
+        matches = list(GET_ARCHIVE_PATTERN.finditer(response))
+        if not matches:
+            return response
+
+        from datetime import datetime, timedelta, timezone
+
+        def _parse_since(raw: str) -> datetime | None:
+            raw = (raw or "").strip()
+            if not raw:
+                return None
+            try:
+                if raw[-1:] in ("s", "m", "h", "d") and raw[:-1].isdigit():
+                    n = int(raw[:-1])
+                    unit = raw[-1]
+                    seconds = n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+                    return datetime.now(timezone.utc) - timedelta(seconds=seconds)
+            except (ValueError, KeyError):
+                pass
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except ValueError:
+                return None
+
+        def _error(code: str, human: str, attrs: dict) -> str:
+            attr_str = " ".join('%s=%r' % (k, v) for k, v in attrs.items()) or "(none)"
+            return (
+                "_archive-query error: %s — %s_\n\n"
+                "_Attributes received: %s_"
+                % (code, human, attr_str)
+            )
+
+        out = response
+        for match in reversed(matches):
+            raw_attrs = (match.group(1) or "").strip()
+            attrs = parse_collab_attrs(raw_attrs) if raw_attrs else {}
+
+            since_raw = attrs.get("since", "")
+            target_name = (attrs.get("name") or agent_name).strip().lower()
+            limit_raw = attrs.get("limit")
+
+            since_dt = _parse_since(since_raw) if since_raw else None
+            if since_dt is None:
+                rendered = _error(
+                    "INVALID_DURATION",
+                    "`since` must be a duration (30m, 2h, 1d) or ISO-8601",
+                    attrs,
+                )
+            else:
+                try:
+                    limit = int(limit_raw) if limit_raw else 10
+                    if not 1 <= limit <= 50:
+                        raise ValueError
+                except ValueError:
+                    rendered = _error(
+                        "INVALID_LIMIT",
+                        "`limit` must be an integer in [1, 50]",
+                        attrs,
+                    )
+                else:
+                    try:
+                        archives = query_archives(
+                            target_name, since=since_dt, limit=limit,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "[GET_ARCHIVE] query failed for %s: %s",
+                            target_name, exc, exc_info=True,
+                        )
+                        rendered = _error("QUERY_FAILED", str(exc), attrs)
+                    else:
+                        if not archives:
+                            rendered = (
+                                "_No conversation archives for *%s* since %s._"
+                                % (target_name, since_dt.isoformat(timespec="seconds"))
+                            )
+                        else:
+                            blocks = []
+                            for a in archives:
+                                blocks.append(a["body"])
+                            rendered = (
+                                "**Archives for %s** (%d file%s since %s):\n\n%s"
+                                % (
+                                    target_name, len(archives),
+                                    "" if len(archives) == 1 else "s",
+                                    since_dt.isoformat(timespec="seconds"),
+                                    "\n\n---\n\n".join(blocks),
+                                )
+                            )
+                        log.info(
+                            "handlers.get_archive agent=%s target=%s since=%s returned=%d",
+                            agent_name, target_name, since_raw, len(archives),
                         )
 
             out = out[: match.start()] + rendered + out[match.end():]
@@ -1906,10 +2193,44 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
         return False
 
-    def _parse_user_id(text: str) -> int | None:
-        text = text.strip().lstrip("@")
+    # Spec 007 — mention dialect patterns. Co-located with _parse_user_id;
+    # compiled once per make_handlers call (negligible overhead).
+    _DISCORD_MENTION_RE = re.compile(r"^<@!?(\d+)>$")
+    _SLACK_MENTION_RE = re.compile(r"^<@(U[A-Z0-9]+)>$")
+
+    def _parse_user_id(text: str) -> int | str | None:
+        """Spec 007 — cross-platform mention parser.
+
+        Accepts the user-id forms emitted by every supported platform:
+
+        - ``<@123>`` / ``<@!123>`` (Discord, optionally nickname-aware) → ``int``
+        - ``<@U12345>`` (Slack, reserved for spec 008) → ``str``
+        - ``@123`` / bare ``123`` (Telegram legacy or numeric paste) → ``int``
+        - ``@username`` (alphanumeric handle, no resolution) → ``None``
+        - garbage / empty → ``None``
+
+        Returns the parsed identifier in its platform-native type so the
+        downstream callers can pass it through to
+        :meth:`CollabWorkspace.set_role` / ``get_role`` (which accept
+        ``int | str``). Note: Slack ids are intentionally not converted
+        to int — they are opaque strings like ``"U01ABC"``.
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        # Discord mention: <@id> or <@!id> (nickname-aware).
+        m = _DISCORD_MENTION_RE.match(text)
+        if m:
+            return int(m.group(1))
+        # Slack mention: <@U...> — reserved for spec 008, accepted now to
+        # avoid a second parser refactor.
+        m = _SLACK_MENTION_RE.match(text)
+        if m:
+            return m.group(1)
+        # Telegram legacy / bare numeric: strip optional leading @, parse int.
+        bare = text.lstrip("@")
         try:
-            return int(text)
+            return int(bare)
         except ValueError:
             return None
 
@@ -1980,8 +2301,229 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
     # ── Collaborative workspace: bot added to a new group ──
 
-    async def collab_bot_added(platform, chat, added_by):
-        """Handle the bot being added to a new Telegram group.
+    async def _flow_a_post_bind(platform, ws, chat_ref, *, chat_title):
+        """Spec 007: post-bind tail of Flow A. Called both by the audit-log
+        success path inside ``collab_bot_added`` and by the manual claim
+        path in ``_handle_im_the_owner``. Idempotent at the chat-message
+        level — duplicate runs would simply re-send the welcome and HQ
+        notification, which the callers prevent by gating on a successful
+        ``update_chat_id`` transition.
+
+        Steps:
+
+        1. Generate the invite link via ``platform.get_invite_link``.
+        2. Read the pre-announced purpose from the seed agent file
+           (fallback to ``ws.display_name``).
+        3. Post the in-group welcome message.
+        4. Notify HQ with the configured purpose and the invite link.
+        """
+        chat_id = chat_ref.chat_id
+
+        # Generate invite link
+        try:
+            link = await platform.get_invite_link(chat_id)
+            if link:
+                collab_store.update_invite_link(ws.id, link)
+        except Exception as e:
+            log.warning(
+                "Failed to generate invite link for collab %s: %s", ws.id, e,
+            )
+
+        # Read back the pre-announced purpose from the seed agent file
+        # so the welcome + HQ notification reflect real intent (SC-001).
+        # Silent fallback to display_name keeps the flow resilient when
+        # the file is missing.
+        purpose = ws.display_name
+        try:
+            from config import AGENTS_DIR
+            agent_file = AGENTS_DIR / ("%s.md" % ws.agent_name)
+            if agent_file.exists():
+                for line in agent_file.read_text().splitlines():
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    purpose = stripped
+                    break
+        except OSError as e:
+            log.warning(
+                "Could not read agent file for %s: %s", ws.agent_name, e,
+            )
+
+        # Send welcome message in the new group — references purpose.
+        try:
+            await platform.send_message(
+                chat_id=chat_id,
+                text=STRINGS["collab_welcome_pending"] % (
+                    ws.display_name, purpose,
+                ),
+                parse_mode="markdown",
+            )
+        except Exception as e:
+            log.warning("Failed to send collab welcome: %s", e)
+
+        # Notify in HQ — include purpose (FR-009, SC-001).
+        link_text = (
+            "\nInvite link: %s" % ws.invite_link if ws.invite_link else ""
+        )
+        try:
+            await platform.send_message(
+                chat_id=_config.CHAT_ID if hasattr(_config, "CHAT_ID") else 0,
+                text=STRINGS["collab_bot_added_hq_matched"] % (
+                    ws.display_name, chat_title, chat_id, purpose, link_text,
+                ),
+                thread_id=platform.control_room_id,
+                parse_mode="markdown",
+            )
+        except Exception as e:
+            log.warning("Failed to send collab HQ notification: %s", e)
+
+        log.info(
+            "collab.match ws_id=%s chat_id=%s title=%r purpose=%r",
+            ws.id, chat_id, chat_title, purpose,
+        )
+
+    async def _handle_im_the_owner(platform, msg, msg_ref):
+        """Spec 007: manual-claim escape hatch for Discord guilds where
+        the audit-log inviter lookup failed (Forbidden / empty / sustained
+        error). The issuing user types ``/im-the-owner <workspace-name>``
+        in the target channel; if a pending workspace exists for them on
+        the same platform, the bot binds the channel and triggers the
+        same downstream flow as the audit-log success path.
+
+        Refusal paths produce deterministic STRINGS so tests can assert
+        them verbatim (see ``contracts/im-the-owner.md`` for the matrix).
+        Identity-aware: the issuing user must match the pending
+        workspace's ``expected_creator_id``.
+        """
+        if collab_store is None:
+            return
+
+        text = (msg.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await platform.reply(
+                msg_ref, STRINGS["im_the_owner_usage"], parse_mode="markdown",
+            )
+            return
+        name = parts[1].strip()
+        if not name:
+            await platform.reply(
+                msg_ref, STRINGS["im_the_owner_usage"], parse_mode="markdown",
+            )
+            return
+
+        ws = next(
+            (w for w in collab_store.list_all() if w.name == name), None,
+        )
+        if ws is None:
+            await platform.reply(
+                msg_ref,
+                STRINGS["im_the_owner_unknown_workspace"] % name,
+                parse_mode="markdown",
+            )
+            log.info(
+                "collab.discord.manual_claim.refused reason=unknown ws=%s by=%s",
+                name, msg.user_id,
+            )
+            return
+
+        if ws.status != "pending":
+            await platform.reply(
+                msg_ref,
+                STRINGS["im_the_owner_already_bound"] % (name, ws.status),
+                parse_mode="markdown",
+            )
+            log.info(
+                "collab.discord.manual_claim.refused reason=already_bound "
+                "ws=%s status=%s by=%s",
+                name, ws.status, msg.user_id,
+            )
+            return
+
+        # The command is Discord-scoped today (spec 008 will accept Slack
+        # workspaces too). Refuse if the pending workspace is bound to
+        # another platform.
+        if ws.platform != "discord" or (
+            ws.expected_platform is not None and ws.expected_platform != "discord"
+        ):
+            await platform.reply(
+                msg_ref,
+                STRINGS["im_the_owner_platform_mismatch"] % (
+                    name, ws.expected_platform or ws.platform,
+                ),
+                parse_mode="markdown",
+            )
+            log.info(
+                "collab.discord.manual_claim.refused reason=platform "
+                "ws=%s pending_platform=%s by=%s",
+                name, ws.expected_platform or ws.platform, msg.user_id,
+            )
+            return
+
+        if (
+            ws.expected_creator_id is not None
+            and ws.expected_creator_id != msg.user_id
+        ):
+            await platform.reply(
+                msg_ref,
+                STRINGS["im_the_owner_creator_mismatch"] % name,
+                parse_mode="markdown",
+            )
+            log.info(
+                "collab.discord.manual_claim.refused reason=creator "
+                "ws=%s expected=%s got=%s",
+                name, ws.expected_creator_id, msg.user_id,
+            )
+            return
+
+        # Build the canonical Discord chat_id. The on_message adapter
+        # path sets ``msg.chat_id = guild.id`` and ``msg.thread_id =
+        # channel.id``; the workspace is bound to the channel where the
+        # ``/im-the-owner`` message was posted.
+        from collaborative import make_discord_chat_id
+        from messaging.base import ChatRef
+        guild_id = msg.chat_id
+        channel_id = msg.thread_id
+        if guild_id is None or channel_id is None:
+            log.warning(
+                "collab.discord.manual_claim: missing guild/channel "
+                "(guild=%s channel=%s) — refusing",
+                guild_id, channel_id,
+            )
+            return
+        chat_ref = ChatRef(
+            platform="discord",
+            chat_id=make_discord_chat_id(int(guild_id), int(channel_id)),
+        )
+        if not collab_store.update_chat_id(
+            ws.id, chat_ref, expected_creator_id=msg.user_id,
+        ):
+            log.warning(
+                "collab.discord.manual_claim.bind_failed ws=%s chat=%s by=%s",
+                ws.id, chat_ref.chat_id, msg.user_id,
+            )
+            return
+        collab_store.update_roles(ws.id, msg.user_id, _collab_role("owner"))
+
+        log.info(
+            "collab.discord.manual_claim ws_id=%s chat=%s by=%s",
+            ws.id, chat_ref.chat_id, msg.user_id,
+        )
+        await _flow_a_post_bind(
+            platform, ws, chat_ref, chat_title=ws.display_name,
+        )
+        await platform.reply(
+            msg_ref,
+            STRINGS["im_the_owner_success"] % ws.display_name,
+            parse_mode="markdown",
+        )
+
+    async def collab_bot_added(platform, event):
+        """Handle the bot being added to a new chat. Spec 007: signature
+        is platform-agnostic — ``event`` is a
+        :class:`bot.messaging.base.LifecycleAdded` carrying ``chat_ref``,
+        ``chat_title``, ``added_by_id``, ``added_by_name``. Dispatch
+        branches on ``event.chat_ref.platform`` where strictly required.
 
         Two flows:
         A) An agent was told in advance (status="pending") → match and configure.
@@ -1993,9 +2535,35 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         if collab_store is None:
             return
 
-        chat_id = chat.id
-        added_by_id = added_by.id if added_by else None
-        chat_title = getattr(chat, "title", None) or "Unnamed group"
+        chat_ref = event.chat_ref
+        chat_id = chat_ref.chat_id
+        added_by_id = event.added_by_id
+        chat_title = event.chat_title or "Unnamed group"
+
+        # Spec 007 — Discord audit-log failure advisory. When the adapter
+        # could not resolve the inviter (Forbidden / empty audit log /
+        # sustained transient errors) the event arrives with
+        # ``added_by_id=None``. On Discord we MUST NOT fall through to
+        # the unauthorised-adder refusal flow — the user may have a
+        # legitimate pending workspace and needs the ``/im-the-owner``
+        # escape hatch. Post the advisory in the channel and exit; the
+        # workspace state is unchanged.
+        if chat_ref.platform == "discord" and added_by_id is None:
+            log.info(
+                "collab.discord.audit_log_failed chat=%s title=%r",
+                chat_id, chat_title,
+            )
+            try:
+                await platform.send_message(
+                    chat_id=chat_id,
+                    text=STRINGS["discord_audit_log_unavailable"],
+                    parse_mode="markdown",
+                )
+            except Exception as e:
+                log.warning(
+                    "Failed to send Discord audit-log advisory: %s", e,
+                )
+            return
 
         # Unauthorised-adder guard (FR-011). Must run BEFORE any persistence
         # so a rejected add never leaves a stale workspace behind.
@@ -2003,7 +2571,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         owner_id = getattr(_config, "OWNER_ID", None)
         if not is_authorised_adder(added_by_id, collab_store, owner_id=owner_id):
             log.info(
-                "collab.unauthorised chat=%d by=%s title=%r",
+                "collab.unauthorised chat=%s by=%s title=%r",
                 chat_id, added_by_id, chat_title,
             )
             try:
@@ -2014,15 +2582,42 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 )
             except Exception as e:
                 log.warning("Failed to send unauthorised-adder message: %s", e)
-            try:
-                await platform.leave_chat(chat_id)
-            except NotImplementedError:
-                log.warning(
-                    "leave_chat not supported on %s; cannot auto-leave unauthorised add",
-                    type(platform).__name__,
-                )
-            except Exception as e:
-                log.warning("leave_chat failed for chat %s: %s", chat_id, e)
+
+            # Spec 007 — shared-guild policy. ``guild.leave()`` on Discord
+            # evicts the bot from EVERY channel in the guild simultaneously
+            # (Discord has no per-channel leave). If another active or
+            # setup workspace lives in this guild, leaving would orphan
+            # those workspaces — refuse and let the refusal message stay
+            # in the offending channel only. Telegram is unaffected: its
+            # chats are 1:1 to workspaces so ``find_active_in_guild``
+            # never returns peers there.
+            should_leave = True
+            if chat_ref.platform == "discord":
+                try:
+                    guild_id_str, _ = chat_ref.chat_id.split(":", 1)
+                except ValueError:
+                    guild_id_str = chat_ref.chat_id
+                peers = collab_store.find_active_in_guild(guild_id_str)
+                if peers:
+                    log.info(
+                        "collab.leave_chat.skipped guild=%s active_count=%d "
+                        "reason=shared_guild",
+                        guild_id_str, len(peers),
+                    )
+                    should_leave = False
+            if should_leave:
+                try:
+                    await platform.leave_chat(chat_id)
+                except NotImplementedError:
+                    log.warning(
+                        "leave_chat not supported on %s; cannot auto-leave "
+                        "unauthorised add",
+                        type(platform).__name__,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "leave_chat failed for chat %s: %s", chat_id, e,
+                    )
             try:
                 await platform.send_message(
                     chat_id=getattr(_config, "CHAT_ID", None) or 0,
@@ -2037,18 +2632,39 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             return
 
         # Flow A: only match pending workspaces explicitly bound to the
-        # user who added the bot. Without this binding, *any* pending
-        # workspace would attach to *any* group, letting an outsider
-        # hijack one Robyx provisioned for a different chat.
+        # user who added the bot AND whose ``expected_platform`` matches
+        # the platform of this lifecycle event. Without the platform
+        # filter, a Telegram user id ``42`` could hijack a pending
+        # workspace pre-announced for a Discord user with the same id
+        # (FR-013, spec 007).
         pending = (
-            collab_store.list_pending_for_creator(added_by_id)
+            collab_store.list_pending_for_creator(
+                added_by_id, platform=chat_ref.platform,
+            )
             if added_by_id is not None else []
         )
+
+        # FR-013: log cross-platform refusals explicitly. A pending
+        # workspace exists for this creator on a different platform —
+        # we leave it pending and fall through to Flow B. The orchestrator
+        # can re-announce on the correct platform or the user can use
+        # /im-the-owner on Discord to manually claim it.
+        if not pending and added_by_id is not None:
+            unfiltered = collab_store.list_pending_for_creator(added_by_id)
+            for ws in unfiltered:
+                if (
+                    ws.expected_platform is not None
+                    and ws.expected_platform != chat_ref.platform
+                ):
+                    log.info(
+                        "collab.match.platform_mismatch ws_id=%s expected=%s got=%s",
+                        ws.id, ws.expected_platform, chat_ref.platform,
+                    )
 
         if pending:
             ws = sorted(pending, key=lambda w: w.created_at, reverse=True)[0]
             if not collab_store.update_chat_id(
-                ws.id, chat_id, expected_creator_id=added_by_id,
+                ws.id, chat_ref, expected_creator_id=added_by_id,
             ):
                 log.warning(
                     "Could not bind pending workspace %s to chat %s (creator=%s)",
@@ -2056,67 +2672,15 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 )
                 return
             collab_store.update_roles(ws.id, added_by_id, _collab_role("owner"))
-
-            # Generate invite link
-            try:
-                link = await platform.get_invite_link(chat_id)
-                if link:
-                    collab_store.update_invite_link(ws.id, link)
-            except Exception as e:
-                log.warning("Failed to generate invite link for collab %s: %s", ws.id, e)
-
-            # Read back the pre-announced purpose from the seed agent
-            # file so the welcome + HQ notification reflect real intent
-            # (SC-001). Silent fallback to display_name keeps the flow
-            # resilient if the file is missing.
-            purpose = ws.display_name
-            try:
-                from config import AGENTS_DIR
-                agent_file = AGENTS_DIR / ("%s.md" % ws.agent_name)
-                if agent_file.exists():
-                    for line in agent_file.read_text().splitlines():
-                        stripped = line.strip()
-                        if not stripped or stripped.startswith("#"):
-                            continue
-                        purpose = stripped
-                        break
-            except OSError as e:
-                log.warning("Could not read agent file for %s: %s", ws.agent_name, e)
-
-            # Send welcome message in the new group — references purpose.
-            try:
-                await platform.send_message(
-                    chat_id=chat_id,
-                    text=STRINGS["collab_welcome_pending"] % (ws.display_name, purpose),
-                    parse_mode="markdown",
-                )
-            except Exception as e:
-                log.warning("Failed to send collab welcome: %s", e)
-
-            # Notify in HQ — include purpose (FR-009, SC-001).
-            link_text = "\nInvite link: %s" % ws.invite_link if ws.invite_link else ""
-            try:
-                await platform.send_message(
-                    chat_id=_config.CHAT_ID if hasattr(_config, "CHAT_ID") else 0,
-                    text=STRINGS["collab_bot_added_hq_matched"] % (
-                        ws.display_name, chat_title, chat_id, purpose, link_text,
-                    ),
-                    thread_id=platform.control_room_id,
-                    parse_mode="markdown",
-                )
-            except Exception as e:
-                log.warning("Failed to send collab HQ notification: %s", e)
-
-            log.info(
-                "collab.match ws_id=%s chat_id=%d title=%r purpose=%r",
-                ws.id, chat_id, chat_title, purpose,
+            await _flow_a_post_bind(
+                platform, ws, chat_ref, chat_title=chat_title,
             )
             return
 
         # Flow B: no pending request — create a provisional workspace and
         # ask directly in the group what the user wants to do.
         log.info(
-            "Bot added to unknown group: chat_id=%d title=%r by=%s — starting in-group setup",
+            "Bot added to unknown group: chat_id=%s title=%r by=%s — starting in-group setup",
             chat_id, chat_title, added_by_id,
         )
         import re as _re
@@ -2137,6 +2701,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             display_name=chat_title,
             agent_name=safe_name,
             chat_id=chat_id,
+            platform=chat_ref.platform,
             interaction_mode="intelligent",
             status="setup",
             created_by=added_by_id or 0,
@@ -2208,7 +2773,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             log.warning("Failed to notify HQ about new group: %s", e)
 
         log.info(
-            "collab.setup.bootstrap ws_id=%s chat_id=%d title=%r by=%s",
+            "collab.setup.bootstrap ws_id=%s chat_id=%s title=%r by=%s",
             ws_id, chat_id, chat_title, added_by_id,
         )
 
@@ -2228,8 +2793,16 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         except Exception as e:
             log.error("Flow-B bootstrap AI turn failed for %s: %s", ws_id, e, exc_info=True)
 
-    async def collab_bot_removed(platform, chat):
-        """Close the collaborative workspace when the bot is removed from a group.
+    async def collab_bot_removed(platform, event):
+        """Close the collaborative workspace when the bot is removed from a
+        chat. Spec 007: ``event`` is a
+        :class:`bot.messaging.base.LifecycleRemoved` carrying ``chat_ref``
+        and ``chat_title``.
+
+        On Discord the adapter emits a sentinel
+        ``chat_ref.chat_id == "<guild>:0"`` for guild-wide removals — the
+        handler iterates :meth:`CollabStore.find_active_in_guild` so every
+        workspace bound to a channel of that guild is closed.
 
         Contract: ``contracts/lifecycle-events.md``. Persistence happens
         BEFORE the HQ notification so a crash in between keeps the
@@ -2237,23 +2810,60 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         """
         if collab_store is None:
             return
-        chat_id = chat.id
-        chat_title = getattr(chat, "title", None) or "Unknown group"
-        ws = collab_store.get_by_chat_id(chat_id)
+        chat_ref = event.chat_ref
+        chat_id = chat_ref.chat_id
+        chat_title = event.chat_title or "Unknown group"
+
+        # Discord guild-remove sentinel: ``<guild>:0`` means "the bot was
+        # evicted from the whole guild; close every workspace bound to any
+        # of its channels". Telegram chat ids never contain a colon, so
+        # this branch is Discord-only by construction.
+        if chat_ref.platform == "discord" and chat_id.endswith(":0"):
+            guild_id, _ = chat_id.split(":", 1)
+            affected = collab_store.find_active_in_guild(guild_id)
+            if not affected:
+                log.info(
+                    "collab.archive guild=%s title=%r — no matching workspace",
+                    guild_id, chat_title,
+                )
+                return
+            for ws in affected:
+                if not collab_store.close(ws.id):
+                    log.warning(
+                        "collab.archive close() refused for ws=%s (chat_id=%s)",
+                        ws.id, ws.chat_id,
+                    )
+                    continue
+                log.info(
+                    "collab.archive ws_id=%s chat_id=%s title=%r reason=guild_remove",
+                    ws.id, ws.chat_id, chat_title,
+                )
+                try:
+                    await platform.send_message(
+                        chat_id=getattr(_config, "CHAT_ID", None) or 0,
+                        text=STRINGS["collab_bot_removed_hq"] % ws.display_name,
+                        thread_id=platform.control_room_id,
+                        parse_mode="markdown",
+                    )
+                except Exception as e:
+                    log.warning("HQ notification (bot_removed) failed: %s", e)
+            return
+
+        ws = collab_store.get_by_chat_id(chat_ref)
         if ws is None:
             log.info(
-                "collab.archive chat_id=%d title=%r — no matching workspace",
+                "collab.archive chat_id=%s title=%r — no matching workspace",
                 chat_id, chat_title,
             )
             return
         if not collab_store.close(ws.id):
             log.warning(
-                "collab.archive close() refused for ws=%s (chat_id=%d)",
+                "collab.archive close() refused for ws=%s (chat_id=%s)",
                 ws.id, chat_id,
             )
             return
         log.info(
-            "collab.archive ws_id=%s chat_id=%d title=%r reason=bot_removed",
+            "collab.archive ws_id=%s chat_id=%s title=%r reason=bot_removed",
             ws.id, chat_id, chat_title,
         )
         try:
@@ -2266,29 +2876,37 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         except Exception as e:
             log.warning("HQ notification (bot_removed) failed: %s", e)
 
-    async def collab_bot_migrated(platform, old_chat_id, new_chat_id):
-        """Rebind a collaborative workspace to a new chat_id on supergroup migration.
+    async def collab_bot_migrated(platform, event):
+        """Rebind a collaborative workspace on supergroup migration. Spec
+        007: ``event`` is a :class:`bot.messaging.base.LifecycleMigrated`
+        carrying ``old_chat_ref`` and ``new_chat_ref``. Discord does not
+        emit migration events (no supergroup equivalent); this path is
+        Telegram-only by construction today.
 
         Contract: ``contracts/lifecycle-events.md``. Status is unchanged;
         ``chat_id`` is rebound atomically via ``collab_store.migrate_chat_id``.
         """
         if collab_store is None:
             return
-        ws = collab_store.get_by_chat_id(old_chat_id)
+        old_chat_ref = event.old_chat_ref
+        new_chat_ref = event.new_chat_ref
+        old_chat_id = old_chat_ref.chat_id
+        new_chat_id = new_chat_ref.chat_id
+        ws = collab_store.get_by_chat_id(old_chat_ref)
         if ws is None:
             log.info(
-                "collab.migrate old_chat_id=%d → new_chat_id=%d — no matching workspace",
+                "collab.migrate old_chat_id=%s → new_chat_id=%s — no matching workspace",
                 old_chat_id, new_chat_id,
             )
             return
-        if not collab_store.migrate_chat_id(old_chat_id, new_chat_id):
+        if not collab_store.migrate_chat_id(old_chat_ref, new_chat_ref):
             log.warning(
-                "collab.migrate refused for ws=%s (%d → %d)",
+                "collab.migrate refused for ws=%s (%s → %s)",
                 ws.id, old_chat_id, new_chat_id,
             )
             return
         log.info(
-            "collab.migrate ws_id=%s old_chat_id=%d new_chat_id=%d",
+            "collab.migrate ws_id=%s old_chat_id=%s new_chat_id=%s",
             ws.id, old_chat_id, new_chat_id,
         )
         try:
@@ -2326,6 +2944,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         "specialists": cmd_specialists,
         "status": cmd_status,
         "reset": cmd_reset,
+        "clear": cmd_clear,
         "focus": cmd_focus,
         "ping": cmd_ping,
         "checkupdate": cmd_checkupdate,
@@ -2337,15 +2956,26 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
     # Spec 006 — [GET_EVENTS] handler is always exposed; it has no
     # collab dependency and is used by every executive-authorised agent.
     result["_handle_get_events"] = _handle_get_events
+    # Spec 007.1 — [GET_ARCHIVE] handler exposed for tests.
+    result["_handle_get_archive"] = _handle_get_archive
 
     if collab_store is not None:
         result["collab_bot_added"] = collab_bot_added
         result["collab_bot_removed"] = collab_bot_removed
         result["collab_bot_migrated"] = collab_bot_migrated
+        # Spec 007 — Discord audit-log fallback. Exposed via the same
+        # command dispatcher as cmd_help / cmd_status so it surfaces as
+        # ``/im-the-owner`` on Discord (and on Slack post-spec-008).
+        # Keyed with the hyphenated form to match the COMMANDS tuple in
+        # ``_run_discord``.
+        result["im-the-owner"] = _handle_im_the_owner
         # Exposed for unit tests; stable internal API, not user commands.
         result["_handle_collab_announce"] = _handle_collab_announce
         result["_handle_collab_setup_complete"] = _handle_collab_setup_complete
         result["_handle_collab_send"] = _handle_collab_send
         result["_handle_notify_hq"] = _handle_notify_hq
+        result["_handle_im_the_owner"] = _handle_im_the_owner
+        # Spec 007 — cross-platform mention parser exposed for unit tests.
+        result["_parse_user_id"] = _parse_user_id
 
     return result
