@@ -112,6 +112,88 @@ class TestCmdClearWorkspace:
         assert any("quiet" in r and "No history" in r for r in replies)
 
 
+# ── /clear — non-owner feedback (v0.28.1 hotfix regression guard) ────
+
+
+class TestCmdClearNonOwnerFeedback:
+    """Pre-0.28.1 ``cmd_clear`` returned silently when a non-owner ran
+    the command in a workspace/specialist topic (legacy ``@owner_only``
+    pattern from ``/reset``). Roberto reported "no feedback" — the silent
+    branch was the cause. The hotfix replaces the silent return with an
+    explicit ``clear_not_owner`` reply so every invocation produces a
+    visible response."""
+
+    @pytest.mark.asyncio
+    async def test_non_owner_workspace_gets_explicit_refusal(
+        self, handlers, agent_manager, mock_platform,
+    ):
+        from unittest.mock import MagicMock
+
+        agent_manager.add_agent(
+            name="atlas-ws", work_dir="/tmp", description="Atlas Workspace",
+            agent_type="workspace", thread_id=4242,
+        )
+        # mock_platform.is_owner returns True by default — override.
+        mock_platform.is_owner = MagicMock(return_value=False)
+        msg = _msg(user_id=99999, thread_id=4242)
+        await handlers["clear"](mock_platform, msg, object())
+        replies = [c.args[1] for c in mock_platform.reply.call_args_list]
+        assert replies, "Expected an explicit refusal reply, not silence"
+        assert any("reserved for the bot owner" in r for r in replies)
+
+
+# ── /clear — collab without forum-topic thread_id (v0.28.1 fix) ──────
+
+
+class TestCmdClearCollabFallback:
+    """Pre-0.28.1 ``cmd_clear`` only resolved the target agent via
+    ``manager.get_by_thread(msg.thread_id)``. In a collab chat where
+    ``msg.thread_id`` is None (Telegram non-supergroup, Discord guild
+    without forum topics) the lookup missed and the handler replied
+    with ``clear_usage`` instead of operating on the collab's agent.
+    The hotfix adds a fallback via ``collab_store.get_by_chat_id``."""
+
+    @pytest.mark.asyncio
+    async def test_collab_without_thread_id_resolves_via_chat_id(
+        self, handlers, agent_manager, store, mock_platform,
+    ):
+        agent = agent_manager.add_agent(
+            name="collab-flat",
+            work_dir="/tmp",
+            description="Collab Flat",
+            agent_type="workspace",
+            thread_id=None,
+        )
+        ws = CollabWorkspace(
+            id="collab-flat", name="collab-flat",
+            display_name="Collab Flat",
+            agent_name="collab-flat",
+            chat_id="-100654321",
+            platform="telegram",
+            status="active",
+            created_by=12345,
+            roles={"12345": "owner"},
+        )
+        store.add(ws)
+        conversations.append_turn(
+            "collab-flat", user_text="ciao", agent_text="ciao back",
+        )
+        original_session = agent.session_id
+
+        # thread_id=None — non-forum chat. Pre-hotfix this would have
+        # routed to clear_usage; post-hotfix it resolves via collab_ws.
+        msg = _msg(user_id=12345, chat_id=-100654321, thread_id=None)
+        await handlers["clear"](mock_platform, msg, object())
+
+        # Session reset confirms we reached the work path.
+        assert agent.session_id != original_session
+        # Archive exists.
+        archives = list(
+            conversations._agent_dir("collab-flat").glob("archive-*.md"),
+        )
+        assert len(archives) == 1
+
+
 # ── /clear — orchestrator refusal ─────────────────────────────────────
 
 

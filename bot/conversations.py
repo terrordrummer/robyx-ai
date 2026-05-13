@@ -192,12 +192,14 @@ def archive_and_clear(
     *,
     display_name: str | None = None,
     session_id: str | None = None,
-) -> Path | None:
+) -> tuple[Path, int] | None:
     """Read the agent's ``current.jsonl``, write a markdown archive, and
     truncate the log.
 
-    Returns the archive ``Path`` on success, or ``None`` if there was no
-    history to archive (no log file, empty log, or every line corrupt).
+    Returns ``(archive_path, turn_count)`` on success, or ``None`` if
+    there was no history to archive (no log file, empty log, or every
+    line corrupt). Callers use ``turn_count`` to render a quantified
+    user-visible confirmation.
     """
     current = _current_path(agent_name)
     if not current.exists() or current.stat().st_size == 0:
@@ -256,7 +258,7 @@ def archive_and_clear(
         "conversations.archive_and_clear agent=%s turns=%d path=%s",
         agent_name, len(entries), archive_path,
     )
-    return archive_path
+    return archive_path, len(entries)
 
 
 # ── [GET_ARCHIVE] support ─────────────────────────────────────────────

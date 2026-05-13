@@ -255,12 +255,21 @@ STRINGS = {
         "collaborative group, or specialist topic instead."
     ),
     "clear_archived": (
-        "Session reset for *%s*. The previous conversation was archived to "
-        "`data/conversations/%s`. The next message starts a fresh session."
+        "🧹 *Conversation cleared.*\n\n"
+        "Session reset on `%s`. The previous conversation (%d turn%s) "
+        "was archived to `data/conversations/%s`. The next message "
+        "starts a fresh session."
     ),
     "clear_no_history": (
-        "Session reset for *%s*. No history to archive (no turns recorded "
-        "since the last reset)."
+        "🧹 *Conversation cleared.*\n\n"
+        "Session reset on `%s`. No history to archive (no turns "
+        "recorded since the last reset). The next message starts a "
+        "fresh session."
+    ),
+    "clear_not_owner": (
+        "`/clear` on `%s` is reserved for the bot owner. Ask the owner "
+        "to run it from this topic, or run it yourself in a workspace "
+        "you own."
     ),
     "archive_unknown_agent": (
         "Unknown agent *%s* — no conversation archive available."

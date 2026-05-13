@@ -133,10 +133,13 @@ class TestArchiveAndClear:
         conversations.append_turn(
             "agent", user_text="domanda 2", agent_text="risposta 2",
         )
-        archive = conversations.archive_and_clear(
+        result = conversations.archive_and_clear(
             "agent", display_name="Test Agent", session_id="sess-abc",
         )
-        assert archive is not None
+        assert result is not None
+        # Hotfix v0.28.1 — archive_and_clear returns (path, turn_count).
+        archive, turns = result
+        assert turns == 2
         body = archive.read_text()
         assert "Test Agent" in body
         assert "sess-abc" in body
@@ -171,10 +174,12 @@ class TestArchiveAndClear:
             "user_text": "ok", "agent_text": "fine",
         })
         path.write_text(valid_entry + "\n{not valid json\n" + valid_entry + "\n")
-        archive = conversations.archive_and_clear("agent")
-        assert archive is not None
+        result = conversations.archive_and_clear("agent")
+        assert result is not None
+        archive, turns = result
+        assert turns == 2  # both valid entries counted
         body = archive.read_text()
-        assert body.count("> ok") == 2  # both valid entries rendered
+        assert body.count("> ok") == 2
 
     def test_only_corrupt_lines_returns_none_and_cleans_up(self):
         path = conversations._current_path("agent")
@@ -186,13 +191,13 @@ class TestArchiveAndClear:
 
     def test_two_archives_have_distinct_timestamps(self):
         conversations.append_turn("agent", user_text="a", agent_text="A")
-        first = conversations.archive_and_clear("agent")
+        first_path, _ = conversations.archive_and_clear("agent")
         conversations.append_turn("agent", user_text="b", agent_text="B")
         # Force a one-second gap to differentiate the archive filenames.
         import time
         time.sleep(1)
-        second = conversations.archive_and_clear("agent")
-        assert first.name != second.name
+        second_path, _ = conversations.archive_and_clear("agent")
+        assert first_path.name != second_path.name
 
 
 # ── query_archives ────────────────────────────────────────────────────
@@ -204,16 +209,16 @@ class TestQueryArchives:
 
     def test_returns_newest_first(self):
         conversations.append_turn("agent", user_text="t1", agent_text="r1")
-        a1 = conversations.archive_and_clear("agent")
+        a1_path, _ = conversations.archive_and_clear("agent")
         import time
         time.sleep(1)
         conversations.append_turn("agent", user_text="t2", agent_text="r2")
-        a2 = conversations.archive_and_clear("agent")
+        a2_path, _ = conversations.archive_and_clear("agent")
         results = conversations.query_archives("agent")
         assert len(results) == 2
         # Newest first — a2 is more recent than a1.
-        assert Path(results[0]["path"]).name == a2.name
-        assert Path(results[1]["path"]).name == a1.name
+        assert Path(results[0]["path"]).name == a2_path.name
+        assert Path(results[1]["path"]).name == a1_path.name
 
     def test_since_filter(self):
         conversations.append_turn("agent", user_text="old", agent_text="old")

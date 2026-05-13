@@ -294,12 +294,26 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         """
         from conversations import archive_and_clear
 
-        # HQ guard — refuse a bare ``/clear`` in the orchestrator's
-        # topic. ``/clear <name>`` from HQ is allowed because it
-        # explicitly targets a non-orchestrator agent (useful when a
-        # specialist's topic isn't easy to navigate to). The
-        # orchestrator's own session is never cleared via this command.
-        in_hq = platform.is_main_thread(msg.chat_id, msg.thread_id)
+        # Resolve the collab workspace (if any) early — used for agent
+        # fallback AND for the authorisation branch.
+        if collab_store is not None:
+            collab_ws = collab_store.get_by_chat_id(msg.chat_id)
+        else:
+            collab_ws = None
+
+        # HQ guard. ``platform.is_main_thread(chat_id, thread_id)`` on
+        # Telegram returns True for ANY chat without a forum topic, not
+        # just HQ — a Telegram non-supergroup collab chat also matches.
+        # Tighten the predicate by also requiring the chat to be the
+        # configured HQ chat. ``/clear <name>`` from HQ is still allowed
+        # (escape hatch for specialists not easily reachable by topic).
+        hq_chat_id = getattr(_config, "CHAT_ID", None)
+        in_hq = (
+            platform.is_main_thread(msg.chat_id, msg.thread_id)
+            and hq_chat_id is not None
+            and msg.chat_id == hq_chat_id
+            and collab_ws is None
+        )
         if in_hq and not msg.args:
             await platform.reply(
                 msg_ref,
@@ -309,20 +323,33 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             return
 
         agent = None
-        # Identify the target agent. Priority: explicit name arg (so
-        # ``/clear specialist-x`` from HQ resolves cleanly), then
-        # thread_id lookup (the topic the user typed /clear in).
+        # Identify the target agent. Priority order:
+        # 1. Explicit name arg — ``/clear specialist-x`` from HQ.
+        # 2. Thread/topic lookup — the topic the user typed /clear in.
+        # 3. Collab agent fallback — covers non-forum chats where
+        #    ``msg.thread_id`` is None but the bound agent is known
+        #    from the collab workspace record.
         if msg.args:
             agent = manager.get(msg.args[0].lower())
         if agent is None and msg.thread_id is not None:
             agent = manager.get_by_thread(msg.thread_id)
+            # Defensive: PTB delivers thread_id as int while state.json
+            # may have persisted it as str (or vice versa). Try the
+            # string form before giving up.
+            if agent is None:
+                agent = manager.get_by_thread(str(msg.thread_id))
+        if agent is None and collab_ws is not None:
+            agent = manager.get(collab_ws.agent_name)
 
         if agent is None:
-            await platform.reply(msg_ref, STRINGS["clear_usage"])
+            await platform.reply(
+                msg_ref, STRINGS["clear_usage"], parse_mode="markdown",
+            )
             return
 
-        # Defensive: if the topic-map miraculously routed back to the
-        # orchestrator (would be a bug, but cheap to guard), refuse.
+        # Defensive: if any resolution path routed back to the
+        # orchestrator, refuse with the same explanation as the bare-HQ
+        # short-circuit above.
         if agent.agent_type == "orchestrator":
             await platform.reply(
                 msg_ref,
@@ -332,30 +359,35 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             return
 
         # Authorisation. For collaborative workspaces the chat permits
-        # OWNER / OPERATOR roles (managed via ``can_execute``). For
+        # OWNER / OPERATOR roles (or the bot's global owner). For
         # standalone workspace / specialist agents the bot owner is the
-        # only caller, mirroring ``/reset``.
-        if collab_store is not None:
-            collab_ws = collab_store.get_by_chat_id(msg.chat_id)
-        else:
-            collab_ws = None
+        # only caller, mirroring ``/reset``. Both refusal paths now reply
+        # explicitly — spec 007.1 hotfix: the previous silent return on
+        # the non-collab path left the user with no feedback whatsoever.
         if collab_ws is not None:
             from authorization import can_send_executive
             role = collab_ws.get_role(msg.user_id)
             owner_id = getattr(_config, "OWNER_ID", None)
             is_global_owner = owner_id is not None and msg.user_id == owner_id
             if not (is_global_owner or can_send_executive(role)):
-                await platform.reply(msg_ref, STRINGS["collab_not_owner"])
+                await platform.reply(
+                    msg_ref, STRINGS["collab_not_owner"],
+                    parse_mode="markdown",
+                )
                 return
         else:
             if not platform.is_owner(msg.user_id):
-                # Mirror the @owner_only convention used by /reset etc.
+                await platform.reply(
+                    msg_ref,
+                    STRINGS["clear_not_owner"] % agent.name,
+                    parse_mode="markdown",
+                )
                 return
 
         # Archive (best-effort — failure here MUST NOT block the reset).
-        archive_path = None
+        archive_result: tuple | None = None
         try:
-            archive_path = archive_and_clear(
+            archive_result = archive_and_clear(
                 agent.name,
                 display_name=agent.description or agent.name,
                 session_id=agent.session_id,
@@ -372,16 +404,21 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         agent.session_started = False
         manager.save_state()
 
-        if archive_path is None:
+        if archive_result is None:
             await platform.reply(
                 msg_ref,
                 STRINGS["clear_no_history"] % agent.name,
                 parse_mode="markdown",
             )
+            archive_path = None
         else:
+            archive_path, turn_count = archive_result
+            plural = "" if turn_count == 1 else "s"
             await platform.reply(
                 msg_ref,
-                STRINGS["clear_archived"] % (agent.name, archive_path.name),
+                STRINGS["clear_archived"] % (
+                    agent.name, turn_count, plural, archive_path.name,
+                ),
                 parse_mode="markdown",
             )
         log.info(

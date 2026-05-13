@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.28.1
+
+**`/clear` UX hotfix.** Three issues in the spec 007.1 chat-archive
+command, surfaced by Roberto immediately after the 0.28.0 rollout:
+silent return for non-owner workspace calls, missed agent resolution
+in collab chats without forum topics, and a too-loose HQ guard that
+matched any thread-less Telegram chat as HQ. No persisted state schema
+changes; the `v0_28_1` migration is a no-op. See `releases/0.28.1.md`
+for the full write-up.
+
+### Fixed
+
+- **`/clear` non-owner branch now replies explicitly.** Pre-0.28.1 the
+  legacy `@owner_only` pattern returned without any user-visible reply,
+  leaving the user uncertain whether the command had been received.
+  Adds `STRINGS["clear_not_owner"]` ("`/clear` on `…` is reserved for
+  the bot owner…").
+- **`/clear` in collab chats without forum topics now resolves the
+  target agent.** Pre-0.28.1 the handler only looked at
+  `manager.get_by_thread(msg.thread_id)`; in Telegram non-supergroups
+  / Discord guilds without forum topics that returned `None` and the
+  handler fell through to `clear_usage`. Adds a fallback via
+  `CollabStore.get_by_chat_id(msg.chat_id).agent_name`.
+- **HQ guard tightened.** `platform.is_main_thread` on Telegram returns
+  `True` for any chat without a forum thread, not just HQ — a collab
+  non-supergroup matched and falsely triggered the HQ refusal. The
+  guard now requires `chat_id == CHAT_ID` AND no collab match.
+- **Defensive `manager.get_by_thread` int/str variant lookup.** Covers
+  the edge case where `state.json` persisted `thread_id` as a string
+  but PTB delivers it as an int (or vice versa).
+
+### Changed
+
+- **`/clear` success copy.** New format with 🧹 emoji headline + turn
+  count: `"Conversation cleared. Session reset on `atlas`. The previous
+  conversation (12 turns) was archived to ..."`. Replaces the previous
+  flat one-line confirmation.
+- **`conversations.archive_and_clear` return shape.** Now returns
+  `tuple[Path, int] | None` (path + turn count) instead of `Path | None`.
+  Enables the handler to surface the turn count in the confirmation.
+
+### Tests
+
+- 2079 pass (was 2075 in 0.28.0). Two new regression-guard tests:
+  - `tests/test_clear_and_archive.py::TestCmdClearNonOwnerFeedback`
+  - `tests/test_clear_and_archive.py::TestCmdClearCollabFallback`
+- `tests/test_conversations.py` updated for the new return shape.
+
 ## 0.28.0
 
 **Discord parity for collaborative workspaces + conversation archive
