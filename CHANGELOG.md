@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.28.2
+
+**Auto-updater hotfix — stash-pop conflict now triggers rollback.**
+Closes the v0.28.0 Linux crashloop incident (Roberto, 2026-05-13): the
+auto-updater's `git stash pop` left raw `<<<<<<<` / `=======` /
+`>>>>>>>` markers inside `bot/bot.py` after a non-trivial WIP collision,
+Python raised `SyntaxError` on restart, and the service crashlooped
+~95 minutes (`Restart=on-failure`, counter 556) until the operator
+intervened manually. The pre-0.28.2 updater detected the unmerged
+paths and logged an `ERROR` but then proceeded to restart anyway. No
+persisted state schema changes; the `v0_28_2` migration is a no-op.
+See `releases/0.28.2.md` for the full write-up.
+
+### Fixed
+
+- **`_safe_stash_pop` gains a `strict` kwarg.** When `strict=True`,
+  the function raises a new `StashPopConflict` exception instead of
+  only logging when `git stash pop` left unmerged paths. Default
+  `strict=False` preserves the best-effort semantics expected by
+  error-path callers.
+- **`apply_update` step-6 stash pop now triggers rollback on
+  conflict.** Catches `StashPopConflict`, rolls back the code to the
+  pre-update commit, restores the `data/` snapshot, notifies HQ with
+  an operator-actionable error message, and returns failure. The
+  stash is left intact (git preserves it on conflict) so the
+  operator's WIP is never lost.
+- **Post-stash-pop Python syntax check.** New helper
+  `_check_python_syntax_in_repo` compiles every `.py` file under
+  `bot/` after the stash pop. Catches any `SyntaxError` (smoking-gun
+  shape from raw conflict markers, but also any typo a clean pop
+  might introduce). On failure: re-stashes the popped changes, rolls
+  back code + data/.
+
+### Tests
+
+- 2084 pass (was 2079 in 0.28.1). Five new regression-guard tests in
+  `tests/test_updater.py`:
+  - `TestSafeStashPop::test_safe_stash_pop_strict_raises_on_conflict`
+  - `TestSafeStashPop::test_safe_stash_pop_strict_does_not_raise_on_clean_pop`
+  - `TestCheckPythonSyntaxInRepo::test_clean_repo_passes`
+  - `TestCheckPythonSyntaxInRepo::test_conflict_markers_detected`
+  - `TestCheckPythonSyntaxInRepo::test_missing_bot_dir_is_ok`
+
+### Operator notes
+
+If your service is stuck in a crashloop on v0.28.0 or v0.28.1 because
+of this bug, see `releases/0.28.2.md` for the manual recovery
+procedure (backup `bot/bot.py`, resolve the conflict markers with a
+union merge, `git add`, restart). Once on v0.28.2, the bug cannot
+recur — a future stash-pop conflict triggers automatic rollback
+instead of restarting into a broken file.
+
 ## 0.28.1
 
 **`/clear` UX hotfix.** Three issues in the spec 007.1 chat-archive

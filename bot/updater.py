@@ -274,6 +274,35 @@ async def _post_update_smoke_test() -> tuple[bool, str]:
     return True, ""
 
 
+def _check_python_syntax_in_repo() -> tuple[bool, str]:
+    """Compile every ``.py`` file under ``bot/`` to detect SyntaxError
+    (typically caused by raw ``<<<<<<<`` / ``=======`` / ``>>>>>>>``
+    conflict markers introduced by a ``git stash pop`` that resolved
+    only partially). Returns ``(ok, error_message)``.
+
+    Cheap parse-only check — no imports, no subprocess. Used by
+    :func:`apply_update` as belt-and-braces after step-6 stash pop:
+    the full smoke test at step 5.5 ran BEFORE the pop and cannot
+    catch conflict markers introduced AFTER it.
+    """
+    bot_dir = PROJECT_ROOT / "bot"
+    if not bot_dir.is_dir():
+        return True, ""
+    for py in sorted(bot_dir.rglob("*.py")):
+        try:
+            source = py.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return False, "could not read %s: %s" % (py, exc)
+        try:
+            compile(source, str(py), "exec")
+        except SyntaxError as exc:
+            rel = py.relative_to(PROJECT_ROOT)
+            return False, "SyntaxError in %s line %d: %s" % (
+                rel, exc.lineno or 0, exc.msg,
+            )
+    return True, ""
+
+
 # ── Release note parser ──
 
 
@@ -352,7 +381,31 @@ async def _git(*args, check=True) -> subprocess.CompletedProcess:
     )
 
 
-async def _safe_stash_pop() -> None:
+class StashPopConflict(Exception):
+    """Raised by :func:`_safe_stash_pop` (when ``strict=True``) if a
+    ``git stash pop`` left unmerged paths in the working tree.
+
+    The success path of :func:`apply_update` catches this and triggers
+    a code+state rollback so the bot is not restarted into a file with
+    raw ``<<<<<<<`` / ``=======`` / ``>>>>>>>`` conflict markers — the
+    failure mode behind the v0.28.0 Linux non-restart incident.
+
+    ``unmerged_paths`` carries the list of conflicted files so callers
+    can surface them in the rollback message.
+    """
+
+    def __init__(self, returncode: int, unmerged_paths: list[str], stderr: str):
+        self.returncode = returncode
+        self.unmerged_paths = unmerged_paths
+        self.stderr = stderr
+        super().__init__(
+            "git stash pop left unmerged paths (rc=%d): %s — stash is "
+            "preserved; conflict markers are in the working tree."
+            % (returncode, ", ".join(unmerged_paths) or "(none)"),
+        )
+
+
+async def _safe_stash_pop(*, strict: bool = False) -> None:
     """Pop the most recent stash and log a WARNING if it fails.
 
     All apply-update error paths call this to restore the user's local
@@ -372,6 +425,13 @@ async def _safe_stash_pop() -> None:
     refuse to run until the operator resolves the conflict. Log with
     explicit file list and recovery instructions so "why did auto-update
     stop working?" is answered before the next attempt.
+
+    Spec 007.2 / v0.28.2 — ``strict=True`` raises :class:`StashPopConflict`
+    on the unmerged-paths case so callers on the SUCCESS path of an
+    update can react with a rollback instead of restarting the bot into
+    a file with raw conflict markers (the v0.28.0 Linux crashloop).
+    Error-path callers leave ``strict=False`` to preserve best-effort
+    semantics.
     """
     result = await _git("stash", "pop", check=False)
     if result.returncode == 0:
@@ -397,6 +457,10 @@ async def _safe_stash_pop() -> None:
             ", ".join(unmerged_paths),
             stderr_out,
         )
+        if strict:
+            raise StashPopConflict(
+                result.returncode, unmerged_paths, stderr_out,
+            )
     else:
         log.warning(
             "git stash pop failed (rc=%d): %s — local changes may be stranded "
@@ -953,9 +1017,73 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                 await _safe_stash_pop()
             return False, "Smoke test failed: %s" % smoke_err
 
-        # 6. Pop stash if we had one
+        # 6. Pop stash if we had one. v0.28.2 hotfix: on conflict the
+        # stash pop leaves raw ``<<<<<<<`` markers in the working tree —
+        # restarting the bot at that point produces a SyntaxError
+        # crashloop (the v0.28.0 Linux incident). Catch the conflict
+        # explicitly and roll back code + data/ instead of restarting
+        # into a broken file. Git preserves the stash on conflict, so
+        # the user's WIP is not lost — they can resolve at their
+        # leisure.
         if has_stash:
-            await _safe_stash_pop()
+            try:
+                await _safe_stash_pop(strict=True)
+            except StashPopConflict as exc:
+                await notify(
+                    "Stash-pop conflict on %s; rolling back: %s"
+                    % (", ".join(exc.unmerged_paths) or "(unknown)", exc),
+                )
+                await _rollback_code_to(current)
+                if snapshot is not None:
+                    _restore_data_dir(snapshot)
+                # NOTE: do NOT re-pop the stash here. Git preserved it
+                # automatically on conflict; the operator resolves
+                # manually when they reach the machine.
+                return False, (
+                    "Stash-pop conflict on %s — code rolled back to %s. "
+                    "Stash preserved at stash@{0}. Resolve manually: "
+                    "edit the conflicted files to remove "
+                    "<<<<<<</=======/>>>>>>> markers, `git add` them, "
+                    "then `git stash drop` and re-trigger the update."
+                    % (
+                        ", ".join(exc.unmerged_paths) or "(unknown)",
+                        current,
+                    )
+                )
+
+            # 6.1 Belt-and-braces — verify every Python file in the
+            # working tree parses cleanly after the stash pop. The
+            # post-update smoke test at step 5.5 ran BEFORE the pop, so
+            # a pop that mutated a file without producing unmerged
+            # paths (rare but possible — e.g. a clean apply that
+            # introduces a typo) would otherwise restart the bot into a
+            # SyntaxError. This is a cheap parse-only check; the full
+            # smoke test (subprocess boot of bot.py) already ran.
+            syntax_ok, syntax_err = _check_python_syntax_in_repo()
+            if not syntax_ok:
+                await notify(
+                    "Post-stash syntax check failed; rolling back: %s"
+                    % syntax_err,
+                )
+                # Re-stash the popped changes so they aren't lost when we
+                # roll back the code. The reflog keeps the original stash
+                # accessible too, but a fresh `stash push` is the
+                # cleanest recovery shape for the operator.
+                restash = await _git("stash", "push", "-m",
+                    "robyx auto-update rollback (post-pop syntax failure)",
+                    check=False,
+                )
+                await _rollback_code_to(current)
+                if snapshot is not None:
+                    _restore_data_dir(snapshot)
+                if restash.returncode == 0:
+                    log.info(
+                        "Re-stashed user changes into stash@{0} before rollback",
+                    )
+                return False, (
+                    "Python syntax check failed after stash pop: %s"
+                    % syntax_err
+                )
 
         # 6.5 Invalidate AI-CLI sessions for any agent whose system prompt
         # or per-agent brief was changed by this update. See the module

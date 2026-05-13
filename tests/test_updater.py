@@ -616,6 +616,52 @@ class TestApplyUpdate:
         assert "bot/foo.py" in msg
 
     @pytest.mark.asyncio
+    @patch("updater._git")
+    async def test_safe_stash_pop_strict_raises_on_conflict(self, mock_git):
+        """v0.28.2 hotfix — ``strict=True`` raises ``StashPopConflict``
+        instead of only logging when stash pop leaves unmerged paths.
+        This is the contract the success-path of ``apply_update`` relies
+        on to trigger a rollback rather than restarting the bot into a
+        file with raw ``<<<<<<<`` markers (the v0.28.0 Linux incident).
+        """
+
+        def side_effect(*args, check=True):
+            if args[:2] == ("stash", "pop"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 1, "",
+                    "CONFLICT (content): Merge conflict in bot/bot.py\n",
+                )
+            if args[:2] == ("ls-files", "--unmerged"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 0,
+                    "100644 aaa 1\tbot/bot.py\n"
+                    "100644 bbb 2\tbot/bot.py\n"
+                    "100644 ccc 3\tbot/bot.py\n",
+                    "",
+                )
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+        mock_git.side_effect = side_effect
+        with pytest.raises(updater.StashPopConflict) as exc_info:
+            await updater._safe_stash_pop(strict=True)
+        assert exc_info.value.returncode == 1
+        assert "bot/bot.py" in exc_info.value.unmerged_paths
+
+    @pytest.mark.asyncio
+    @patch("updater._git")
+    async def test_safe_stash_pop_strict_does_not_raise_on_clean_pop(
+        self, mock_git,
+    ):
+        """``strict=True`` only raises on conflict — a clean pop is a
+        no-op regardless of the flag."""
+        mock_git.return_value = subprocess.CompletedProcess(
+            ["git", "stash", "pop"], 0, "Dropped refs/stash@{0}", "",
+        )
+        # Must not raise.
+        await updater._safe_stash_pop(strict=True)
+
+
+    @pytest.mark.asyncio
     @patch("updater.asyncio.create_subprocess_exec")
     @patch("updater._git")
     async def test_detached_head_reattaches_to_main(self, mock_git, mock_exec, tmp_path):
@@ -1739,3 +1785,46 @@ class TestApplyUpdateSafetyIntegration:
         # The restore_data_dir spy must have been called with the snapshot
         # path created during this update.
         restore_spy.assert_called_once()
+
+
+# ── v0.28.2 hotfix — post-stash-pop syntax check ─────────────────────
+
+
+class TestCheckPythonSyntaxInRepo:
+    """Belt-and-braces parse check used by ``apply_update`` after step-6
+    stash pop. Catches the v0.28.0 Linux failure shape: a ``git stash pop``
+    that left ``<<<<<<<`` / ``=======`` / ``>>>>>>>`` markers inside a
+    Python file, which Python parses as ``SyntaxError`` and would
+    crashloop the service if we restarted into it."""
+
+    def test_clean_repo_passes(self):
+        ok, err = updater._check_python_syntax_in_repo()
+        assert ok, err
+        assert err == ""
+
+    def test_conflict_markers_detected(self, monkeypatch, tmp_path):
+        """A file with raw ``<<<<<<<`` markers (the v0.28.0 Linux
+        failure shape) must fail the parse check."""
+        bot_dir = tmp_path / "bot"
+        bot_dir.mkdir(exist_ok=True)  # conftest _patch_env may pre-create
+        (bot_dir / "ok.py").write_text("x = 1\n")
+        (bot_dir / "conflicted.py").write_text(
+            "<<<<<<< Updated upstream\n"
+            "x = 1\n"
+            "=======\n"
+            "x = 2\n"
+            ">>>>>>> Stashed changes\n"
+        )
+        monkeypatch.setattr(updater, "PROJECT_ROOT", tmp_path)
+        ok, err = updater._check_python_syntax_in_repo()
+        assert not ok
+        assert "SyntaxError" in err
+        assert "conflicted.py" in err
+
+    def test_missing_bot_dir_is_ok(self, monkeypatch, tmp_path):
+        """A repo without a ``bot/`` dir is acceptable — the helper is
+        defensive and treats it as 'nothing to check, presumed ok'."""
+        monkeypatch.setattr(updater, "PROJECT_ROOT", tmp_path)
+        ok, err = updater._check_python_syntax_in_repo()
+        assert ok
+        assert err == ""
