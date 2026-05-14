@@ -254,6 +254,25 @@ class TestClassifyError:
         result = _classify_error("something weird", "", "")
         assert "unknown" in result
 
+    def test_stderr_preferred_over_stdout_for_classification(self):
+        """combined includes stdout, which can contain assistant content
+        mentioning rate-limit keywords. stderr (the actual error channel)
+        must drive classification; stdout-only matches are ignored."""
+        combined = "i talked about rate limit in my answer connection refused"
+        err = "connection refused"
+        out = "i talked about rate limit in my answer"
+        result = _classify_error(combined, err, out)
+        assert result == STRINGS["network_error"]
+        assert result != STRINGS["rate_limited"]
+
+    def test_falls_back_to_combined_when_stderr_empty(self):
+        """If a CLI prints its error on stdout and exits non-zero with
+        empty stderr, the combined haystack (stdout+stderr, lowercased)
+        is still consulted so we don't lose the signal entirely."""
+        combined = "rate limit hit"
+        result = _classify_error(combined, "", "rate limit hit")
+        assert result == STRINGS["rate_limited"]
+
 
 # ══════════════════════════════════════════════════════════════════════
 # split_message
@@ -1156,17 +1175,31 @@ class TestInvokeAiLocked:
         assert result == STRINGS["ai_no_response"]
 
     @pytest.mark.asyncio
-    async def test_rate_limited_response(self, agent_manager, mock_bot, claude_backend):
-        """Lines 215-217: response contains rate limit keyword."""
+    async def test_assistant_text_mentioning_rate_limit_is_delivered(
+        self, agent_manager, mock_bot, claude_backend,
+    ):
+        """A successful response whose text happens to mention "rate limit"
+        (because the agent is reviewing the rate-limit code, citing docs,
+        etc.) must be delivered as-is — not replaced with STRINGS["rate_limited"].
+
+        Regression test for the false-positive substring match that
+        previously triggered on any assistant content containing one of
+        ``RATE_LIMIT_KEYWORDS``.
+        """
         agent = agent_manager.get("robyx")
         proc = _make_mock_process(returncode=0)
+        assistant_text = (
+            "I updated the rate limit handling: the keyword `throttling` is "
+            "now matched against stderr only, not against the AI response."
+        )
 
         with patch("ai_invoke.asyncio.create_subprocess_exec", return_value=proc), \
              patch.object(claude_backend, "build_command", return_value=["claude"]), \
-             patch("ai_invoke._read_stream", new_callable=AsyncMock, return_value="rate limit reached sorry"):
+             patch("ai_invoke._read_stream", new_callable=AsyncMock, return_value=assistant_text):
             result = await _invoke_ai_locked(agent, "hi", 123, mock_bot, agent_manager, claude_backend, False, "sonnet", 0, None)
 
-        assert result == STRINGS["rate_limited"]
+        assert result == assistant_text
+        assert result != STRINGS["rate_limited"]
 
     @pytest.mark.asyncio
     async def test_empty_response(self, agent_manager, mock_bot, claude_backend):

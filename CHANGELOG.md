@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.28.3
+
+**Rate-limit false-positive fix.** Working inside the robyx-ai workspace
+(or any project whose code discusses rate-limit handling), agent replies
+that merely *mentioned* keywords like "rate limit", "limit reached", or
+"throttling" were being silently replaced with
+`"Rate limit reached — retry in a few minutes."` — even though the user's
+subscription was nowhere near its actual usage limits. Root cause was a
+substring keyword scan running against the assistant's free-form response
+text and against the combined `stdout+stderr` of the CLI subprocess.
+
+### Fixed
+
+- **`bot/ai_invoke.py` success path** — removed the
+  `_is_rate_limited(text_lower)` check that scanned the assistant's parsed
+  result text. Assistant content is now delivered as-is.
+- **`bot/ai_invoke.py:_classify_error`** — now classifies on `err`
+  (stderr) first, falling back to `combined` only when stderr is empty.
+  Stdout (which for streaming backends contains the assistant's JSON
+  events, and for non-streaming backends contains the assistant's parsed
+  text) no longer leaks into keyword matching.
+- **`bot/ai_invoke.py:_is_rate_limited`** — defensively case-insensitive;
+  docstring forbids calling it on free-form assistant output.
+
+### Tests
+
+- `tests/test_ai_invoke.py` — inverted the test that previously enforced
+  the false-positive behavior. Added regression coverage:
+  `test_assistant_text_mentioning_rate_limit_is_delivered`,
+  `test_stderr_preferred_over_stdout_for_classification`,
+  `test_falls_back_to_combined_when_stderr_empty`.
+
+### Known follow-ups (deferred, both reviewers agreed)
+
+- `STREAM_RETRYABLE_KEYWORDS` shares the same anti-pattern at the
+  streaming success path and on the non-streaming combined haystack —
+  assistant discussing network errors triggers silent retries up to
+  `MAX_AI_RETRIES`. Major separate.
+- Structured rate-limit detection via Claude Code stream-json
+  `is_error` / `subtype` / `system/api_retry` events. Requires a captured
+  real-world rate-limit sample to verify the exact event format.
+- Keyword categorisation (rate-limit vs quota/billing vs server-overload
+  vs network).
+
+Adversarial review transcript at
+`research/claude-codex-rate-limit-review.md` (3-turn Claude ↔ Codex
+peer review, frozen sign-off).
+
 ## 0.28.2
 
 **Auto-updater hotfix — stash-pop conflict now triggers rollback.**

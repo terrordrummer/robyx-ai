@@ -612,17 +612,34 @@ def _backend_short_name(backend: AIBackend) -> str:
 
 
 def _is_rate_limited(text: str) -> bool:
-    return any(kw in text for kw in RATE_LIMIT_KEYWORDS)
+    """Substring match on CLI error/diagnostic text.
+
+    Intended for stderr / known-error payloads only. Never call this on
+    free-form assistant output — keyword substrings ("rate limit",
+    "limit reached", "throttl") regularly appear in legitimate AI
+    responses, especially when the agent is discussing rate-limit code
+    in this very repository.
+    """
+    return any(kw in text.lower() for kw in RATE_LIMIT_KEYWORDS)
 
 
 def _classify_error(combined: str, err: str, out: str) -> str:
-    if _is_rate_limited(combined):
+    # Prefer stderr for keyword classification. The non-streaming branch
+    # builds ``combined = (stdout + " " + stderr).lower()`` — including
+    # stdout means assistant content (which for some backends is just the
+    # parsed text) leaks into the keyword test and produces false
+    # positives (the most common one being "rate limit" matched against
+    # an agent response that merely *discusses* rate limits). Fall back
+    # to combined only when stderr is empty (some CLIs print errors to
+    # stdout).
+    haystack = (err if err else combined).lower()
+    if _is_rate_limited(haystack):
         return STRINGS["rate_limited"]
-    if "network" in combined or "connection" in combined or "timeout" in combined:
+    if "network" in haystack or "connection" in haystack or "timeout" in haystack:
         return STRINGS["network_error"]
-    if "permission" in combined or "denied" in combined:
+    if "permission" in haystack or "denied" in haystack:
         return STRINGS["permission_denied"]
-    if "session" in combined and ("not found" in combined or "invalid" in combined):
+    if "session" in haystack and ("not found" in haystack or "invalid" in haystack):
         return STRINGS["session_expired"]
     detail = err or out or "unknown"
     return STRINGS["ai_error"] % detail[:300]
@@ -944,8 +961,10 @@ async def _invoke_ai_locked(
                 agent, message, chat_id, platform, manager, backend,
                 is_orchestrator_call, model, _retry + 1, thread_id,
             )
-        if _is_rate_limited(text_lower):
-            return STRINGS["rate_limited"]
+        # Do not infer rate limits from assistant content. Substring
+        # matches against free-form AI output produce frequent false
+        # positives; failure-path diagnostics are classified separately
+        # in _classify_error.
 
         # If the backend handed us a native session id (e.g. OpenCode's
         # ``ses_…``), persist it so the next turn can resume the
