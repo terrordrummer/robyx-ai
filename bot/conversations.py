@@ -20,9 +20,9 @@ break message delivery if the disk is full or read-only. ``archive`` and
 can surface them.
 
 The orchestrator (HQ) agent is excluded from turn logging by the caller
-in ``bot/ai_invoke.py`` — Roberto's design choice (spec 007.1
-clarification): ``/clear`` is a tool for the operational agents, not for
-the orchestrator that needs full cross-session context to coordinate.
+in ``bot/ai_invoke.py`` — by design (spec 007.1 clarification):
+``/clear`` is a tool for the operational agents, not for the
+orchestrator that needs full cross-session context to coordinate.
 """
 
 from __future__ import annotations

@@ -118,7 +118,7 @@ class TestCmdClearWorkspace:
 class TestCmdClearNonOwnerFeedback:
     """Pre-0.28.1 ``cmd_clear`` returned silently when a non-owner ran
     the command in a workspace/specialist topic (legacy ``@owner_only``
-    pattern from ``/reset``). Roberto reported "no feedback" — the silent
+    pattern from ``/reset``). The owner reported "no feedback" — the silent
     branch was the cause. The hotfix replaces the silent return with an
     explicit ``clear_not_owner`` reply so every invocation produces a
     visible response."""

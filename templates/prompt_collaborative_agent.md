@@ -98,7 +98,7 @@ See `specs/003-external-group-wiring/contracts/collab-setup-complete.md`.
 ### Surfacing updates to HQ
 
 When an **executive** user in your group says "let HQ know …", "tell
-Roberto …", or otherwise asks you to surface a short update to the
+the owner …", or otherwise asks you to surface a short update to the
 bot owner's Headquarters, emit:
 
 ```

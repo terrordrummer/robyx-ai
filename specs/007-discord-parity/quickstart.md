@@ -12,9 +12,9 @@ token configured in `.env` (`DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`,
 `DISCORD_CONTROL_CHANNEL_ID`).
 
 A second testing guild "robyx-test-007" with two text channels `#general`
-and `#project-a` is recommended. The bot owner is Roberto (`OWNER_ID` set to
-his Telegram id; his Discord id is recorded as `OWNER_ID_DISCORD` for
-manual cross-referencing).
+and `#project-a` is recommended. The bot owner (`OWNER_ID` set to their
+Telegram id; their Discord id is recorded as `OWNER_ID_DISCORD` for
+manual cross-referencing) drives the quickstart.
 
 ---
 
@@ -84,13 +84,13 @@ second testing guild. Pre-announce a workspace `recovery-007` (Flow A as §2).
 2. The bot posts `STRINGS["discord_audit_log_unavailable"]` in the first
    writable channel of the second guild.
 3. Workspace record remains `status="pending"`, `chat_id="0"`.
-4. Roberto types `/im-the-owner recovery-007` in `#general` of the second guild.
+4. The owner types `/im-the-owner recovery-007` in `#general` of the second guild.
 5. Bot replies `STRINGS["im_the_owner_success"]`.
 6. Same downstream flow as §2.4–§2.7.
 
-**Negative**: A second user (not Roberto) types `/im-the-owner recovery-007`
-before Roberto. Bot replies `STRINGS["im_the_owner_creator_mismatch"]`; the
-workspace remains pending until Roberto claims it.
+**Negative**: A second user (not the owner) types `/im-the-owner recovery-007`
+before the owner does. Bot replies `STRINGS["im_the_owner_creator_mismatch"]`; the
+workspace remains pending until the owner claims it.
 
 ---
 
@@ -98,7 +98,7 @@ workspace remains pending until Roberto claims it.
 
 **Setup**: From §2, workspace `atlas-007` is active in `robyx-test-007:#general`.
 
-**Trigger**: Have an unauthorized Discord user (not Roberto, not OWNER/OPERATOR
+**Trigger**: Have an unauthorized Discord user (not the owner, not OWNER/OPERATOR
 in any active workspace) add Robyx to a **second channel** in the same guild
 (`robyx-test-007:#project-a`) — Discord OAuth supports per-channel invites
 via channel-restricted permissions, but at the gateway level the bot only

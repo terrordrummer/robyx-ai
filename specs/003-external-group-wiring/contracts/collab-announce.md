@@ -33,7 +33,7 @@ All attributes are required. Attribute order is free. Double-quoted string value
 
 ## Example (orchestrator output)
 
-Input from Roberto in HQ:
+Input from the owner in HQ:
 
 > "I'm going to create a Telegram group with Alice and Bob for the Nebula research project. Use our astro-research workspace as a base."
 

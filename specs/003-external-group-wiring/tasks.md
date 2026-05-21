@@ -74,7 +74,7 @@ Single-project Python repo. Source under `bot/`; tests under `tests/`; runtime s
 
 ## Phase 3: User Story 1 — Pre-announced external group gets a working agent (Priority: P1) 🎯 MVP
 
-**Goal**: From HQ, Roberto tells the orchestrator he'll create an external group; the orchestrator captures purpose + inheritance via `[COLLAB_ANNOUNCE]`; when the group is created, Flow A matches and the bot's first in-group message references the pre-announced purpose.
+**Goal**: From HQ, the owner tells the orchestrator they'll create an external group; the orchestrator captures purpose + inheritance via `[COLLAB_ANNOUNCE]`; when the group is created, Flow A matches and the bot's first in-group message references the pre-announced purpose.
 
 **Independent Test**: End-to-end per `quickstart.md` Flow 1 — announce "nebula" in HQ with purpose and inheritance; create Telegram group; add bot; verify first in-group message references the purpose AND the agent answers follow-ups using inherited skills.
 
@@ -98,7 +98,7 @@ Single-project Python repo. Source under `bot/`; tests under `tests/`; runtime s
 - [X] T026 [US1] Extend Flow A's HQ notification in `collab_bot_added` to include the purpose (use new i18n string `collab_bot_added_hq_pending` or extend the existing "Collaborative workspace configured" format with a `Purpose:` line).
 - [X] T027 [US1] Update agent-prompt context so the freshly-bound agent has access to the captured purpose. Concretely: verify that the agent's `.md` file written in T023 is the same file `AgentManager` loads when the agent is first invoked (no code change may be needed — document the verification in `tests/test_collab_announce_command.py`).
 
-**Checkpoint**: US1 end-to-end works. Roberto can announce, create, and chat. No Phase 2/other-story regressions.
+**Checkpoint**: US1 end-to-end works. The owner can announce, create, and chat. No Phase 2/other-story regressions.
 
 ---
 
@@ -242,7 +242,7 @@ Task: "Implement leave_chat on Slack adapter in bot/messaging/slack.py (NotImple
 ### MVP First (US1 only)
 
 1. Phase 1 + Phase 2 → foundation ready.
-2. Phase 3 (US1) → Roberto can pre-announce groups. **STOP & validate** against Flow 1 of `quickstart.md`. Merge → ship MVP.
+2. Phase 3 (US1) → the owner can pre-announce groups. **STOP & validate** against Flow 1 of `quickstart.md`. Merge → ship MVP.
 3. Phase 4 (US2) → ad-hoc adds produce real AI turns. Validate Flow 2. Merge.
 4. Phase 5 (US3) → full bidirectional routing + lifecycle. Validate Flows 3, 4, 5.
 5. Phase 6 → polish, release notes, multi-platform guard.

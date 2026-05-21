@@ -47,7 +47,7 @@ description: "Task list for spec 007 — Discord parity for collaborative worksp
 - [ ] T014 [P1] Create `tests/test_migration_v0_28_0.py`: synthetic pre-007 JSON (3 records: one with legacy int chat_id, one with already-string chat_id but no platform field, one already migrated) → run migration → assert post-state correct; second run is a no-op (done marker check); idempotency on already-migrated single record.
 - [ ] T014a [P1] Update `tests/test_collaborative.py` to construct workspaces with `chat_id: str`; add a test that explicitly verifies `from_dict` accepts a legacy `{"chat_id": -1001234}` record and coerces to `"-1001234"`.
 
-**Checkpoint**: run `cd <repo-root> && PYTHONPATH=bot pytest tests/test_collab* tests/test_collaborative.py tests/test_authorization.py -v` and `ruff check bot/ tests/`. Both green. Then await user review before Phase 2.
+**Checkpoint**: from the repo root run `PYTHONPATH=bot pytest tests/test_collab* tests/test_collaborative.py tests/test_authorization.py -v` and `ruff check bot/ tests/`. Both green. Then await user review before Phase 2.
 
 ---
 

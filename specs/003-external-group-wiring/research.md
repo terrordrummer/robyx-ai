@@ -44,7 +44,7 @@ The call uses the existing `_process_and_send(agent, bootstrap_message, chat_id,
 
 **Alternatives considered**:
 - *Dedicated "setup agent" singleton* that does setup for all groups and then hands off: rejected — adds coordination complexity and loses the "same agent the group will talk to forever" identity.
-- *Two-step: template first, AI later when the user replies*: rejected — this is the current behaviour and exactly the failure mode Roberto reported.
+- *Two-step: template first, AI later when the user replies*: rejected — this is the current behaviour and exactly the failure mode the owner reported.
 
 ---
 
@@ -108,7 +108,7 @@ Rendered from `collab_store.list_for_orchestrator()` (new helper that returns ac
 **Rationale**:
 - Mirrors `[DELEGATE]` mechanics and the confirmation-back pattern at `ai_invoke.py:774-789`.
 - `get_by_agent_name` already filters on `status=="active"`, preventing stray deliveries to closed groups.
-- Delivery failure surfaces in the HQ response so the orchestrator can retry or inform Roberto.
+- Delivery failure surfaces in the HQ response so the orchestrator can retry or inform the owner.
 
 **Alternatives considered**:
 - *Direct agent-to-agent invocation* (running the target agent to produce a reply instead of relaying text): rejected — the orchestrator's intent is to *inform* the group, not to trigger an AI turn there. A user reply in the group will naturally produce an agent turn.
@@ -122,7 +122,7 @@ Rendered from `collab_store.list_for_orchestrator()` (new helper that returns ac
 **Rationale**:
 - Symmetric with `[COLLAB_SEND]`; completes the two-way channel required by FR-007 and User Story 3.
 - Reuses the HQ notification path already used at `handlers.py:1421-1428` and `handlers.py:1533-1540`.
-- Does not invoke the orchestrator — it lands as a notification in HQ, and Roberto (or the orchestrator on its next turn) can choose to act.
+- Does not invoke the orchestrator — it lands as a notification in HQ, and the owner (or the orchestrator on its next turn) can choose to act.
 
 **Alternatives considered**:
 - *Re-invoke orchestrator with the notification as input*: rejected for this iteration — risks feedback loops and surprise token cost. Can be added behind a flag later.
@@ -158,7 +158,7 @@ Rendered from `collab_store.list_for_orchestrator()` (new helper that returns ac
 **Rationale**:
 - Matches FR-011's "MUST be explicit, not silent provisioning".
 - The "leave group" Telegram API is available via python-telegram-bot (`bot.leave_chat(chat_id)`); expose it on the `Platform` ABC as `platform.leave_chat(chat_id)` so Discord/Slack can implement or raise.
-- Notifying HQ allows Roberto to reverse the decision if it was a legitimate add but by an unrecognised account.
+- Notifying HQ allows the owner to reverse the decision if it was a legitimate add but by an unrecognised account.
 
 **Alternatives considered**:
 - *Provision + await approval from HQ*: rejected for v1 — adds a pending-approval state machine and a new HQ control command. Can be added later if "leave by default" proves too strict.
@@ -180,7 +180,7 @@ And emits a log entry. The bot does **not** auto-leave on Discord/Slack (to avoi
 
 **Alternatives considered**:
 - *Full Discord/Slack support*: deferred per Complexity Tracking in `plan.md`.
-- *Silent no-op*: rejected — would recreate the exact silent-failure symptom Roberto reported.
+- *Silent no-op*: rejected — would recreate the exact silent-failure symptom the owner reported.
 
 ---
 
@@ -209,7 +209,7 @@ And emits a log entry. The bot does **not** auto-leave on Discord/Slack (to avoi
 
 ## Open items for `/speckit-clarify`
 
-Roberto may want to reconsider:
+The owner may want to reconsider:
 - **FR-013 scope** — currently Telegram-only; Discord/Slack ship a "not yet supported" message. Could be widened to include Discord/Slack in the same iteration, which would expand Complexity Tracking significantly.
 - **Unauthorised adder behaviour** — currently "leave + notify"; could be "stay-but-silent + notify" or "provision pending HQ approval".
 

@@ -51,7 +51,7 @@ peer review, frozen sign-off).
 ## 0.28.2
 
 **Auto-updater hotfix — stash-pop conflict now triggers rollback.**
-Closes the v0.28.0 Linux crashloop incident (Roberto, 2026-05-13): the
+Closes the v0.28.0 Linux crashloop incident (owner report, 2026-05-13): the
 auto-updater's `git stash pop` left raw `<<<<<<<` / `=======` /
 `>>>>>>>` markers inside `bot/bot.py` after a non-trivial WIP collision,
 Python raised `SyntaxError` on restart, and the service crashlooped
@@ -103,7 +103,7 @@ instead of restarting into a broken file.
 ## 0.28.1
 
 **`/clear` UX hotfix.** Three issues in the spec 007.1 chat-archive
-command, surfaced by Roberto immediately after the 0.28.0 rollout:
+command, surfaced by the owner immediately after the 0.28.0 rollout:
 silent return for non-owner workspace calls, missed agent resolution
 in collab chats without forum topics, and a too-loose HQ guard that
 matched any thread-less Telegram chat as HQ. No persisted state schema

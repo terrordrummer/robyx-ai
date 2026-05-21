@@ -31,5 +31,5 @@
 
 ## Notes
 
-- Auto-mode default applied on FR-013: scope to Telegram only; Discord/Slack show an explicit "not yet supported" message. Roberto can override during `/speckit-clarify` if Discord/Slack should be in-scope for this iteration.
+- Auto-mode default applied on FR-013: scope to Telegram only; Discord/Slack show an explicit "not yet supported" message. The owner can override during `/speckit-clarify` if Discord/Slack should be in-scope for this iteration.
 - Items marked incomplete require spec updates before `/speckit-clarify` or `/speckit-plan`.

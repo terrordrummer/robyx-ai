@@ -225,8 +225,8 @@ from a future HQ on Discord — unlikely but supported by the abstraction).
 
 - The audit-log mechanic is already required for the unauthorized-adder
   guard. Re-using it for Flow A means one code path, not two.
-- `expected_platform` prevents Roberto's Telegram user id `42` from
-  accidentally binding to a pending workspace meant for Roberto's Discord
+- `expected_platform` prevents the owner's Telegram user id `42` from
+  accidentally binding to a pending workspace meant for the owner's Discord
   user id `42` (the ids are unrelated; collision is plausible).
 
 **Alternatives considered**:

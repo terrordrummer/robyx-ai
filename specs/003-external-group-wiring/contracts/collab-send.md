@@ -38,7 +38,7 @@ Both attributes required. `text` may contain newlines (encoded as literal `\n` o
 
 ## Example
 
-Roberto in HQ: "Tell the Nebula group we'll skip tomorrow's session."
+The owner in HQ: "Tell the Nebula group we'll skip tomorrow's session."
 
 Orchestrator response (pre-strip):
 
@@ -48,7 +48,7 @@ Sent.
 [COLLAB_SEND name="nebula" text="Heads-up: we're skipping tomorrow's session."]
 ```
 
-Post-parse response to Roberto:
+Post-parse response to the owner:
 
 ```
 Sent.

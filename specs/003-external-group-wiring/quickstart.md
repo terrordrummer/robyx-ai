@@ -1,7 +1,7 @@
 # Quickstart: External Group Wiring
 
 **Feature**: 003-external-group-wiring
-**Audience**: Roberto and anyone reviewing the feature end-to-end.
+**Audience**: the bot owner and anyone reviewing the feature end-to-end.
 
 This quickstart exercises the two user-facing flows (P1 pre-announced, P2 ad-hoc) and the orchestrator's view of external groups (P2). It assumes a running bot on Telegram with HQ configured (`OWNER_ID`, `CHAT_ID`, and `control_room_id` set).
 

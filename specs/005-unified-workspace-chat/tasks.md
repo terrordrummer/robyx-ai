@@ -16,7 +16,7 @@ description: "Task list for feature 005-unified-workspace-chat"
 
 - **[P]**: Parallelizable (distinct files, no incomplete dependencies)
 - **[Story]**: Owning user story (`US1`…`US5`); setup/foundational/polish phases have no story label
-- All paths are repo-relative from ``
+- All paths are repo-relative from the repository root
 
 ## Path Conventions
 

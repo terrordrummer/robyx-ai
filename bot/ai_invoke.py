@@ -979,8 +979,8 @@ async def _invoke_ai_locked(
 
         # Spec 007.1 — conversation archive. Log this turn so /clear can
         # produce a markdown transcript before resetting the session.
-        # Orchestrator turns are intentionally excluded (Roberto's design
-        # choice — the HQ agent needs full cross-session context). The
+        # Orchestrator turns are intentionally excluded by design — the HQ
+        # agent needs full cross-session context. The
         # log call is defensive (swallows all exceptions) so a failure
         # never breaks message delivery.
         if not is_orchestrator_call and agent.agent_type != "orchestrator":

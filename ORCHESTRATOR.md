@@ -327,7 +327,7 @@ add_task({
     "id": str(uuid.uuid4()),
     "name": "remind-meeting",            # unique slug
     "agent_file": "agents/my-workspace.md",
-    "prompt": "Tell Roberto: reminder — product meeting at 15:00!",
+    "prompt": "Tell the owner: reminder — product meeting at 15:00!",
     "type": "one-shot",                  # or "periodic"
     "scheduled_at": "2026-04-10T15:00:00+00:00",
     "status": "pending",
