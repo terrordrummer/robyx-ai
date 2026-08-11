@@ -1,10 +1,9 @@
 """Robyx — startup dependency check.
 
 Runs at the very top of ``bot/bot.py`` before any other ``bot/*`` import.
-Its only job is to make sure the virtual environment's packages are in
-sync with ``bot/requirements.txt`` — if they are not, it runs
-``pip install -r bot/requirements.txt`` once, synchronously, before the
-rest of the bot starts.
+Its only job is to make sure the virtual environment's packages are in sync
+with the committed runtime lock for this Python minor. If they are not, it
+runs a hash-verified install once, synchronously, before the bot starts.
 
 Why this exists
 ---------------
@@ -17,10 +16,9 @@ new code against the old venv and crashes with ``ImportError: No module
 named 'PIL'`` or similar.
 
 This file is the safety net. It runs *every time the bot starts*, but
-only performs work when the content of ``requirements.txt`` has actually
-changed since the last successful install (tracked via a SHA1 hash
-stored inside the venv itself). The common case — same requirements —
-is a fast file hash comparison and nothing else.
+only performs work when the input requirements or selected runtime lock have
+changed since the last successful install (tracked via a SHA256 fingerprint
+stored inside the venv itself). The common case is a fast comparison.
 
 Design choices
 --------------
@@ -30,26 +28,34 @@ Design choices
   prod) don't share a marker.
 - **No third-party imports**: this file can only use the Python stdlib,
   because if a dep is missing we might not even have ``packaging`` etc.
-- **Best-effort**: a pip install failure is logged loudly on stderr but
-  not fatal — we still let the bot try to import, because the error
-  message from the eventual ``ImportError`` is often more informative.
+- **Fail closed**: a missing lock or failed install stops boot with a concise
+  dependency error. New code must never continue against a stale environment.
 - **Quiet common path**: no output when the hash matches, so the bot
   startup stays clean in operational logs.
-- **Skips when no venv**: if there is no ``.venv/`` at the expected path
-  we return immediately. This single check covers both dev/manual runs
-  and test sessions (pytest runs against the project tree without a
-  ``.venv/``), so the bootstrap never shells out to pip while tests
-  are executing.
+- **Runs only inside the managed venv**: ``.venv/`` must both exist and be the
+  running interpreter's ``sys.prefix``. A developer, CI, or test interpreter
+  must never mutate a different checkout-local environment merely because it
+  happens to exist.
 """
 
 from __future__ import annotations
 
-import hashlib
+import json
 import os
+import re
+import signal
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 from pathlib import Path
+
+from dependency_locks import (
+    DependencyLockError,
+    dependency_fingerprint,
+    dependency_lock_path,
+)
 
 _BOT_DIR = Path(__file__).parent
 _PROJECT_ROOT = _BOT_DIR.parent
@@ -73,17 +79,40 @@ _CHILD_ENV_SCRUB = frozenset({
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
 })
+_SENSITIVE_ENV_NAME = re.compile(
+    r"(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL)",
+    re.IGNORECASE,
+)
+_PIP_TRANSPORT_ENV = frozenset({
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+})
 
 
 def _scrubbed_child_env() -> dict[str, str]:
     """Return a copy of ``os.environ`` with platform tokens / AI provider
     keys removed. Used as the ``env=`` argument for the pip subprocess.
     Stdlib-only — this file runs before third-party imports are safe."""
-    return {k: v for k, v in os.environ.items() if k not in _CHILD_ENV_SCRUB}
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _CHILD_ENV_SCRUB
+        and not (
+            _SENSITIVE_ENV_NAME.search(key)
+            and key not in _PIP_TRANSPORT_ENV
+        )
+    }
 
 
-def _compute_hash(path: Path) -> str:
-    return hashlib.sha1(path.read_bytes()).hexdigest()
+def _runtime_lock() -> Path:
+    return dependency_lock_path(_PROJECT_ROOT, kind="runtime")
+
+
+def _current_dependency_hash(lock_path: Path) -> str:
+    return dependency_fingerprint(_REQUIREMENTS, lock_path)
 
 
 def _venv_pip() -> Path | None:
@@ -98,9 +127,179 @@ def _marker_path() -> Path:
     return _VENV_DIR / ".robyx_deps_hash"
 
 
+def _running_from_managed_venv() -> bool:
+    """Return whether this interpreter owns the checkout-local runtime venv."""
+    try:
+        return Path(sys.prefix).resolve() == _VENV_DIR.resolve()
+    except OSError:
+        return False
+
+
 def _log(msg: str, *, err: bool = False) -> None:
     stream = sys.stderr if err else sys.stdout
     print("[robyx bootstrap] %s" % msg, file=stream, flush=True)
+
+
+def _terminate_pip_process(proc: subprocess.Popen) -> None:
+    """Terminate the hash-install process group and reap its leader."""
+    if proc.poll() is not None:
+        proc.wait()
+        return
+    if sys.platform != "win32":
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+    else:  # pragma: no cover - no Windows CI
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc.terminate()
+    try:
+        proc.wait(timeout=2.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if sys.platform != "win32":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+    else:  # pragma: no cover
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            proc.kill()
+    proc.wait()
+
+
+def _run_pip_install(
+    argv: list[str],
+    *,
+    timeout: float,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess:
+    """Run pip in an isolated group with cleanup on timeout or parent unwind."""
+    previous_handlers: dict[int, object] = {}
+
+    def _bootstrap_signal(signum, _frame):
+        raise SystemExit(128 + int(signum))
+
+    # This runs before bot.main() installs the normal shutdown hooks. Without
+    # a temporary handler, SIGTERM would kill the Python parent immediately
+    # while isolated pip/build children continued mutating .venv.
+    if threading.current_thread() is threading.main_thread():
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _bootstrap_signal)
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(_PROJECT_ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=sys.platform != "win32",
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                if sys.platform == "win32"
+                else 0
+            ),
+        )
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except BaseException:
+        # Ignore repeated termination signals for the bounded cleanup window;
+        # original handlers are restored in finally before propagation.
+        for signum in previous_handlers:
+            signal.signal(signum, signal.SIG_IGN)
+        if proc is not None:
+            _terminate_pip_process(proc)
+        raise
+    finally:
+        for signum, previous in previous_handlers.items():
+            signal.signal(signum, previous)
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def _write_marker_atomically(marker: Path, value: str) -> None:
+    """Commit a successful dependency fingerprint without partial markers."""
+    fd, temp_name = tempfile.mkstemp(
+        prefix=".%s." % marker.name,
+        suffix=".tmp",
+        dir=str(marker.parent),
+    )
+    temporary = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _assert_no_interrupted_update() -> None:
+    """Fail boot closed when a prior updater died after changing code/data."""
+    marker = _DATA_DIR / "backups" / "active-update.json"
+    if not marker.exists():
+        return
+    valid = False
+    phase = "unknown"
+    pre_commit = ""
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        phase = str(payload.get("phase", "unknown"))
+        pre_commit = str(payload.get("pre_update_commit", ""))
+        valid = (
+            isinstance(payload, dict)
+            and payload.get("schema") == 1
+            and phase in {
+                "stash",
+                "workspace-prepare",
+                "checkout",
+                "migration",
+                "dependencies",
+                "smoke-test",
+            }
+            and bool(re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", pre_commit))
+            and isinstance(payload.get("pre_update_version"), str)
+            and bool(payload.get("pre_update_version"))
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        valid = False
+
+    detail = "phase=%s pre-update=%s" % (
+        phase,
+        pre_commit[:12] if valid else "unverified",
+    )
+    raise DependencyLockError(
+        "interrupted update detected (%s); refusing to boot unverified code. "
+        "Inspect %s, restore the recorded commit/data snapshot, and remove "
+        "the marker only after smoke-testing the recovered runtime."
+        % (detail, marker)
+    )
 
 
 def migrate_personal_data_if_needed() -> list[str]:
@@ -166,14 +365,22 @@ def migrate_personal_data_if_needed() -> list[str]:
 
 
 def ensure_dependencies() -> None:
-    """Re-run ``pip install`` iff ``requirements.txt`` changed since last success."""
+    """Install the selected runtime lock iff its fingerprint changed."""
+    _assert_no_interrupted_update()
     if not _REQUIREMENTS.exists():
         return
-    if not _VENV_DIR.exists():
-        # Not running from a venv-managed install (dev mode, manual run).
+    if not _VENV_DIR.exists() or not _running_from_managed_venv():
+        # Dev/CI may execute this checkout from another virtual environment.
+        # Never install into a distinct checkout-local .venv in that case.
         return
 
-    current_hash = _compute_hash(_REQUIREMENTS)
+    try:
+        lock_path = _runtime_lock()
+        current_hash = _current_dependency_hash(lock_path)
+    except (DependencyLockError, OSError) as exc:
+        message = "dependency lock unavailable — refusing unlocked boot: %s" % exc
+        _log(message, err=True)
+        raise DependencyLockError(message) from exc
     marker = _marker_path()
     if marker.exists():
         try:
@@ -184,38 +391,47 @@ def ensure_dependencies() -> None:
 
     pip = _venv_pip()
     if pip is None:
-        _log("venv pip not found at %s — skipping dep check" % _VENV_DIR, err=True)
-        return
+        message = "venv pip not found at %s — refusing stale dependency boot" % _VENV_DIR
+        _log(message, err=True)
+        raise DependencyLockError(message)
 
-    _log("requirements.txt changed — running pip install...")
+    _log("dependency lock changed — running hash-verified pip install...")
     try:
-        proc = subprocess.run(
-            [str(pip), "install", "-r", str(_REQUIREMENTS)],
-            cwd=str(_PROJECT_ROOT),
-            env=_scrubbed_child_env(),
-            capture_output=True,
-            text=True,
+        proc = _run_pip_install(
+            [
+                str(pip),
+                "install",
+                "--require-hashes",
+                "-r",
+                str(lock_path),
+            ],
             timeout=600,
+            env=_scrubbed_child_env(),
         )
     except subprocess.TimeoutExpired:
-        _log("pip install timed out after 600s — continuing; imports may fail", err=True)
-        return
+        message = "hash-verified pip install timed out after 600s"
+        _log(message, err=True)
+        raise DependencyLockError(message) from None
     except OSError as e:
-        _log("pip install could not be launched: %s — continuing; imports may fail" % e, err=True)
-        return
+        message = "hash-verified pip install could not be launched: %s" % e
+        _log(message, err=True)
+        raise DependencyLockError(message) from e
 
     if proc.returncode != 0:
+        # pip output can echo authenticated index URLs and arbitrary setup.py
+        # diagnostics. Preserve the exit status, never the raw child streams.
         _log(
-            "pip install returned %d — continuing; imports may fail\n"
-            "--- stdout (last 1 KB) ---\n%s\n--- stderr (last 1 KB) ---\n%s"
-            % (proc.returncode, proc.stdout[-1024:], proc.stderr[-1024:]),
+            "hash-verified pip install failed with exit status %d"
+            % proc.returncode,
             err=True,
         )
-        return
+        raise DependencyLockError(
+            "hash-verified pip install failed with exit status %d" % proc.returncode
+        )
 
     # Success: persist the hash so we don't re-run next boot.
     try:
-        marker.write_text(current_hash)
+        _write_marker_atomically(marker, current_hash)
     except OSError as e:
         _log("could not write marker %s: %s" % (marker, e), err=True)
     _log("dependencies are now in sync (hash=%s)" % current_hash[:12])

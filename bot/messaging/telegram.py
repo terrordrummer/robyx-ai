@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
@@ -83,8 +84,13 @@ class TelegramPlatform(Platform):
 
     def is_main_thread(self, chat_id, thread_id) -> bool:
         # On Telegram the General topic of a forum supergroup has no
-        # ``message_thread_id``. Any other value identifies a forum topic.
-        return thread_id is None
+        # ``message_thread_id``.  The chat check is part of the security
+        # boundary: unrelated groups also use ``thread_id=None`` and must
+        # never be mistaken for Headquarters.
+        return (
+            thread_id is None
+            and str(chat_id) == str(self._chat_id)
+        )
 
     async def reply(self, msg_ref: Any, text: str, parse_mode: str | None = None) -> Any:
         """msg_ref is a telegram Message object (or mock)."""
@@ -240,24 +246,37 @@ class TelegramPlatform(Platform):
             return None
 
     async def close_channel(self, channel_id: int) -> bool:
+        from .base import TopicUnreachable
+
         try:
-            client = self._get_client()
-            resp = await client.post(
-                "%s/closeForumTopic" % self._api_base,
-                data={"chat_id": self._chat_id, "message_thread_id": channel_id},
-                timeout=30,
+            result = await self._topic_api_call(
+                "closeForumTopic",
+                {"chat_id": self._chat_id, "message_thread_id": channel_id},
+                channel_id,
             )
-            result = resp.json()
             if result.get("ok"):
                 log.info("Closed topic (thread_id=%d)", channel_id)
                 return True
             log.error("Failed to close topic: %s", result)
             return False
+        except TopicUnreachable:
+            raise
         except Exception as e:
             log.error("Error closing topic: %s", e)
             return False
 
     async def send_to_channel(self, channel_id: int, text: str, parse_mode: str | None = None) -> bool:
+        return bool(
+            await self.send_to_channel_with_ref(channel_id, text, parse_mode=parse_mode)
+        )
+
+    async def send_to_channel_with_ref(
+        self,
+        channel_id: int,
+        text: str,
+        parse_mode: str | None = None,
+    ) -> Any:
+        from .base import TopicUnreachable
         try:
             data = {
                 "chat_id": self._chat_id,
@@ -275,10 +294,18 @@ class TelegramPlatform(Platform):
             resp = await client.post(
                 "%s/sendMessage" % self._api_base, data=data, timeout=30,
             )
-            return resp.json().get("ok", False)
+            result = resp.json()
+            if self._is_topic_unreachable(result):
+                raise TopicUnreachable(
+                    channel_id,
+                    reason=result.get("description", ""),
+                )
+            return result.get("result", True) if result.get("ok") else None
+        except TopicUnreachable:
+            raise
         except Exception as e:
             log.error("Error sending to topic %d: %s", channel_id, e)
-            return False
+            return None
 
     async def get_invite_link(self, chat_id: int) -> str | None:
         try:
@@ -343,6 +370,7 @@ class TelegramPlatform(Platform):
         "MESSAGE_THREAD_NOT_FOUND",
         "chat not found",
     )
+    _TOPIC_RETRY_BACKOFF = (0.5, 1.0, 2.0)
 
     def _is_topic_unreachable(self, result: dict) -> bool:
         """True if the Bot API error payload signals a permanently gone topic."""
@@ -350,6 +378,62 @@ class TelegramPlatform(Platform):
             return False
         desc = (result.get("description") or "").lower()
         return any(m.lower() in desc for m in self._TOPIC_UNREACHABLE_MARKERS)
+
+    async def _topic_api_call(
+        self,
+        endpoint: str,
+        data: dict,
+        channel_id: int,
+    ) -> dict:
+        """Call one topic mutation with three bounded transient retries."""
+        from .base import TopicUnreachable
+
+        client = self._get_client()
+        attempts = len(self._TOPIC_RETRY_BACKOFF) + 1
+        last_result: dict = {}
+        for attempt in range(attempts):
+            try:
+                resp = await client.post(
+                    "%s/%s" % (self._api_base, endpoint),
+                    data=data,
+                    timeout=30,
+                )
+                last_result = resp.json()
+            except Exception as exc:
+                if attempt >= len(self._TOPIC_RETRY_BACKOFF):
+                    log.error(
+                        "%s failed after %d attempts: %s",
+                        endpoint,
+                        attempts,
+                        exc,
+                    )
+                    return {}
+                log.warning(
+                    "%s transient exception (attempt %d/%d): %s",
+                    endpoint,
+                    attempt + 1,
+                    attempts,
+                    exc,
+                )
+            else:
+                if last_result.get("ok"):
+                    return last_result
+                if self._is_topic_unreachable(last_result):
+                    raise TopicUnreachable(
+                        channel_id,
+                        reason=last_result.get("description", ""),
+                    )
+                if attempt >= len(self._TOPIC_RETRY_BACKOFF):
+                    return last_result
+                log.warning(
+                    "%s transient response (attempt %d/%d): %s",
+                    endpoint,
+                    attempt + 1,
+                    attempts,
+                    last_result,
+                )
+            await asyncio.sleep(self._TOPIC_RETRY_BACKOFF[attempt])
+        return last_result
 
     async def edit_topic_title(self, channel_id: int, new_title: str) -> bool:
         """Rename a forum topic via ``editForumTopic``.
@@ -364,21 +448,15 @@ class TelegramPlatform(Platform):
             "name": new_title,
         }
         try:
-            client = self._get_client()
-            resp = await client.post(
-                "%s/editForumTopic" % self._api_base, data=data, timeout=30,
+            result = await self._topic_api_call(
+                "editForumTopic", data, channel_id,
             )
-            result = resp.json()
             if result.get("ok"):
                 log.info(
                     "Edited topic title (thread_id=%d) → %r",
                     channel_id, new_title,
                 )
                 return True
-            if self._is_topic_unreachable(result):
-                raise TopicUnreachable(
-                    channel_id, reason=result.get("description", ""),
-                )
             log.warning(
                 "editForumTopic failed for %d: %s", channel_id, result,
             )
@@ -405,20 +483,14 @@ class TelegramPlatform(Platform):
             "disable_notification": True,  # silent pin — no ping
         }
         try:
-            client = self._get_client()
-            resp = await client.post(
-                "%s/pinChatMessage" % self._api_base, data=data, timeout=30,
+            result = await self._topic_api_call(
+                "pinChatMessage", data, thread_id,
             )
-            result = resp.json()
             if result.get("ok"):
                 log.info(
                     "Pinned message %d in topic %d", message_id, thread_id,
                 )
                 return True
-            if self._is_topic_unreachable(result):
-                raise TopicUnreachable(
-                    thread_id, reason=result.get("description", ""),
-                )
             log.warning("pinChatMessage failed: %s", result)
             return False
         except TopicUnreachable:
@@ -440,7 +512,6 @@ class TelegramPlatform(Platform):
         """
         from .base import TopicUnreachable
         try:
-            client = self._get_client()
             if message_id is None:
                 endpoint = "unpinAllForumTopicMessages"
                 data = {
@@ -453,22 +524,13 @@ class TelegramPlatform(Platform):
                     "chat_id": chat_id,
                     "message_id": message_id,
                 }
-            resp = await client.post(
-                "%s/%s" % (self._api_base, endpoint),
-                data=data,
-                timeout=30,
-            )
-            result = resp.json()
+            result = await self._topic_api_call(endpoint, data, thread_id)
             if result.get("ok"):
                 log.info(
                     "Unpinned in topic %d (message_id=%s)",
                     thread_id, message_id,
                 )
                 return True
-            if self._is_topic_unreachable(result):
-                raise TopicUnreachable(
-                    thread_id, reason=result.get("description", ""),
-                )
             log.warning("%s failed: %s", endpoint, result)
             return False
         except TopicUnreachable:

@@ -102,7 +102,7 @@ class TestSharedGuildLeaveChatPolicy:
         # Refusal message went to the offending channel.
         sends = [
             c for c in mock_platform.send_message.call_args_list
-            if c.kwargs.get("chat_id") == "111:333"
+            if c.kwargs.get("chat_id") == 333
         ]
         assert sends, "Expected refusal in the offending channel"
 
@@ -176,7 +176,7 @@ class TestDiscordAuditLogAdvisory:
         # Advisory posted in the offending channel.
         sends = [
             c for c in mock_platform.send_message.call_args_list
-            if c.kwargs.get("chat_id") == "111:222"
+            if c.kwargs.get("chat_id") == 222
         ]
         assert sends, "Expected advisory in the channel"
         assert "View Audit Log" in sends[0].kwargs["text"]

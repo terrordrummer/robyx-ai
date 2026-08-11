@@ -250,14 +250,17 @@ class TestCorruptedState:
         with pytest.raises(RuntimeError, match="could not be migrated"):
             await mig.upgrade(ctx)
 
-        # Good one migrated; bad one left alone.
+        # Good one migrated; bad one quarantined for forensic recovery.
         good_state = json.loads(
             (data_dir / "continuous" / "good" / "state.json").read_text()
         )
         assert good_state.get("migrated_v0_23_0")
 
-        bad_text = (data_dir / "continuous" / "bad" / "state.json").read_text()
-        assert bad_text == "{not valid json"
+        bad_path = data_dir / "continuous" / "bad" / "state.json"
+        assert not bad_path.exists()
+        quarantined = list(bad_path.parent.glob("state.json.corrupt-*"))
+        assert len(quarantined) == 1
+        assert quarantined[0].read_text() == "{not valid json"
 
         # Done marker NOT written — chain halts, will retry on next boot.
         assert not (data_dir / "migrations" / "v0_23_0.done").exists()

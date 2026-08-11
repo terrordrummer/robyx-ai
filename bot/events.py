@@ -84,6 +84,11 @@ KNOWN_EVENT_TYPES = frozenset({
 # ── Internals ────────────────────────────────────────────────────────────────
 
 _MAX_PAYLOAD_BYTES = 1024  # truncation threshold for payload serialisation
+# FR-021/T061 carries the already chat-sanitised final body when deletion
+# makes topic delivery impossible. This is the only event allowed above the
+# ordinary 1 KiB diagnostic cap; the body itself is capped by the delivery
+# chokepoint at 8 KiB before append.
+_MAX_DRAIN_DELETE_PAYLOAD_BYTES = 10 * 1024
 
 
 def _now_utc() -> datetime:
@@ -94,14 +99,23 @@ def _iso(ts: datetime) -> str:
     return ts.isoformat()
 
 
-def _serialise_payload(payload: Optional[dict]) -> dict:
+def _serialise_payload(
+    payload: Optional[dict],
+    *,
+    max_bytes: int = _MAX_PAYLOAD_BYTES,
+) -> dict:
     if not payload:
         return {}
     try:
-        raw = json.dumps(payload, separators=(",", ":"), default=str)
+        raw = json.dumps(
+            payload,
+            separators=(",", ":"),
+            default=str,
+            ensure_ascii=False,
+        )
     except (TypeError, ValueError):
         return {"_serialisation_error": True}
-    if len(raw.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
+    if len(raw.encode("utf-8")) > max_bytes:
         return {"_truncated": True}
     return payload
 
@@ -162,9 +176,18 @@ def append(
         "task_type": task_type,
         "event_type": str(event_type),
         "outcome": str(outcome),
-        "payload": _serialise_payload(payload),
+        "payload": _serialise_payload(
+            payload,
+            max_bytes=(
+                _MAX_DRAIN_DELETE_PAYLOAD_BYTES
+                if event_type == "step_complete"
+                and isinstance(payload, dict)
+                and payload.get("delivery") == "drain_during_delete"
+                else _MAX_PAYLOAD_BYTES
+            ),
+        ),
     }
-    line = json.dumps(entry, separators=(",", ":")) + "\n"
+    line = json.dumps(entry, separators=(",", ":"), ensure_ascii=False) + "\n"
     hot, events_dir, _, _ = _config()
 
     with _append_lock:

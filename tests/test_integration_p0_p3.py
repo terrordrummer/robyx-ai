@@ -32,10 +32,25 @@ class TestQueueMutex:
         # Two entries, two _queue_mutex holders — second must block until
         # first releases. Verified by observing write ordering in the file.
         monkeypatch.setattr(scheduler, "QUEUE_FILE", tmp_path / "queue.json")
-        scheduler.save_queue([{"id": "a"}])
+        scheduler.save_queue([{
+            "id": "a", "name": "a", "type": "one-shot",
+            "status": "pending", "agent_file": "agents/a.md",
+            "scheduled_at": "2099-01-01T00:00:00+00:00",
+        }])
         # Saving again overwrites — round-trip the data to ensure the
         # mutex path is exercised end-to-end.
-        scheduler.save_queue([{"id": "b"}, {"id": "c"}])
+        scheduler.save_queue([
+            {
+                "id": "b", "name": "b", "type": "one-shot",
+                "status": "pending", "agent_file": "agents/b.md",
+                "scheduled_at": "2099-01-01T00:00:00+00:00",
+            },
+            {
+                "id": "c", "name": "c", "type": "one-shot",
+                "status": "pending", "agent_file": "agents/c.md",
+                "scheduled_at": "2099-01-01T00:00:00+00:00",
+            },
+        ])
         entries = scheduler.load_queue()
         assert [e["id"] for e in entries] == ["b", "c"]
 
@@ -67,6 +82,7 @@ class TestStaleClaimReconciliation:
             "type": "one-shot",
             "status": "pending",
             "agent_file": "agents/foo.md",
+            "scheduled_at": "2099-01-01T00:00:00+00:00",
         }])
         caplog.set_level(logging.WARNING, logger="robyx.scheduler")
         scheduler._reconcile_task_results([

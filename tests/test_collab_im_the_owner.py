@@ -57,12 +57,10 @@ def _pending_discord_ws(
 
 
 def _msg(text: str, *, user_id: int = 7777, guild_id: int = 111, channel_id: int = 222):
-    """Build a Discord-shaped PlatformMessage where chat_id is the guild
-    and thread_id is the channel — matching what ``_run_discord``
-    constructs in its ``on_message`` dispatch."""
+    """Build the canonical Discord message emitted by ``_run_discord``."""
     return PlatformMessage(
         user_id=user_id,
-        chat_id=guild_id,
+        chat_id="%d:%d" % (guild_id, channel_id),
         text=text,
         thread_id=channel_id,
         command="im-the-owner",

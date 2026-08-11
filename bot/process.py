@@ -7,8 +7,10 @@ without requiring external dependencies like psutil.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +18,116 @@ log = logging.getLogger("robyx.process")
 
 # Process names that indicate an AI-related or bot-related process
 AI_PROCESS_NAMES = ("claude", "codex", "opencode", "python", "node")
+
+
+def get_process_identity_sync(pid: int) -> dict[str, object] | None:
+    """Return a durable identity for *pid*, or ``None`` if unverifiable.
+
+    A PID and process name are not ownership proofs: both can be reused after a
+    Robyx crash.  The start fingerprint is therefore mandatory.  Callers must
+    fail safe (retain evidence and never signal) when this function returns
+    ``None``.
+    """
+    if pid <= 0:
+        return None
+    try:
+        if sys.platform == "win32":
+            script = (
+                "$p=Get-Process -Id %d -ErrorAction Stop; "
+                "[pscustomobject]@{start=$p.StartTime.ToUniversalTime().Ticks.ToString();"
+                "executable=$p.Path;comm=$p.ProcessName;pgid=%d} | "
+                "ConvertTo-Json -Compress" % (pid, pid)
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode != 0:
+                return None
+            raw = json.loads(result.stdout)
+            start = str(raw.get("start") or "").strip()
+            executable = str(raw.get("executable") or "").strip()
+            comm = str(raw.get("comm") or "").strip().lower()
+            if not start or not executable or not comm:
+                return None
+            return {
+                "start_fingerprint": "windows:%s" % start,
+                "executable": executable,
+                "comm": comm,
+                "pgid": pid,
+            }
+
+        proc_root = Path("/proc/%d" % pid)
+        if proc_root.exists():
+            stat = (proc_root / "stat").read_text()
+            close_paren = stat.rfind(")")
+            fields = stat[close_paren + 2 :].split()
+            # ``fields`` starts at procfs field 3; starttime is field 22.
+            start_ticks = fields[19]
+            boot_id_path = Path("/proc/sys/kernel/random/boot_id")
+            boot_id = (
+                boot_id_path.read_text().strip()
+                if boot_id_path.exists()
+                else "unknown-boot"
+            )
+            executable = os.readlink(proc_root / "exe")
+            comm = (proc_root / "comm").read_text().strip().lower()
+            pgid = os.getpgid(pid)
+            if not boot_id or not start_ticks or not executable or not comm:
+                return None
+            return {
+                "start_fingerprint": "linux:%s:%s" % (boot_id, start_ticks),
+                "executable": executable,
+                "comm": comm,
+                "pgid": pgid,
+            }
+
+        start_result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        executable_result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        start = " ".join(start_result.stdout.split())
+        executable = executable_result.stdout.strip()
+        comm = Path(executable).name.lower()
+        pgid = os.getpgid(pid)
+        if (
+            start_result.returncode != 0
+            or executable_result.returncode != 0
+            or not start
+            or not executable
+            or not comm
+        ):
+            return None
+        return {
+            "start_fingerprint": "%s:%s" % (sys.platform, start),
+            "executable": executable,
+            "comm": comm,
+            "pgid": pgid,
+        }
+    except (OSError, IndexError, ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        log.debug("get_process_identity_sync(%d) failed: %s", pid, exc)
+        return None
+
+
+def process_identity_matches(pid: int, expected: object) -> bool:
+    """Return true only for a complete exact match with the live process."""
+    if not isinstance(expected, dict):
+        return False
+    required = {"start_fingerprint", "executable", "comm", "pgid"}
+    if not required.issubset(expected) or any(expected[key] in (None, "") for key in required):
+        return False
+    current = get_process_identity_sync(pid)
+    return current is not None and all(current.get(key) == expected.get(key) for key in required)
 
 
 def is_pid_alive(pid: int) -> bool:

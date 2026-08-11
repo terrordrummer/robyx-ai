@@ -120,7 +120,7 @@ New workspaces inherit the configured `ROBYX_WORKSPACE` (or legacy `KAELOPS_WORK
 
 A workspace is not limited to a single mode — the same agent can respond interactively when you message it, run scheduled tasks on a timer, and have continuous autonomous work in progress. See [Scheduler](scheduler.md) for the full range of what agents can do.
 
-For iterative, long-running work (R&D loops, optimization, training cycles), agents support the **agentic loop** mechanism. You can trigger it explicitly with `/loop` or let the agent suggest it when it recognizes the need from conversation context. The agent conducts a setup interview (objective, stopping criteria, constraints, **checkpoint policy**) before launching a structured iterative process with a dedicated git branch, per-task state, and a per-task `plan.md`; step reports flow back into the workspace chat prefixed with `🔄 [<task-name>]`. Four checkpoint policies govern when the step agent is allowed to stop and hand control back (`on-demand`, `on-uncertainty`, `on-milestone`, `every-N-steps`). Once running, you control the task lifecycle (list, status, stop, pause, resume, read plan, update scope or policy in place) by talking to the primary workspace agent — no dedicated control topic. See [Scheduler — Continuous Tasks](scheduler.md#continuous-tasks-agentic-loop) and the *Checkpoint policies* and *Controlling tasks from the workspace chat* sections there for the full reference.
+For iterative, long-running work (R&D loops, optimization, training cycles), agents support the **agentic loop** mechanism. You can trigger it explicitly with `/loop` or let the agent suggest it when it recognizes the need from conversation context. The setup interview records objective, stopping criteria, constraints, and checkpoint policy in revisioned `program.json`; `plan.md` is its human-readable projection. Each task gets a dedicated topic for reports, pinned questions, incidents, and final notices, while lifecycle control remains available from the parent workspace agent. Four checkpoint policies govern when the step agent may hand control back (`on-demand`, `on-uncertainty`, `on-milestone`, `every-N-steps`). See [Scheduler — Continuous Tasks](scheduler.md#continuous-tasks-agentic-loop) for the full reference.
 
 ### Specialists — The Experts
 
@@ -198,23 +198,36 @@ Collaborative workspaces let external collaborators join a **separate Telegram g
 |------|----------|----------------------|--------------|-----------------|
 | **Owner** | Yes | Yes | Yes | Yes |
 | **Operator** | Yes | Yes | No | No |
-| **Participant** | Yes | No | No | No |
+| **Participant** | Human chat only | No | No | No |
 
 - The bot owner (from `.env`) is always treated as Owner in every collaborative workspace.
 - The person who creates the workspace starts as Owner.
 - New group members are auto-registered as Participants.
-- Messages from executive users (Owner/Operator) are tagged with `[EXECUTIVE]` so the agent knows to follow their instructions. Participant messages are context-only.
+- Messages from executive users (Owner/Operator) are tagged with `[EXECUTIVE]`
+  so the agent knows to follow their instructions. Participant AI execution is
+  disabled by default. Operators may explicitly opt in to the stateless,
+  backend-restricted `read-only` profile only where readable workspace content
+  is safe to disclose; participant turns never receive executive authority or
+  persistence.
 
 ### Interaction Modes
 
-- **Intelligent** (default) — the agent receives every message and decides autonomously whether to respond. It speaks when addressed, when it can help, or when it detects errors. It stays silent (via `[SILENT]`) when the conversation does not need it.
-- **Passive** — the agent only responds when explicitly @mentioned or when an executive user sends a direct instruction.
+- **Intelligent** (default) — executive messages reach the agent, which decides
+  whether to respond. Participant messages follow the separate disabled/read-only
+  policy above.
+- **Passive** — executive messages require an explicit @mention or direct
+  instruction; participant execution remains governed by the same security
+  policy.
 
 ### Creation Flows
 
-**Flow A (planned):** Robyx or a workspace agent creates a pending collaborative workspace, then the owner adds the bot to a new chat (Telegram group, Discord guild). The bot matches the pending request and configures itself automatically.
+**Flow A (pre-announced):** Robyx or a workspace agent creates a pending collaborative workspace, then the owner adds the bot to a Telegram group or Discord guild/channel. The bot matches the pending request and configures itself automatically. Slack lifecycle provisioning remains deferred to spec 008.
 
-**Flow B (ad-hoc):** The owner adds the bot to a chat with no prior setup. The bot creates a provisional workspace and asks directly in the chat what it should focus on and whether to inherit from an existing workspace.
+**Flow B (ad-hoc):** The owner adds the bot to a chat with no prior setup. When
+the platform event proves who added it, the bot creates a provisional workspace
+and asks directly in the chat what it should focus on and whether to inherit
+from an existing workspace. On Discord this requires `View Audit Log`; without
+verified inviter identity, ad-hoc Flow B fails closed.
 
 ### Platform lifecycle abstraction (spec 007)
 
@@ -227,7 +240,12 @@ LifecycleRemoved(chat_ref, chat_title, raw_event)
 LifecycleMigrated(old_chat_ref, new_chat_ref, raw_event)
 ```
 
-Each adapter (`TelegramPlatform`, `DiscordPlatform`, `SlackPlatform`) translates its native event into the matching dataclass and dispatches via the `Platform.on_added` / `on_removed` / `on_migrated` callback attributes. `bot/bot.py` wires the same `collab_bot_added` / `collab_bot_removed` / `collab_bot_migrated` handlers to every adapter — handler bodies branch on `event.chat_ref.platform` only where strictly required (`find_active_in_guild` for Discord's shared-guild safety; the audit-log advisory; the mention parser's dialect table).
+Telegram and Discord translate native events into these dataclasses and dispatch
+through the same `Platform.on_added` / `on_removed` / `on_migrated` callback
+attributes. Slack exposes the shared wiring but intentionally emits only its
+documented unsupported advisory until spec 008 implements channel lifecycle.
+Handler bodies branch on `event.chat_ref.platform` only where required by
+platform semantics.
 
 `chat_id` is the canonical string form per platform:
 

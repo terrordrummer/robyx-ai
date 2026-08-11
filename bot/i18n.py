@@ -7,6 +7,8 @@ To translate, copy this file and swap the values.
 STRINGS = {
     # General
     "unauthorized": "Unauthorized.",
+    "unknown_command": "Unknown command. Type /help to see the available commands.",
+    "lifecycle_command_usage": "Usage: /%s <task-name>",
     "empty_message": "Empty message.",
     "unmapped_topic": (
         "This topic is not bound to any workspace agent.\n\n"
@@ -65,6 +67,25 @@ STRINGS = {
 
     # Service
     "config_updated": "Updated `.env`: %s",
+    "config_invalid": (
+        "Configuration update rejected for `%s`: %s. `.env` was not changed."
+    ),
+    "config_local_only": (
+        "`%s` is a sensitive or local-authority setting and cannot be changed "
+        "through chat. Update `.env` locally; the submitted value was not forwarded."
+    ),
+    "config_preflight_failed": (
+        "The candidate configuration failed its startup check. The previous "
+        "`.env` was restored; inspect `bot.log` before trying again."
+    ),
+    "config_rollback_failed": (
+        "Critical configuration error: the startup check and automatic rollback "
+        "both failed. Stop the service and inspect `.env` and `bot.log`."
+    ),
+    "config_write_failed": (
+        "Could not safely write `.env`; no restart was attempted. Check file "
+        "ownership and free disk space, then try again."
+    ),
     "restart_pending": "Restarting service...",
 
     # Voice
@@ -84,6 +105,10 @@ STRINGS = {
         "/reset `<name>` — Reset an agent's session (fresh conversation)\n"
         "/clear — Archive the current conversation and reset the session "
         "(use inside any non-HQ topic — workspace, collaborative, specialist)\n"
+        "/stop `<task>` — Stop a continuous task in this workspace\n"
+        "/resume `<task>` — Resume a stopped continuous task\n"
+        "/complete `<task>` — Mark a continuous task complete\n"
+        "/delete `<task>` — Delete and archive a continuous task\n"
         "/ping — Quick health check\n"
         "/checkupdate — Check if a new Robyx version is available\n"
         "/doupdate — Download and apply a pending update\n\n"
@@ -139,6 +164,18 @@ STRINGS = {
     "collab_close_confirm": "Collaborative workspace *%s* closed.",
     "collab_close_denied": "Only the workspace creator can close it.",
     "collab_no_users": "No users registered in this workspace.",
+    "collab_participant_disabled": (
+        "Participant AI access is disabled for this Robyx installation. "
+        "Ask the workspace owner or an operator for help."
+    ),
+    "collab_participant_agent_busy": (
+        "The workspace agent is currently executing an authorised task. "
+        "Please try again when it finishes."
+    ),
+    "collab_participant_backend_unsupported": (
+        "This AI backend cannot guarantee the required read-only participant "
+        "policy, so the turn was refused. Ask the owner to update the backend."
+    ),
 
     # External group wiring (feature 003)
     "collab_unauthorised_adder": (
@@ -153,7 +190,7 @@ STRINGS = {
     # variant remains until spec 008 closes the corresponding gap.
     "collab_unsupported_platform_slack": (
         "External collaborative groups are not yet supported on Slack. "
-        "Use Telegram for external groups. The bot will take no further "
+        "Use Telegram or Discord for external groups. The bot will take no further "
         "action here."
     ),
     # Spec 007 — Discord audit-log fallback advisories. The lifecycle
@@ -302,6 +339,10 @@ STRINGS = {
     ),
     "continuous_task_error_downstream": (
         "Continuous task not created — an internal error prevented setup."
+    ),
+    "collab_continuous_hq_only": (
+        "Continuous tasks can only be created from Headquarters or an HQ "
+        "workspace, not from an external collaborative chat."
     ),
 
     # UPDATE_PLAN macro

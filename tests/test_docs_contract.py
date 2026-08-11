@@ -1,4 +1,7 @@
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import config
 
@@ -18,6 +21,7 @@ def test_env_example_lists_cross_platform_config_keys():
         "AI_BACKEND=",
         "AI_CLI_PATH=",
         "CLAUDE_PERMISSION_MODE=",
+        "COLLAB_PARTICIPANT_POLICY=",
         "ROBYX_WORKSPACE=",
         "OPENAI_API_KEY=",
         "SCHEDULER_INTERVAL=",
@@ -38,6 +42,33 @@ def test_env_example_lists_cross_platform_config_keys():
     for key in expected_keys:
         assert key in contents
 
+    assert "COLLAB_PARTICIPANT_POLICY=disabled" in contents
+
+
+def test_participant_ai_defaults_fail_closed_when_env_is_absent():
+    env = os.environ.copy()
+    env.pop("COLLAB_PARTICIPANT_POLICY", None)
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    bot_dir = PROJECT_ROOT / "bot"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            (
+                f"import sys; sys.path.insert(0, {str(bot_dir)!r}); "
+                "import config; print(config.COLLAB_PARTICIPANT_POLICY)"
+            ),
+        ],
+        cwd=PROJECT_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "disabled"
+
 
 def test_readme_documents_current_cross_platform_contract():
     """v0.20.15 split the README into ``docs/`` files. The cross-platform
@@ -53,6 +84,7 @@ def test_readme_documents_current_cross_platform_contract():
 
     assert "SCHEDULER_INTERVAL" in contents
     assert "CLAUDE_PERMISSION_MODE" in contents
+    assert "COLLAB_PARTICIPANT_POLICY" in contents
     assert "SLACK_APP_TOKEN" in contents
     assert "DISCORD_CONTROL_CHANNEL_ID" in contents
     assert "relayed back into the target topic/channel" in contents
@@ -86,3 +118,14 @@ def test_robyx_prompt_mentions_full_platform_key_set():
     assert "manage a staff of AI agents through Telegram." not in prompt
     assert "tasks.md entry automatically." not in prompt
     assert "ONE manual step" not in prompt
+
+
+def test_command_and_migration_docs_match_runtime_contracts():
+    commands = _read("docs/commands.md")
+    for command in ("/clear", "/stop", "/resume", "/complete", "/delete"):
+        assert command in commands
+
+    updates = _read("docs/updates.md")
+    assert "failed version-chain step" in updates
+    assert "retried on the next" in updates
+    assert "Migrations are idempotent, never retried on failure" not in updates

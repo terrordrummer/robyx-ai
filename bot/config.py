@@ -10,6 +10,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from config_schema import typed_env
+
 try:  # PyYAML is optional at import time so the test suite can stub it.
     import yaml  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - exercised only when dep is missing
@@ -58,10 +60,30 @@ def _int_env(new_key: str, old_key: str, default: int = 0):
 BOT_TOKEN = _env("ROBYX_BOT_TOKEN", "KAELOPS_BOT_TOKEN")
 CHAT_ID = _int_env("ROBYX_CHAT_ID", "KAELOPS_CHAT_ID")
 OWNER_ID = _int_env("ROBYX_OWNER_ID", "KAELOPS_OWNER_ID")
-AI_BACKEND = os.environ.get("AI_BACKEND", "claude")
-AI_CLI_PATH = os.environ.get("AI_CLI_PATH", "")  # empty → auto-detected lazily in ai_backend.create_backend()
-CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "").strip()
-PLATFORM = _env("ROBYX_PLATFORM", "KAELOPS_PLATFORM", "telegram")
+AI_BACKEND = typed_env("AI_BACKEND", os.environ.get("AI_BACKEND", "claude"))
+AI_CLI_PATH = typed_env(
+    "AI_CLI_PATH", os.environ.get("AI_CLI_PATH", ""),
+)  # empty → auto-detected lazily in ai_backend.create_backend()
+CLAUDE_PERMISSION_MODE = typed_env(
+    "CLAUDE_PERMISSION_MODE", os.environ.get("CLAUDE_PERMISSION_MODE", ""),
+)
+PLATFORM = typed_env(
+    "ROBYX_PLATFORM", _env("ROBYX_PLATFORM", "KAELOPS_PLATFORM", "telegram"),
+)
+
+_collab_participant_policy_raw = os.environ.get(
+    "COLLAB_PARTICIPANT_POLICY", "disabled",
+).strip().lower()
+if _collab_participant_policy_raw in {"read-only", "disabled"}:
+    COLLAB_PARTICIPANT_POLICY = _collab_participant_policy_raw
+else:
+    # Security-sensitive and deliberately local-only: unlike chat-editable
+    # settings this invalid value fails closed instead of blocking startup.
+    _log.error(
+        "Invalid COLLAB_PARTICIPANT_POLICY=%r — participant AI turns disabled",
+        _collab_participant_policy_raw,
+    )
+    COLLAB_PARTICIPANT_POLICY = "disabled"
 
 # ── Slack ──
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")  # xoxb-...
@@ -111,10 +133,20 @@ DISCORD_INVITE_TTL_DAYS = _int_env_with_default("DISCORD_INVITE_TTL_DAYS", 7)
 DISCORD_INVITE_MAX_USES = _int_env_with_default("DISCORD_INVITE_MAX_USES", 10)
 
 # ── Optional ──
-WORKSPACE = Path(_env("ROBYX_WORKSPACE", "KAELOPS_WORKSPACE", os.path.expanduser("~/Workspace")))
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-SCHEDULER_INTERVAL = int(os.environ.get("SCHEDULER_INTERVAL", "60"))  # unified scheduler tick
-UPDATE_CHECK_INTERVAL = int(os.environ.get("UPDATE_CHECK_INTERVAL", "3600"))  # 1 hour
+WORKSPACE = typed_env(
+    "ROBYX_WORKSPACE",
+    _env("ROBYX_WORKSPACE", "KAELOPS_WORKSPACE", os.path.expanduser("~/Workspace")),
+    as_type=Path,
+)
+OPENAI_API_KEY = typed_env("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+SCHEDULER_INTERVAL = typed_env(
+    "SCHEDULER_INTERVAL", os.environ.get("SCHEDULER_INTERVAL", "60"), as_type=int,
+)  # unified scheduler tick
+UPDATE_CHECK_INTERVAL = typed_env(
+    "UPDATE_CHECK_INTERVAL",
+    os.environ.get("UPDATE_CHECK_INTERVAL", "3600"),
+    as_type=int,
+)  # 1 hour
 
 
 # ── Model preferences ─────────────────────────────────────────────────────
@@ -280,8 +312,10 @@ CLAIM_TIMEOUT_SECONDS = int(
 #  in which a slow delivery watcher plus a reset can cause token-mismatch
 #  double-dispatch (see review H2).
 MAX_REMINDER_ATTEMPTS = 10  # max delivery attempts before marking a reminder failed
-REMINDER_MAX_AGE_SECONDS = int(
-    os.environ.get("REMINDER_MAX_AGE_SECONDS", "604800")
+REMINDER_MAX_AGE_SECONDS = typed_env(
+    "REMINDER_MAX_AGE_SECONDS",
+    os.environ.get("REMINDER_MAX_AGE_SECONDS", "604800"),
+    as_type=int,
 )  # reject reminders whose fire_at is older than this (default: 7 days).
 #  A bot offline for 2–3 days used to drop legitimate reminders at 24 h.
 

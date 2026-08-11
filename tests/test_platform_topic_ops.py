@@ -23,6 +23,7 @@ def telegram_adapter(monkeypatch):
     from messaging.telegram import TelegramPlatform
 
     plat = TelegramPlatform(bot_token="fake", chat_id=-100, owner_id=1)
+    monkeypatch.setattr(plat, "_TOPIC_RETRY_BACKOFF", (0.0, 0.0, 0.0))
     mock_client = AsyncMock()
     monkeypatch.setattr(plat, "_get_client", lambda: mock_client)
     return plat, mock_client
@@ -63,6 +64,19 @@ async def test_telegram_edit_topic_title_transient_error(telegram_adapter):
     client.post.return_value = _error_response("rate limited")
     result = await plat.edit_topic_title(42, "x")
     assert result is False  # logged, not raised
+    assert client.post.await_count == 4
+
+
+async def test_telegram_topic_operation_retries_then_succeeds(telegram_adapter):
+    plat, client = telegram_adapter
+    client.post.side_effect = [
+        _error_response("Too Many Requests: retry after 1"),
+        OSError("network blip"),
+        _ok_response(),
+    ]
+
+    assert await plat.edit_topic_title(42, "recovered") is True
+    assert client.post.await_count == 3
 
 
 async def test_telegram_pin_message_happy(telegram_adapter):
@@ -170,6 +184,25 @@ async def test_discord_edit_topic_title_raises_on_not_found(discord_adapter, mon
         await discord_adapter.edit_topic_title(42, "x")
 
 
+async def test_discord_edit_side_effect_not_found_maps_unreachable(
+    discord_adapter,
+    monkeypatch,
+):
+    import discord
+
+    channel = MagicMock(name="old")
+    channel.name = "old"
+    channel.edit = AsyncMock(
+        side_effect=discord.NotFound(MagicMock(status=404), "gone"),
+    )
+    monkeypatch.setattr(
+        discord_adapter, "_fetch_channel", AsyncMock(return_value=channel),
+    )
+
+    with pytest.raises(TopicUnreachable):
+        await discord_adapter.edit_topic_title(42, "new")
+
+
 async def test_discord_pin_message_happy(discord_adapter, monkeypatch):
     msg = MagicMock()
     msg.pin = AsyncMock()
@@ -229,6 +262,18 @@ async def test_slack_edit_topic_title_slugifies(slack_adapter):
     assert kwargs["name"].islower() or kwargs["name"] == kwargs["name"]  # no uppercase
 
 
+async def test_slack_edit_topic_title_warns_once(slack_adapter, caplog):
+    slack_adapter._client.conversations_rename.return_value = {"ok": True}
+    await slack_adapter.edit_topic_title("C456", "First")
+    await slack_adapter.edit_topic_title("C456", "Second")
+    warns = [
+        record for record in caplog.records
+        if record.levelname == "WARNING"
+        and "edit_topic_title" in record.getMessage()
+    ]
+    assert len(warns) == 1
+
+
 async def test_slack_pin_message_warns_once(slack_adapter, caplog):
     slack_adapter._client.pins_add.return_value = {"ok": True}
     await slack_adapter.pin_message(chat_id="C", thread_id="C456", message_id="ts1")
@@ -257,6 +302,19 @@ async def test_slack_archive_topic_composes(slack_adapter):
     assert await slack_adapter.archive_topic("C456", "zeus-research")
     slack_adapter._client.conversations_rename.assert_awaited_once()
     slack_adapter._client.conversations_archive.assert_awaited_once()
+
+
+async def test_slack_archive_topic_warns_once(slack_adapter, caplog):
+    slack_adapter._client.conversations_rename.return_value = {"ok": True}
+    slack_adapter._client.conversations_archive.return_value = {"ok": True}
+    await slack_adapter.archive_topic("C456", "first")
+    await slack_adapter.archive_topic("C789", "second")
+    warns = [
+        record for record in caplog.records
+        if record.levelname == "WARNING"
+        and "archive_topic" in record.getMessage()
+    ]
+    assert len(warns) == 1
 
 
 async def test_slack_unreachable_on_channel_not_found(slack_adapter):

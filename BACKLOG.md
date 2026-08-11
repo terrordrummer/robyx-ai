@@ -1,7 +1,10 @@
 # Robyx Operational Backlog
 
-This file is the local source of truth for the post-review remediation plan.
-Work one ticket at a time. Keep scope tight. Do not start dependent work early.
+This file is the completed historical backlog from the April 2026 remediation.
+The August repository-review program and cross-context handoff register live in
+[REVIEW_REMEDIATION.md](REVIEW_REMEDIATION.md) and are now complete. Both files
+are retained as implementation history; new work should start a new bounded
+register rather than silently reopening either program.
 
 ## Working Rules
 

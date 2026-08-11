@@ -36,12 +36,22 @@ class TestSetupLogging:
     def test_adds_handlers(self, tmp_path, monkeypatch):
         monkeypatch.setattr(bot, "LOG_FILE", str(tmp_path / "test.log"))
         root = logging.getLogger()
-        before = len(root.handlers)
-        setup_logging()
-        after = len(root.handlers)
-        assert after > before
-        # Clean up handlers to avoid leaking into other tests
-        root.handlers = root.handlers[:before]
+        original_handlers = list(root.handlers)
+        try:
+            setup_logging()
+            added_handlers = [
+                handler for handler in root.handlers
+                if handler not in original_handlers
+            ]
+            assert added_handlers
+        finally:
+            # Removing a FileHandler does not close its underlying stream.
+            # Close only the handlers created by this test and restore the
+            # original logging topology even when the assertion fails.
+            for handler in list(root.handlers):
+                if handler not in original_handlers:
+                    root.removeHandler(handler)
+                    handler.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -51,7 +61,7 @@ class TestSetupLogging:
 
 class TestSchedulerJob:
     @pytest.mark.asyncio
-    async def test_dispatched_sends_notification(self, mock_platform):
+    async def test_dispatched_is_not_pushed_to_hq(self, mock_platform):
         mock_backend = MagicMock()
         context = _make_job_context(mock_platform, backend=mock_backend)
 
@@ -60,9 +70,7 @@ class TestSchedulerJob:
              patch.object(bot, "CHAT_ID", -100999):
             await scheduler_job(context)
 
-        mock_platform.send_message.assert_awaited_once()
-        call_kwargs = mock_platform.send_message.call_args[1]
-        assert "Dispatched: my-task (PID 42)" in call_kwargs["text"]
+        mock_platform.send_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_no_dispatch_no_notification(self, mock_platform):
@@ -77,7 +85,7 @@ class TestSchedulerJob:
         mock_platform.send_message.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_errors_sends_notification(self, mock_platform):
+    async def test_errors_are_not_pushed_to_hq(self, mock_platform):
         mock_backend = MagicMock()
         context = _make_job_context(mock_platform, backend=mock_backend)
 
@@ -86,9 +94,7 @@ class TestSchedulerJob:
              patch.object(bot, "CHAT_ID", -100999):
             await scheduler_job(context)
 
-        mock_platform.send_message.assert_awaited_once()
-        call_kwargs = mock_platform.send_message.call_args[1]
-        assert "Error: task1" in call_kwargs["text"]
+        mock_platform.send_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_cycle_exception_logged(self, mock_platform, caplog):
@@ -100,18 +106,6 @@ class TestSchedulerJob:
             await scheduler_job(context)  # Should not raise
 
         mock_platform.send_message.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_send_notification_fails(self, mock_platform, caplog):
-        mock_backend = MagicMock()
-        mock_platform.send_message = AsyncMock(side_effect=RuntimeError("network error"))
-        context = _make_job_context(mock_platform, backend=mock_backend)
-
-        result = {"dispatched": [("x", 1)], "errors": [], "skipped": []}
-        with patch.object(bot, "run_scheduler_cycle", new_callable=AsyncMock, return_value=result), \
-             patch.object(bot, "CHAT_ID", -100999):
-            await scheduler_job(context)  # Should not raise
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # update_check_job
@@ -370,25 +364,8 @@ class TestEnsureSingleInstance:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-class TestSchedulerJobRoutesViaControlRoom:
-    """The scheduler/update jobs must forward ``plat.control_room_id`` as
-    the ``thread_id`` of every notification. The previous hard-coded
-    ``TELEGRAM_MAIN_THREAD_ID = None`` made messages bypass the General
-    topic on Telegram forum supergroups."""
-
-    @pytest.mark.asyncio
-    async def test_scheduler_uses_platform_control_room_id(self, mock_platform):
-        mock_platform.control_room_id = 0  # Telegram General topic
-        mock_backend = MagicMock()
-        context = _make_job_context(mock_platform, backend=mock_backend)
-
-        result = {"dispatched": [("x", 1)], "errors": [], "skipped": []}
-        with patch.object(bot, "run_scheduler_cycle", new_callable=AsyncMock, return_value=result), \
-             patch.object(bot, "CHAT_ID", -100999):
-            await scheduler_job(context)
-
-        kwargs = mock_platform.send_message.call_args[1]
-        assert kwargs["thread_id"] == 0
+class TestUpdateJobRoutesViaControlRoom:
+    """Update notices use the platform control room; scheduler cycles are silent."""
 
     @pytest.mark.asyncio
     async def test_update_check_uses_platform_control_room_id(self, mock_platform):
@@ -439,3 +416,103 @@ class TestTelegramPollingKwargs:
     def test_poll_interval_is_subsecond_for_quick_recovery(self):
         kwargs = bot.telegram_polling_kwargs()
         assert kwargs["poll_interval"] <= 1.0
+
+
+class TestTelegramCommandFallback:
+    @pytest.mark.asyncio
+    async def test_unknown_slash_reaches_shared_message_handler(self, monkeypatch):
+        """PTB must not drop collaborative commands excluded from COMMANDS."""
+
+        class FakeJobQueue:
+            run_repeating = MagicMock()
+            run_once = MagicMock()
+
+        class FakeApplication:
+            def __init__(self):
+                self.bot = MagicMock()
+                self.job_queue = FakeJobQueue()
+                self.handlers = []
+                self.run_polling = MagicMock()
+
+            def add_handler(self, handler, group=0):
+                self.handlers.append((group, handler))
+
+        app = FakeApplication()
+
+        class FakeBuilder:
+            def token(self, _value):
+                return self
+
+            def concurrent_updates(self, _value):
+                return self
+
+            def post_shutdown(self, _callback):
+                return self
+
+            def build(self):
+                return app
+
+        monkeypatch.setattr(bot.Application, "builder", lambda: FakeBuilder())
+        monkeypatch.setattr(bot, "voice_available", lambda: False)
+
+        platform = MagicMock()
+        platform.control_room_id = 0
+        platform.register_lifecycle = MagicMock()
+        platform.set_bot = MagicMock()
+        shared_message = AsyncMock()
+        handlers = {
+            name: AsyncMock()
+            for name in (
+                "start", "help", "workspaces", "specialists", "status",
+                "reset", "clear", "focus", "ping", "checkupdate",
+                "doupdate", "stop", "resume", "complete", "delete",
+                "voice",
+            )
+        }
+        handlers["message"] = shared_message
+
+        bot._run_telegram(platform, handlers, MagicMock(), MagicMock())
+
+        assert callable(app.post_init)
+
+        fallback = [
+            handler
+            for _group, handler in app.handlers
+            if isinstance(handler, bot.MessageHandler)
+            and handler.filters is bot.filters.COMMAND
+        ]
+        assert len(fallback) == 1
+
+        update = MagicMock()
+        update.effective_user.id = 12345
+        update.effective_user.first_name = "Owner"
+        update.effective_user.last_name = None
+        update.effective_user.username = None
+        update.effective_chat.id = -200111
+        update.message.text = "/promote 99999"
+        update.message.message_thread_id = None
+        await fallback[0].callback(update, MagicMock())
+
+        shared_message.assert_awaited_once()
+        routed = shared_message.await_args.args[1]
+        assert routed.text == "/promote 99999"
+        assert routed.chat_id == -200111
+
+
+class TestBootMigrationBoundary:
+    @pytest.mark.asyncio
+    async def test_corrupt_migration_tracker_aborts_boot(self, monkeypatch):
+        from persistence_recovery import PersistenceUnavailableError
+
+        platform = AsyncMock()
+        monkeypatch.setattr(bot, "migrate_to_unified_queue", lambda: 0)
+        monkeypatch.setattr(
+            bot,
+            "run_pending_migrations",
+            AsyncMock(side_effect=PersistenceUnavailableError("tracker corrupt")),
+        )
+
+        with pytest.raises(PersistenceUnavailableError, match="tracker corrupt"):
+            await bot._run_boot_sequence(platform, MagicMock(), 1)
+
+        platform.send_message.assert_not_awaited()

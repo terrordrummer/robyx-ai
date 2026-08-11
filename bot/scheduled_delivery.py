@@ -14,6 +14,8 @@ from continuous_macro import (
     strip_continuous_macros_for_log,
     strip_control_tokens_for_user,
 )
+from maintenance import get_maintenance_gate
+from runtime_supervisor import get_runtime_supervisor
 
 log = logging.getLogger("robyx.scheduled_delivery")
 
@@ -73,6 +75,7 @@ TASK_TYPE_ICONS: dict[str, str] = {
 }
 
 _MAX_TASK_NAME_CHARS = 64
+_MAX_DRAIN_DELETE_BODY_BYTES = 8 * 1024
 
 
 def format_delivery_message(task_type: str, task_name: str, body: str) -> str:
@@ -121,6 +124,12 @@ def _coerce_target_id(raw_target: Any) -> Any:
     return raw_target
 
 
+def _message_id_from_ref(ref: Any) -> Any:
+    if isinstance(ref, dict):
+        return ref.get("message_id") or ref.get("ts") or ref.get("id")
+    return getattr(ref, "message_id", None) or getattr(ref, "id", None)
+
+
 def _clean_result_text(text: str) -> str:
     # Scrub any stray continuous-task macro tokens and [STATUS …] tokens.
     # Scheduled subprocess output has no interactive agent context, so we
@@ -131,6 +140,25 @@ def _clean_result_text(text: str) -> str:
     # observability on the scheduled path.
     strip_continuous_macros_for_log(text or "")
     return strip_control_tokens_for_user(text or "")
+
+
+def _bounded_drain_delete_body(parsed_text: str) -> tuple[str, bool]:
+    """Return only chat-safe output, bounded to the FR-021 8 KiB limit.
+
+    Raw CLI output and stderr excerpts are intentionally excluded: the
+    journal receives exactly the normalised agent body that could otherwise
+    have gone to chat, with all control tokens and agent-authored delivery
+    headers removed.
+    """
+    body = _strip_agent_header(_clean_result_text(parsed_text))
+    body = SILENT_PATTERN.sub("", body).strip()
+    encoded = body.encode("utf-8")
+    if len(encoded) <= _MAX_DRAIN_DELETE_BODY_BYTES:
+        return body, False
+    bounded = encoded[:_MAX_DRAIN_DELETE_BODY_BYTES].decode(
+        "utf-8", errors="ignore",
+    )
+    return bounded, True
 
 
 def _error_excerpt(raw_output: str, max_chars: int = 800) -> str:
@@ -333,6 +361,7 @@ async def deliver_task_output(
 
     # Spec 006 — resolve the dedicated topic id, if present.
     target_id: Any = None
+    state: dict | None = None
     if is_continuous and task_name:
         try:
             from continuous import load_state, state_file_path
@@ -347,6 +376,60 @@ async def deliver_task_output(
     raw_output = output_log.read_text(errors="replace") if output_log.exists() else ""
     parsed_response = backend.parse_response(raw_output, returncode)
     parsed_text = _normalize_backend_text(parsed_response)
+
+    # FR-021/T061: deletion may win while a workspace-close drain watcher is
+    # reconciling the final child output. Once delete is in progress the body
+    # must never race topic archival. Persist the bounded chat-safe body and
+    # let the lifecycle path post one final journal reference before archive.
+    delete_in_progress = False
+    archive_completed = False
+    if is_continuous and task_name:
+        fresh_state = _read_continuous_state(task_name)
+        if fresh_state is not None:
+            state = fresh_state
+            delete_in_progress = bool(state.get("delete_in_progress_at"))
+            archive_completed = (
+                state.get("status") == "deleted"
+                and bool(state.get("archived_at"))
+            )
+    if is_continuous and task_name and (delete_in_progress or archive_completed):
+        body, body_truncated = _bounded_drain_delete_body(parsed_text)
+        try:
+            import events as events_mod
+            events_mod.append(
+                task_name=task_name,
+                task_type="continuous",
+                event_type="step_complete",
+                outcome="archived" if archive_completed else "delete_in_progress",
+                payload={
+                    "delivery": "drain_during_delete",
+                    "returncode": returncode,
+                    "body": body,
+                    "body_truncated": body_truncated,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Could not journal delete-drain output for '%s'",
+                task_name,
+                exc_info=True,
+            )
+        if not archive_completed and state is not None:
+            try:
+                from datetime import datetime, timezone
+                from continuous import save_state, state_file_path
+                state["drain_delete_output_recorded_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
+                state["drain_delete_reference_pending"] = True
+                save_state(state_file_path(task_name), state)
+            except Exception:
+                logger.warning(
+                    "Could not persist delete-drain reference for '%s'",
+                    task_name,
+                    exc_info=True,
+                )
+        return True
 
     # Spec 006 — journal step_complete for continuous tasks regardless of
     # whether the delivery itself is SILENT. This keeps [GET_EVENTS]
@@ -389,20 +472,148 @@ async def deliver_task_output(
         )
         return False
 
-    message = _render_result_message(task, parsed_text, returncode, raw_output)
+    state_override = (
+        state.get("delivery_state_override")
+        if state is not None
+        else None
+    )
+    message = _render_result_message(
+        task,
+        parsed_text,
+        returncode,
+        raw_output,
+        state_override=state_override,
+    )
 
     max_len = getattr(platform, "max_message_length", 4000)
+    last_message_ref: Any = None
+    topic_operation_failed = False
     for chunk in split_message(message, max_len=max_len):
-        sent = await platform.send_to_channel(target_id, chunk, parse_mode="Markdown")
+        failure_reason = "delivery returned false"
+        try:
+            ref_method = getattr(type(platform), "send_to_channel_with_ref", None)
+            if ref_method is not None:
+                last_message_ref = await platform.send_to_channel_with_ref(
+                    target_id,
+                    chunk,
+                    parse_mode="Markdown",
+                )
+                sent = bool(last_message_ref)
+            else:
+                sent = await platform.send_to_channel(
+                    target_id,
+                    chunk,
+                    parse_mode="Markdown",
+                )
+            if not sent:
+                if ref_method is not None:
+                    last_message_ref = await platform.send_to_channel_with_ref(
+                        target_id,
+                        chunk,
+                        parse_mode="",
+                    )
+                    sent = bool(last_message_ref)
+                else:
+                    sent = await platform.send_to_channel(target_id, chunk, parse_mode="")
+        except Exception as exc:
+            from messaging.base import TopicUnreachable
+            if not isinstance(exc, TopicUnreachable):
+                raise
+            sent = False
+            failure_reason = exc.reason or str(exc)
         if not sent:
-            sent = await platform.send_to_channel(target_id, chunk, parse_mode="")
-        if not sent:
+            if is_continuous and task_name:
+                event = None
+                if returncode != 0:
+                    event = "error"
+                elif state and state.get("status") in ("awaiting_input", "awaiting-input"):
+                    event = "awaiting_input"
+                from topic_recovery import recover_unreachable_topic
+                recovery = await recover_unreachable_topic(
+                    task_name,
+                    platform,
+                    reason=failure_reason,
+                    event=event,
+                    pending_delivery=chunk,
+                )
+                if recovery.pending_delivered:
+                    target_id = recovery.recreated_thread_id
+                    continue
             logger.error(
                 "Failed to deliver scheduled task '%s' result to target %r",
                 task.get("name"),
                 target_id,
             )
             return False
+    if is_continuous and task_name:
+        if state and state.get("status") in ("awaiting_input", "awaiting-input"):
+            message_id = _message_id_from_ref(last_message_ref)
+            if message_id is not None:
+                try:
+                    from config import CHAT_ID
+                    from continuous import (
+                        load_state,
+                        pin_awaiting_message,
+                        save_state,
+                        state_file_path,
+                        update_topic_state_marker,
+                    )
+                    fresh = load_state(state_file_path(task_name)) or state
+                    pinned = await pin_awaiting_message(
+                        fresh,
+                        platform,
+                        CHAT_ID,
+                        message_id,
+                    )
+                    marker_updated = await update_topic_state_marker(fresh, platform)
+                    if pinned and marker_updated:
+                        fresh["topic_marker_status"] = fresh.get("status")
+                        save_state(state_file_path(task_name), fresh)
+                    if not pinned or not marker_updated:
+                        from topic_recovery import recover_unreachable_topic
+                        recovery = await recover_unreachable_topic(
+                            task_name,
+                            platform,
+                            reason="awaiting pin or marker returned false",
+                            event="awaiting_input",
+                            pending_delivery=chunk,
+                        )
+                        topic_operation_failed = not recovery.pending_delivered
+                except Exception as exc:
+                    from messaging.base import TopicUnreachable
+                    if isinstance(exc, TopicUnreachable):
+                        from topic_recovery import recover_unreachable_topic
+                        recovery = await recover_unreachable_topic(
+                            task_name,
+                            platform,
+                            reason=exc.reason or str(exc),
+                            event="awaiting_input",
+                            pending_delivery=chunk,
+                        )
+                        topic_operation_failed = not recovery.pending_delivered
+                    else:
+                        logger.warning(
+                            "Awaiting-input pin/marker failed for '%s'",
+                            task_name,
+                            exc_info=True,
+                        )
+        if not topic_operation_failed:
+            from topic_recovery import mark_topic_reachable
+            await mark_topic_reachable(task_name)
+    if state_override and state is not None:
+        try:
+            from continuous import load_state, save_state, state_file_path
+            state_path = state_file_path(task_name)
+            fresh = load_state(state_path)
+            if fresh and fresh.get("id") == state.get("id"):
+                fresh.pop("delivery_state_override", None)
+                save_state(state_path, fresh)
+        except Exception:
+            logger.warning(
+                "Could not clear delivery override for '%s'",
+                task_name,
+                exc_info=True,
+            )
     return True
 
 
@@ -414,8 +625,8 @@ def start_task_delivery_watch(
     platform: Any,
     backend: AIBackend,
     logger: logging.Logger,
-) -> asyncio.Task | None:
-    """Detach a watcher that relays output after the spawned task exits.
+) -> asyncio.Task:
+    """Start a supervised watcher that relays output after child exit.
 
     Spec 006 US4: also spawns a heartbeat refresher that rewrites the
     lock file's timestamp every ``LOCK_HEARTBEAT_INTERVAL_SECONDS`` while
@@ -424,9 +635,6 @@ def start_task_delivery_watch(
     ``LOCK_STALE_THRESHOLD_SECONDS`` and the scheduler reclaims on its
     next cycle (FR-019/FR-020).
     """
-    if platform is None:
-        return None
-
     import asyncio as _asyncio
     from scheduler import refresh_heartbeat
 
@@ -459,14 +667,30 @@ def start_task_delivery_watch(
         returncode = 1
         try:
             returncode = await proc.wait()
-            await deliver_task_output(
-                task,
-                output_log,
-                platform,
-                backend,
-                returncode,
-                logger,
-            )
+            if not isinstance(getattr(proc, "returncode", None), int):
+                try:
+                    proc.returncode = returncode
+                except (AttributeError, TypeError):
+                    pass
+            # The direct CLI can exit while a worker it spawned keeps the
+            # isolated group alive. Reap that remainder before treating output
+            # as final; otherwise a delivered task can still mutate files.
+            if supervisor.process_tree_alive(proc):
+                stopped = await supervisor.terminate_process(
+                    proc,
+                    grace_seconds=2.0,
+                )
+                if not stopped:
+                    raise RuntimeError("scheduled process tree did not stop")
+            if platform is not None:
+                await deliver_task_output(
+                    task,
+                    output_log,
+                    platform,
+                    backend,
+                    returncode,
+                    logger,
+                )
         except Exception as exc:
             logger.error(
                 "Scheduled-task delivery watcher crashed for '%s': %s",
@@ -478,8 +702,65 @@ def start_task_delivery_watch(
             heartbeat_cancelled.set()
             try:
                 await _asyncio.wait_for(heartbeat_task, timeout=2.0)
-            except (_asyncio.TimeoutError, Exception):
+            except _asyncio.CancelledError:
                 heartbeat_task.cancel()
-            lock_file.unlink(missing_ok=True)
+                await _asyncio.gather(heartbeat_task, return_exceptions=True)
+                raise
+            except Exception:
+                heartbeat_task.cancel()
+                await _asyncio.gather(heartbeat_task, return_exceptions=True)
+            finally:
+                if (
+                    getattr(proc, "returncode", None) is not None
+                    and not supervisor.process_tree_alive(proc)
+                ):
+                    lock_file.unlink(missing_ok=True)
+                    supervisor.untrack_process(proc)
+                else:
+                    logger.error(
+                        "Keeping lock and orphan PID for unreaped scheduled task '%s'",
+                        task.get("name"),
+                    )
 
-    return asyncio.create_task(_watch())
+    supervisor = get_runtime_supervisor()
+    supervisor.track_process(
+        proc,
+        owner="scheduled:%s" % (task.get("name") or "?"),
+        process_group=True,
+    )
+    gate = get_maintenance_gate()
+    watch_coroutine = _watch()
+    try:
+        handoff = gate.handoff_shared()
+    except RuntimeError:
+        handoff = None
+        leased_coroutine = _watch_with_new_maintenance_lease(
+            watch_coroutine,
+            gate,
+        )
+    else:
+        leased_coroutine = _watch_with_maintenance_lease(watch_coroutine, handoff)
+    try:
+        return supervisor.spawn(
+            leased_coroutine,
+            name="scheduled_delivery:%s:%s" % (task.get("name") or "?", proc.pid),
+            key="scheduled_delivery:%s" % proc.pid,
+        )
+    except BaseException:
+        if handoff is not None:
+            handoff.cancel()
+        leased_coroutine.close()
+        watch_coroutine.close()
+        raise
+
+
+async def _watch_with_maintenance_lease(coroutine, handoff) -> None:
+    """Retain the scheduler's shared lease through delivery reconciliation."""
+    async with handoff:
+        await coroutine
+
+
+async def _watch_with_new_maintenance_lease(coroutine, gate) -> None:
+    """Compatibility path for callers not dispatched by a scheduler cycle."""
+    async with gate.shared():
+        await coroutine

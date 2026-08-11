@@ -11,14 +11,36 @@ Architecture:
 """
 
 # MUST run before any other bot-local import: keeps the venv in sync with
-# bot/requirements.txt so a new release with new deps never boots against
-# a stale environment. See bot/_bootstrap.py for the full rationale.
+# the hash-verified runtime lock for this Python minor so a new release with
+# new deps never boots against a stale environment. See bot/_bootstrap.py.
 import _bootstrap
 _bootstrap.ensure_dependencies()
 # v0.16+: relocate any leftover repo-root runtime files into data/. This
 # is the boot-time safety net that complements the pre-pull migration in
 # bot/updater.py — see migrate_personal_data_if_needed() for rationale.
 _bootstrap.migrate_personal_data_if_needed()
+
+# Enforce owner-only modes before ``config`` reads .env.  Kept behind the
+# executable-entrypoint check so importing this module does not alter a test
+# runner's process-wide umask or touch its filesystem.
+if __name__ == "__main__":
+    from local_security import (
+        emit_hardening_report,
+        establish_private_umask,
+        harden_runtime_permissions,
+        PermissionHardeningError,
+        require_hardening_success,
+    )
+
+    establish_private_umask()
+    _permission_report = harden_runtime_permissions(_bootstrap._PROJECT_ROOT)
+    emit_hardening_report(_permission_report)
+    try:
+        require_hardening_success(_permission_report)
+    except PermissionHardeningError as _permission_error:
+        # A concise SystemExit avoids a traceback and never embeds runtime
+        # contents; detailed path-only diagnostics were emitted just above.
+        raise SystemExit(str(_permission_error)) from None
 
 import asyncio
 import atexit
@@ -62,6 +84,8 @@ from config import (
 from handlers import make_handlers
 from messaging.base import PlatformMessage
 from migrations import run_pending as run_pending_migrations
+from persistence_recovery import PersistenceUnavailableError
+from runtime_supervisor import get_runtime_supervisor
 from scheduler import migrate_to_unified_queue, run_scheduler_cycle
 from topics import heal_detached_workspaces
 from updater import apply_update, check_for_updates, get_pending_update, restart_service
@@ -199,24 +223,15 @@ async def scheduler_job(context):
             default_chat_id=context.job.data.get("default_chat_id"),
         )
 
-        # Notify in Main only if something happened
+        # Spec 006: scheduler activity is pull-based. Per-task delivery and the
+        # event journal carry actionable outcomes; routine dispatch/error
+        # summaries must never leak into HQ.
         if result["dispatched"] or result["errors"]:
-            lines = []
-            for name, pid in result["dispatched"]:
-                lines.append("Dispatched: %s (PID %d)" % (name, pid))
-            for name in result["errors"]:
-                lines.append("Error: %s" % name)
-
-            text = "*Scheduler*\n" + "\n".join(lines)
-            try:
-                await plat.send_message(
-                    chat_id=CHAT_ID,
-                    text=text,
-                    thread_id=control_room_id,
-                    parse_mode="markdown",
-                )
-            except Exception as e:
-                log.error("Failed to send scheduler notification: %s", e)
+            log.info(
+                "Scheduler cycle summary: dispatched=%d errors=%d",
+                len(result["dispatched"]),
+                len(result["errors"]),
+            )
 
     except Exception as e:
         log.error("Scheduler cycle failed: %s", e, exc_info=True)
@@ -341,8 +356,14 @@ def main():
             return
         _shutdown_done = True
         log.info("Shutting down — saving state...")
-        manager.save_state()
-        PID_FILE.unlink(missing_ok=True)
+        try:
+            # Normal adapter shutdown drains asynchronously.  This bounded
+            # fallback also covers SIGTERM/atexit paths where the event loop
+            # has already stopped or cannot be awaited.
+            get_runtime_supervisor().terminate_processes_sync()
+            manager.save_state()
+        finally:
+            PID_FILE.unlink(missing_ok=True)
 
     atexit.register(save_on_exit)
     if sys.platform != "win32":
@@ -383,10 +404,9 @@ def _wire_lifecycle(plat, h) -> None:
     in 007) leave their native event handler unregistered — the
     callbacks stay set but are simply never fired.
 
-    Telegram's wiring still lives inline in ``_run_telegram`` for now
-    (Phase 3 of spec 007 will move it into ``TelegramPlatform.register_lifecycle``
-    for symmetry); this helper currently registers only the shared
-    callback attributes that all adapters can use.
+    Each runner calls the adapter's native lifecycle registration after this
+    shared callback wiring; Telegram and Discord currently emit events, with
+    Slack support supplied by its adapter lifecycle bridge.
     """
     if "collab_bot_added" in h:
         plat.on_added = lambda evt: h["collab_bot_added"](plat, evt)
@@ -398,8 +418,19 @@ def _wire_lifecycle(plat, h) -> None:
 
 def _run_telegram(plat, h, backend, manager):
     """Start the Telegram event loop."""
+    supervisor = get_runtime_supervisor()
+
+    async def _post_shutdown(_application):
+        await supervisor.shutdown()
+
     # Build Telegram application
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
 
     # Give platform access to the bot instance
     plat.set_bot(app.bot)
@@ -487,8 +518,15 @@ def _run_telegram(plat, h, backend, manager):
         return wrapper
 
     # Register command handlers
-    for name in ("start", "help", "workspaces", "specialists", "status", "reset", "clear", "focus", "ping", "checkupdate", "doupdate"):
+    for name in ("start", "help", "workspaces", "specialists", "status", "reset", "clear", "focus", "ping", "checkupdate", "doupdate", "stop", "resume", "complete", "delete"):
         app.add_handler(CommandHandler(name, _wrap_command(h[name])))
+
+    # PTB excludes every slash-prefixed message from the ordinary text
+    # handler. Keep a fallback after the known CommandHandlers so
+    # collaborative commands such as /promote, /demote, /role, /mode and
+    # /close still cross the shared role-aware handler boundary. Known HQ
+    # commands win because PTB uses the first matching handler in a group.
+    app.add_handler(MessageHandler(filters.COMMAND, _wrap_message(h["message"])))
 
     # Register voice handler (always — replies gracefully if Whisper not configured)
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, _wrap_voice(h["voice"])))
@@ -523,11 +561,14 @@ def _run_telegram(plat, h, backend, manager):
         data={"platform": plat, "manager": manager},
     )
 
-    # Send boot notification
-    async def boot_notify(context):
+    # Run data recovery/migrations in PTB's ``post_init`` hook, before the
+    # updater starts polling or the JobQueue starts scheduler/update work. A
+    # fail-closed persistence error therefore aborts process startup instead
+    # of leaving a partially online Telegram bot.
+    async def boot_notify(_application):
         from updater import get_current_version
-        boot_plat = context.job.data["platform"]
-        boot_manager = context.job.data["manager"]
+        boot_plat = plat
+        boot_manager = manager
         control_room_id = boot_plat.control_room_id
 
         # Heal any workspaces whose Telegram topic was lost between
@@ -574,6 +615,11 @@ def _run_telegram(plat, h, backend, manager):
         # the running bot's next ``save_state()`` call).
         try:
             executed = await run_pending_migrations(boot_plat, boot_manager)
+        except PersistenceUnavailableError:
+            # A corrupt migration tracker makes schema progress unknowable.
+            # Continuing could run new code against partially migrated data;
+            # fail startup without overwriting or reseeding the tracker.
+            raise
         except Exception as e:
             log.error("Migration runner crashed: %s", e, exc_info=True)
             executed = []
@@ -609,7 +655,7 @@ def _run_telegram(plat, h, backend, manager):
         except Exception as e:
             log.warning("Boot notification failed: %s", e)
 
-    app.job_queue.run_once(boot_notify, when=3, data={"platform": plat, "manager": manager})
+    app.post_init = boot_notify
 
     log.info(
         "Robyx is running. Polling for updates (timeout=%ss, request_timeout=%ss)...",
@@ -639,7 +685,8 @@ def _run_slack(plat, h, backend, manager):
     plat.set_bot(app.client)
 
     COMMANDS = ("start", "help", "workspaces", "specialists", "status",
-                "reset", "clear", "focus", "ping", "checkupdate", "doupdate")
+                "reset", "clear", "focus", "ping", "checkupdate", "doupdate",
+                "stop", "resume", "complete", "delete")
 
     @app.event("message")
     async def handle_message(event, say, client):
@@ -740,16 +787,35 @@ def _run_slack(plat, h, backend, manager):
             log.warning("Failed to post Slack unsupported-platform notice: %s", e)
 
     async def _run():
-        control_room = plat.control_room_channel
-        await _run_boot_sequence(plat, manager, control_room)
+        supervisor = get_runtime_supervisor()
+        try:
+            auth = await app.client.auth_test()
+            team_id = auth.get("team_id")
+            if not team_id:
+                raise RuntimeError(
+                    "Slack auth.test did not return team_id; canonical task "
+                    "ownership cannot be established"
+                )
+            plat.set_team_id(team_id)
+            control_room = plat.control_room_channel
+            await _run_boot_sequence(plat, manager, control_room)
 
-        # Start background loops
-        asyncio.ensure_future(_background_scheduler_loop(plat, backend, control_room))
-        asyncio.ensure_future(_background_update_loop(plat, control_room, manager))
+            supervisor.spawn(
+                _background_scheduler_loop(plat, backend, control_room),
+                name="slack_scheduler",
+                key="slack_scheduler",
+            )
+            supervisor.spawn(
+                _background_update_loop(plat, control_room, manager),
+                name="slack_updates",
+                key="slack_updates",
+            )
 
-        handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
-        log.info("Robyx is running on Slack (Socket Mode)...")
-        await handler.start_async()
+            handler = AsyncSocketModeHandler(app, SLACK_APP_TOKEN)
+            log.info("Robyx is running on Slack (Socket Mode)...")
+            await handler.start_async()
+        finally:
+            await supervisor.shutdown()
 
     asyncio.run(_run())
 
@@ -757,6 +823,7 @@ def _run_slack(plat, h, backend, manager):
 def _run_discord(plat, h, backend, manager):
     """Start the Discord event loop using discord.py."""
     import discord
+    from collaborative import make_discord_chat_id
 
     intents = discord.Intents.default()
     intents.message_content = True
@@ -765,24 +832,63 @@ def _run_discord(plat, h, backend, manager):
 
     client = discord.Client(intents=intents)
     plat.set_bot(client)
+    supervisor = get_runtime_supervisor()
 
     # Spec 007: ``im-the-owner`` is the Discord-only manual-claim escape
     # hatch when the audit-log inviter lookup fails (Forbidden / empty
     # / sustained API errors). Slash on Discord = text command parsed by
     # on_message; the same handler is exposed on Slack post-spec-008.
     COMMANDS = ("start", "help", "workspaces", "specialists", "status",
-                "reset", "focus", "ping", "checkupdate", "doupdate",
-                "im-the-owner")
+                "reset", "clear", "focus", "ping", "checkupdate", "doupdate",
+                "stop", "resume", "complete", "delete", "im-the-owner")
+
+    # ``on_ready`` can run more than once after gateway reconnects. Retain
+    # the one-time boot task and the two long-lived loops so a reconnect
+    # neither repeats migrations/boot notices nor doubles scheduler work.
+    boot_task = None
+    background_tasks = {}
+
+    def _start_background(name, coro_factory):
+        task = background_tasks.get(name)
+        if task is not None and not task.done():
+            return task
+
+        task = supervisor.spawn(
+            coro_factory(),
+            name="discord_%s" % name,
+            key="discord_%s" % name,
+        )
+        background_tasks[name] = task
+        return task
 
     @client.event
     async def on_ready():
+        nonlocal boot_task
         log.info("Discord bot ready: %s", client.user)
         control_room = plat.control_room_id
-        await _run_boot_sequence(plat, manager, control_room)
+        if boot_task is None:
+            boot_task = supervisor.spawn(
+                _run_boot_sequence(plat, manager, control_room),
+                name="discord_boot_sequence",
+            )
+        current_boot = boot_task
+        try:
+            await current_boot
+        except BaseException:
+            # A later ready event may retry a failed/cancelled boot. Guard
+            # the assignment in case another ready callback replaced it.
+            if boot_task is current_boot:
+                boot_task = None
+            raise
 
-        # Start background loops
-        client.loop.create_task(_background_scheduler_loop(plat, backend, control_room))
-        client.loop.create_task(_background_update_loop(plat, control_room, manager))
+        _start_background(
+            "scheduler",
+            lambda: _background_scheduler_loop(plat, backend, control_room),
+        )
+        _start_background(
+            "updates",
+            lambda: _background_update_loop(plat, control_room, manager),
+        )
 
     # Spec 007: Discord collaborative-workspace lifecycle is now wired.
     # DiscordPlatform.register_lifecycle attaches on_guild_join /
@@ -797,8 +903,13 @@ def _run_discord(plat, h, backend, manager):
     async def on_message(message):
         if message.author == client.user:
             return
-        if not plat.is_owner(message.author.id):
-            return
+
+        # Discord workspace identity is channel-scoped. Keep the canonical
+        # value serialisable on PlatformMessage; ``thread_id`` remains the
+        # native numeric delivery target for discord.py operations.
+        guild_id = message.guild.id if message.guild else 0
+        channel_id = message.channel.id
+        chat_id = make_discord_chat_id(guild_id, channel_id)
 
         # Check for voice message
         audio_attachment = None
@@ -810,9 +921,9 @@ def _run_discord(plat, h, backend, manager):
         if message.flags.voice or audio_attachment:
             msg = PlatformMessage(
                 user_id=message.author.id,
-                chat_id=message.guild.id if message.guild else message.channel.id,
+                chat_id=chat_id,
                 text=None,
-                thread_id=message.channel.id,
+                thread_id=channel_id,
                 voice_file_id=audio_attachment.url if audio_attachment else None,
             )
             await h["voice"](plat, msg, message)
@@ -830,9 +941,9 @@ def _run_discord(plat, h, backend, manager):
                 args = parts[1:]
                 msg = PlatformMessage(
                     user_id=message.author.id,
-                    chat_id=message.guild.id if message.guild else message.channel.id,
+                    chat_id=chat_id,
                     text=text,
-                    thread_id=message.channel.id,
+                    thread_id=channel_id,
                     command=cmd_name,
                     args=args,
                 )
@@ -842,11 +953,27 @@ def _run_discord(plat, h, backend, manager):
         # Regular text message
         msg = PlatformMessage(
             user_id=message.author.id,
-            chat_id=message.guild.id if message.guild else message.channel.id,
+            chat_id=chat_id,
             text=text,
-            thread_id=message.channel.id,
+            thread_id=channel_id,
+            user_name=(
+                getattr(message.author, "display_name", None)
+                or getattr(message.author, "name", None)
+            ),
         )
         await h["message"](plat, msg, message)
+
+    # discord.py owns its event loop inside ``Client.run``.  Wrapping its
+    # async close hook ensures our retained tasks and AI children are drained
+    # before that loop disappears. Reconnects do not invoke close, so they do
+    # not tear down the singleton scheduler/update loops.
+    original_close = getattr(client, "close", None)
+    if callable(original_close):
+        async def _supervised_close():
+            await supervisor.shutdown()
+            await original_close()
+
+        client.close = _supervised_close
 
     client.run(DISCORD_BOT_TOKEN)
 
@@ -869,18 +996,11 @@ async def _background_scheduler_loop(
                 backend, platform=plat, default_chat_id=control_room_id,
             )
             if result["dispatched"] or result["errors"]:
-                lines = []
-                for name, pid in result["dispatched"]:
-                    lines.append("Dispatched: %s (PID %d)" % (name, pid))
-                for name in result["errors"]:
-                    lines.append("Error: %s" % name)
-                text = "*Scheduler*\n" + "\n".join(lines)
-                try:
-                    await plat.send_message(
-                        chat_id=control_room_id, text=text, parse_mode="markdown",
-                    )
-                except Exception as e:
-                    log.error("Failed to send scheduler notification: %s", e)
+                log.info(
+                    "Scheduler cycle summary: dispatched=%d errors=%d",
+                    len(result["dispatched"]),
+                    len(result["errors"]),
+                )
         except Exception as e:
             log.error("Scheduler cycle failed: %s", e, exc_info=True)
         await asyncio.sleep(interval)
@@ -951,6 +1071,8 @@ async def _run_boot_sequence(plat, manager, control_room_id) -> list:
 
     try:
         executed = await run_pending_migrations(plat, manager)
+    except PersistenceUnavailableError:
+        raise
     except Exception as e:
         log.error("Migration runner crashed: %s", e, exc_info=True)
         executed = []

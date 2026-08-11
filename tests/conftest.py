@@ -55,6 +55,15 @@ def _patch_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "UPDATES_STATE_FILE", data_dir / "updates.json")
     monkeypatch.setattr(cfg, "OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setattr(cfg, "CLAUDE_PERMISSION_MODE", "")
+    # Participant-policy behavior tests opt in explicitly. Production defaults
+    # to ``disabled``; a dedicated isolated config test locks that contract.
+    monkeypatch.setattr(cfg, "COLLAB_PARTICIPANT_POLICY", "read-only")
+    if "ai_invoke" in sys.modules:
+        monkeypatch.setattr(
+            sys.modules["ai_invoke"],
+            "COLLAB_PARTICIPANT_POLICY",
+            "read-only",
+        )
     monkeypatch.setattr(cfg, "TIMED_QUEUE_FILE", data_dir / "timed_queue.json")
     monkeypatch.setattr(cfg, "QUEUE_FILE", data_dir / "queue.json")
     monkeypatch.setattr(cfg, "CONTINUOUS_DIR", data_dir / "continuous")

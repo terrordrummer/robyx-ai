@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import topics
+from task_scope import TaskScope
 
 
 @pytest.fixture
@@ -73,11 +74,43 @@ async def test_creates_channel_with_bracketed_name(
         manager=agent_manager,
         platform=mock_platform_spec006,
         parent_thread_id=42,
+        workspace_scope=TaskScope("telegram", "-1001", 42),
     )
     assert result is not None
     mock_platform_spec006.create_channel.assert_awaited_once_with(
         "[Continuous] Sample Task",
     )
+
+
+async def test_persists_canonical_scope_in_state_and_queue(
+    tmp_path, agent_manager, mock_platform_spec006, program, monkeypatch,
+):
+    monkeypatch.setattr(
+        "continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous",
+    )
+    work_dir = tmp_path / "project"
+    work_dir.mkdir()
+    scope = TaskScope("telegram", "-1001", 42)
+
+    await topics.create_continuous_workspace(
+        name="Scoped Task",
+        program=program,
+        work_dir=str(work_dir),
+        parent_workspace="ops",
+        model="powerful",
+        manager=agent_manager,
+        platform=mock_platform_spec006,
+        parent_thread_id=42,
+        workspace_scope=scope,
+    )
+
+    state = json.loads(
+        (tmp_path / "data" / "continuous" / "scoped-task" / "state.json")
+        .read_text()
+    )
+    queue = json.loads((tmp_path / "data" / "queue.json").read_text())
+    assert state["workspace_scope"] == scope.to_dict()
+    assert queue[0]["workspace_scope"] == scope.to_dict()
 
 
 async def test_initial_state_marker_applied(
@@ -98,6 +131,7 @@ async def test_initial_state_marker_applied(
         manager=agent_manager,
         platform=mock_platform_spec006,
         parent_thread_id=42,
+        workspace_scope=TaskScope("telegram", "-1001", 42),
     )
     # edit_topic_title was called with running-state marker.
     mock_platform_spec006.edit_topic_title.assert_awaited_once()
@@ -124,6 +158,7 @@ async def test_queue_entry_thread_id_is_dedicated(
         manager=agent_manager,
         platform=mock_platform_spec006,
         parent_thread_id=42,
+        workspace_scope=TaskScope("telegram", "-1001", 42),
     )
     queue_file = tmp_path / "data" / "queue.json"
     queue = json.loads(queue_file.read_text())
@@ -152,6 +187,7 @@ async def test_state_stores_dedicated_thread_id(
         manager=agent_manager,
         platform=mock_platform_spec006,
         parent_thread_id=42,
+        workspace_scope=TaskScope("telegram", "-1001", 42),
     )
     state_file = tmp_path / "data" / "continuous" / "sample-task" / "state.json"
     state = json.loads(state_file.read_text())
@@ -177,6 +213,7 @@ async def test_drain_timeout_override_persisted(
         manager=agent_manager,
         platform=mock_platform_spec006,
         parent_thread_id=42,
+        workspace_scope=TaskScope("telegram", "-1001", 42),
         drain_timeout_seconds=7200,
     )
     state_file = tmp_path / "data" / "continuous" / "longtask" / "state.json"
@@ -204,6 +241,7 @@ async def test_created_event_journaled(
         manager=agent_manager,
         platform=mock_platform_spec006,
         parent_thread_id=42,
+        workspace_scope=TaskScope("telegram", "-1001", 42),
     )
     since = datetime.now(timezone.utc) - timedelta(minutes=1)
     entries = events_mod.query(since, task_name="sample-task")
@@ -212,15 +250,14 @@ async def test_created_event_journaled(
     assert created_events[0]["payload"]["dedicated_thread_id"] == 7777
 
 
-async def test_platform_failure_falls_back_to_parent_thread(
+async def test_platform_failure_rolls_back_without_parent_thread_fallback(
     tmp_path, agent_manager, program, monkeypatch,
 ):
-    """If create_channel fails, the task still gets created and delivery
-    falls back to the parent workspace thread.
-    """
+    """New tasks fail closed when their isolated topic cannot be created."""
     plat = AsyncMock()
     plat.create_channel = AsyncMock(return_value=None)  # simulate failure
     plat.edit_topic_title = AsyncMock(return_value=False)
+    plat.send_to_channel = AsyncMock(return_value=True)
     plat.send_message = AsyncMock()
     plat.max_message_length = 4000
     plat.control_room_id = 1
@@ -231,19 +268,24 @@ async def test_platform_failure_falls_back_to_parent_thread(
     work_dir = tmp_path / "project"
     work_dir.mkdir()
 
-    result = await topics.create_continuous_workspace(
-        name="Fallback Task",
-        program=program,
-        work_dir=str(work_dir),
-        parent_workspace="ops",
-        model="powerful",
-        manager=agent_manager,
-        platform=plat,
-        parent_thread_id=42,
-    )
-    assert result is not None
-    assert result["dedicated_thread_id"] is None
-    assert result["thread_id"] == 42  # fallback to parent
+    with pytest.raises(RuntimeError, match="dedicated topic creation failed"):
+        await topics.create_continuous_workspace(
+            name="Fallback Task",
+            program=program,
+            work_dir=str(work_dir),
+            parent_workspace="ops",
+            model="powerful",
+            manager=agent_manager,
+            platform=plat,
+            parent_thread_id=42,
+            workspace_scope=TaskScope("telegram", "-1001", 42),
+        )
+    assert agent_manager.get("fallback-task") is None
+    assert not (
+        tmp_path / "data" / "continuous" / "fallback-task" / "state.json"
+    ).exists()
+    assert not (work_dir / ".git").exists()
+    plat.send_to_channel.assert_not_awaited()
 
 
 # ── State-marker helper ─────────────────────────────────────────────────

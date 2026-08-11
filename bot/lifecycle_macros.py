@@ -22,11 +22,21 @@ Contract: ``specs/005-unified-workspace-chat/contracts/lifecycle-macros.md``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
+
+from task_scope import (
+    TaskScope,
+    attach_scope,
+    legacy_scope_matches,
+    scope_from_record,
+)
 
 log = logging.getLogger("robyx.lifecycle_macros")
 
@@ -123,6 +133,7 @@ class DispatchContext:
 
     chat_id: Any
     thread_id: Any
+    task_scope: TaskScope | None = None
     platform: Any = None
     manager: Any = None
     # Snippet of the user message that triggered this dispatch (if any).
@@ -133,6 +144,46 @@ class DispatchContext:
     # modules with in-memory doubles.
     queue_reader: Any = None
     state_reader: Any = None
+
+
+@dataclass
+class _LifecycleLockEntry:
+    lock: asyncio.Lock
+    users: int = 0
+
+
+_lifecycle_locks: dict[str, _LifecycleLockEntry] = {}
+_lifecycle_locks_guard = threading.Lock()
+
+
+@asynccontextmanager
+async def _lifecycle_task_lock(name: str):
+    """Serialize lifecycle mutations for one task without a global bottleneck.
+
+    ``users`` includes both the current owner and queued waiters, allowing the
+    registry entry to be removed exactly when the last operation exits (or is
+    canceled while waiting).  The small threading guard is never held across
+    an await; the asyncio lock is scoped to the lifecycle transaction itself.
+    """
+    with _lifecycle_locks_guard:
+        entry = _lifecycle_locks.get(name)
+        if entry is None:
+            entry = _LifecycleLockEntry(lock=asyncio.Lock())
+            _lifecycle_locks[name] = entry
+        entry.users += 1
+
+    acquired = False
+    try:
+        await entry.lock.acquire()
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            entry.lock.release()
+        with _lifecycle_locks_guard:
+            entry.users -= 1
+            if entry.users == 0 and _lifecycle_locks.get(name) is entry:
+                _lifecycle_locks.pop(name, None)
 
 
 # ── Detection ────────────────────────────────────────────────────────────────
@@ -176,8 +227,24 @@ def scope_to_workspace(
     entries: list[dict],
     chat_id: Any,
     thread_id: Any,
+    *,
+    task_scope: TaskScope | None = None,
+    manager: Any = None,
 ) -> list[dict]:
     """Filter queue entries to those belonging to the invoking workspace."""
+    if task_scope is not None:
+        scoped: list[dict] = []
+        for entry in entries or []:
+            matched, _legacy = _record_matches_scope(
+                entry,
+                task_scope,
+                legacy_parent_thread_id=entry.get("thread_id"),
+                manager=manager,
+            )
+            if matched:
+                scoped.append(entry)
+        return scoped
+
     normalized = _normalize_thread_id(thread_id)
     return [
         e for e in (entries or [])
@@ -191,6 +258,35 @@ def _normalize_thread_id(raw: Any) -> Any:
     if isinstance(raw, str) and raw.lstrip("-").isdigit():
         return int(raw)
     return raw
+
+
+def _record_matches_scope(
+    record: dict,
+    task_scope: TaskScope,
+    *,
+    legacy_parent_thread_id: Any,
+    manager: Any,
+) -> tuple[bool, bool]:
+    """Return ``(matched, legacy_needs_migration)`` for one record."""
+    try:
+        persisted = scope_from_record(record)
+    except (TypeError, ValueError):
+        log.error(
+            "lifecycle: refusing record with invalid workspace_scope name=%r",
+            record.get("name"),
+        )
+        return False, False
+    if persisted is not None:
+        return persisted == task_scope, False
+    return (
+        legacy_scope_matches(
+            record,
+            task_scope,
+            legacy_parent_thread_id=legacy_parent_thread_id,
+            manager=manager,
+        ),
+        True,
+    )
 
 
 # ── Task discovery & filtering ──────────────────────────────────────────────
@@ -223,25 +319,139 @@ def _load_scoped_entries(ctx: DispatchContext) -> list[dict]:
         from scheduler import load_queue
         entries = load_queue()
 
-    direct = scope_to_workspace(entries, ctx.chat_id, ctx.thread_id)
-    direct_ids = {e.get("name") for e in direct}
+    direct = scope_to_workspace(
+        entries,
+        ctx.chat_id,
+        ctx.thread_id,
+        task_scope=ctx.task_scope,
+        manager=ctx.manager,
+    )
+    direct_non_continuous: list[dict] = []
+    for entry in direct:
+        if entry.get("type") == "continuous":
+            continue
+        if ctx.task_scope is not None and scope_from_record(entry) is None:
+            if ctx.queue_reader is None:
+                entry_id = entry.get("id")
+                if not entry_id:
+                    log.error(
+                        "lifecycle: legacy queue entry has no id; scope cannot "
+                        "be migrated name=%r",
+                        entry.get("name"),
+                    )
+                    continue
+                try:
+                    from scheduler import set_queue_entry_workspace_scope
+
+                    set_queue_entry_workspace_scope(
+                        str(entry_id), ctx.task_scope.to_dict(),
+                    )
+                except Exception:
+                    log.error(
+                        "lifecycle: non-continuous scope migration failed "
+                        "entry=%s",
+                        entry_id,
+                        exc_info=True,
+                    )
+                    continue
+            entry["workspace_scope"] = ctx.task_scope.to_dict()
+        direct_non_continuous.append(entry)
 
     # Spec 006 — also include continuous entries whose state's
     # workspace_thread_id matches ctx.thread_id (these are tasks owned
     # by the invoking workspace but with queue.thread_id now pointing
     # at the dedicated topic).
     target = _normalize_thread_id(ctx.thread_id)
+    scoped = list(direct_non_continuous)
     for e in entries:
         if e.get("type") != "continuous":
             continue
-        if e.get("name") in direct_ids:
-            continue
+        queue_legacy = False
+        if ctx.task_scope is not None:
+            try:
+                queue_scope = scope_from_record(e)
+            except (TypeError, ValueError):
+                log.error(
+                    "lifecycle: invalid queue workspace_scope name=%r",
+                    e.get("name"),
+                )
+                continue
+            if queue_scope is not None and queue_scope != ctx.task_scope:
+                continue
+            queue_legacy = queue_scope is None
         state = _load_continuous_state(e, ctx)
         if state is None:
             continue
-        if _normalize_thread_id(state.get("workspace_thread_id")) == target:
-            direct.append(e)
-    return direct
+        if ctx.task_scope is None:
+            matched = _normalize_thread_id(state.get("workspace_thread_id")) == target
+            legacy = False
+        else:
+            matched, legacy = _record_matches_scope(
+                state,
+                ctx.task_scope,
+                legacy_parent_thread_id=state.get("workspace_thread_id"),
+                manager=ctx.manager,
+            )
+        if matched:
+            if (
+                ctx.task_scope is not None
+                and (legacy or queue_legacy)
+                and not _migrate_continuous_scope(state, e, ctx)
+            ):
+                continue
+            scoped.append(e)
+    return scoped
+
+
+def _migrate_continuous_scope(
+    state: dict,
+    entry: dict,
+    ctx: DispatchContext,
+) -> bool:
+    """Persist a proven legacy scope to state and queue as one transaction."""
+    if ctx.task_scope is None:
+        return False
+    if ctx.state_reader is not None or ctx.queue_reader is not None:
+        # Injection-backed tests/storage cannot provide an atomic persistence
+        # contract. Authorization may proceed, but do not mutate the doubles.
+        return True
+
+    from continuous import load_state, save_state, state_file_path
+    from scheduler import set_continuous_workspace_scope
+
+    name = str(entry.get("name") or state.get("name") or "")
+    path = state_file_path(name)
+    original = load_state(path)
+    if original is None:
+        return False
+    try:
+        existing = scope_from_record(original)
+    except (TypeError, ValueError):
+        return False
+    if existing is not None and existing != ctx.task_scope:
+        return False
+
+    migrated = dict(original)
+    attach_scope(migrated, ctx.task_scope)
+    save_state(path, migrated)
+    try:
+        set_continuous_workspace_scope(name, ctx.task_scope.to_dict())
+    except Exception:
+        # Roll back the state half so a later lookup never observes a partial
+        # migration as authoritative. The queue helper itself is atomic.
+        save_state(path, original)
+        log.error(
+            "lifecycle: scope migration rolled back name=%s",
+            name,
+            exc_info=True,
+        )
+        return False
+
+    state.clear()
+    state.update(migrated)
+    entry["workspace_scope"] = ctx.task_scope.to_dict()
+    log.info("lifecycle: migrated canonical workspace scope name=%s", name)
+    return True
 
 
 def _load_continuous_state(entry: dict, ctx: DispatchContext) -> dict | None:
@@ -270,6 +480,16 @@ def _effective_status(entry: dict, state: dict | None) -> str:
     return entry.get("status", "pending") or "pending"
 
 
+def _list_scoped_tasks(ctx: DispatchContext) -> list[dict]:
+    """Return every scoped task enriched with authoritative state/status."""
+    out: list[dict] = []
+    for entry in _load_scoped_entries(ctx):
+        state = _load_continuous_state(entry, ctx)
+        status = _effective_status(entry, state)
+        out.append({"entry": entry, "state": state, "status": status})
+    return out
+
+
 def _list_active_tasks(ctx: DispatchContext) -> list[dict]:
     """Return an enriched list of active tasks for the invoking workspace.
 
@@ -277,14 +497,7 @@ def _list_active_tasks(ctx: DispatchContext) -> list[dict]:
     "status": effective_status}``. Filters out completed / canceled /
     dispatched entries.
     """
-    out: list[dict] = []
-    for entry in _load_scoped_entries(ctx):
-        state = _load_continuous_state(entry, ctx)
-        status = _effective_status(entry, state)
-        if not _is_active_status(status):
-            continue
-        out.append({"entry": entry, "state": state, "status": status})
-    return out
+    return [t for t in _list_scoped_tasks(ctx) if _is_active_status(t["status"])]
 
 
 def _match_by_name(tasks: list[dict], query: str) -> list[dict]:
@@ -472,40 +685,202 @@ def _stop_reason(ctx: DispatchContext, verb: str) -> str:
     return "%s by user" % verb
 
 
-def _stop_task(t: dict, ctx: DispatchContext) -> str:
-    """Spec 006 FR-014 stop: halt dispatches but preserve
-    state+history+topic. Task is resumable.
+async def _drain_for_lifecycle(name: str, reason: str, fallback: dict) -> dict:
+    """Cancel future dispatches, terminate the running step, then reload state.
+
+    Reloading only after the subprocess has exited is important: the step agent
+    owns the state file while it runs and may write a final update while
+    handling SIGTERM.  Applying the authoritative lifecycle transition last
+    prevents that update from resurrecting a stopped/terminal task.
     """
+    from continuous import load_state, state_file_path
+    from scheduler import drain_and_cancel_continuous_task
+
+    outcome = await drain_and_cancel_continuous_task(
+        name,
+        reason=reason,
+        terminate_immediately=True,
+        journal_events=False,
+    )
+    if outcome.get("process_found") and not outcome.get("tree_stopped"):
+        raise RuntimeError(
+            "continuous task '%s' process tree did not terminate" % name,
+        )
+    return load_state(state_file_path(name)) or dict(fallback)
+
+
+async def _refresh_topic_marker(state: dict, ctx: DispatchContext) -> None:
+    from continuous import update_topic_state_marker
+
+    try:
+        await update_topic_state_marker(state, ctx.platform)
+    except Exception as exc:
+        log.warning(
+            "lifecycle: topic marker update failed for %s: %s",
+            state.get("name"), exc,
+        )
+
+
+async def _clear_awaiting_pin(state: dict, ctx: DispatchContext) -> None:
+    from continuous import unpin_awaiting_message
+
+    try:
+        await unpin_awaiting_message(state, ctx.platform, ctx.chat_id)
+    except Exception as exc:
+        log.warning(
+            "lifecycle: awaiting pin cleanup failed for %s: %s",
+            state.get("name"), exc,
+        )
+
+
+async def _send_lifecycle_notice(
+    state: dict,
+    ctx: DispatchContext,
+    body: str,
+) -> bool:
+    platform = ctx.platform
+    dedicated = state.get("dedicated_thread_id")
+    if platform is None or dedicated is None or not hasattr(platform, "send_to_channel"):
+        return False
+    try:
+        return bool(
+            await platform.send_to_channel(dedicated, body, parse_mode="Markdown")
+        )
+    except Exception as exc:
+        log.warning(
+            "lifecycle: final notice failed for %s (thread=%s): %s",
+            state.get("name"), dedicated, exc,
+        )
+        return False
+
+
+async def _send_drain_delete_reference(
+    state: dict,
+    ctx: DispatchContext,
+) -> bool:
+    """Post the single FR-021 reference immediately before topic archive."""
+    if not state.get("drain_delete_reference_pending"):
+        return False
+    platform = ctx.platform
+    dedicated = state.get("dedicated_thread_id")
+    if platform is None or dedicated is None or not hasattr(platform, "send_to_channel"):
+        return False
+    name = state.get("name") or "?"
+    body = (
+        "drain output recorded in journal — see archived topic or "
+        "`[GET_EVENTS task=\"%s\"]`" % name
+    )
+    try:
+        sent = bool(
+            await platform.send_to_channel(
+                dedicated,
+                body,
+                parse_mode="Markdown",
+            )
+        )
+    except Exception as exc:
+        log.warning(
+            "lifecycle: drain-delete reference failed for %s (thread=%s): %s",
+            name,
+            dedicated,
+            exc,
+        )
+        return False
+    if sent:
+        from continuous import save_state, state_file_path
+
+        state["drain_delete_reference_pending"] = False
+        state["drain_delete_reference_sent_at"] = (
+            datetime.now(timezone.utc).isoformat()
+        )
+        save_state(state_file_path(name), state)
+    return sent
+
+
+def _terminal_error(operation: str, name: str, status: str) -> str:
+    next_step = (
+        "Per liberare il nome usa `[DELETE_TASK name=\"%s\"]`." % name
+        if status == "completed"
+        else "Il task è già archiviato; per ricrearlo usa `[CONTINUOUS name=\"%s\" …]`." % name
+    )
+    return (
+        "Impossibile %s il task `%s`: lo stato corrente è `%s`. %s"
+        % (operation, name, status, next_step)
+    )
+
+
+async def _stop_continuous_task(
+    t: dict,
+    ctx: DispatchContext,
+    *,
+    macro: str,
+) -> str:
+    entry = t["entry"]
+    name = entry.get("name") or "?"
+    state = t["state"]
+    status = state.get("status") or "pending"
+
+    from scheduler import cancel_task_by_name, _journal_scheduler_event
+
+    if status in ("stopped", "paused"):
+        # Repair pre-fix snapshots where PAUSE wrote stopped state but left the
+        # continuous queue entry pending.
+        cancel_task_by_name(name, reason=_stop_reason(ctx, "stopped"))
+        _journal_scheduler_event(
+            task_name=name,
+            event_type="stopped",
+            outcome="noop",
+            payload={"prev_status": "stopped"},
+        )
+        _log_action(ctx, macro, name, name, "noop")
+        return "Task `%s` è già fermato. Riprendi con: `ripristina %s`." % (name, name)
+    if status in ("completed", "deleted"):
+        _log_action(ctx, macro, name, name, "terminal_state:%s" % status)
+        return _terminal_error("fermare", name, status)
+
+    reason = _stop_reason(ctx, "stopped")
+    state = await _drain_for_lifecycle(name, reason, state)
+    current = state.get("status") or status
+    # A concurrent complete/delete that won while drain yielded is
+    # authoritative and must never be overwritten with a resumable state.
+    if current in ("completed", "deleted"):
+        _log_action(ctx, macro, name, name, "terminal_state:%s" % current)
+        return _terminal_error("fermare", name, current)
+
+    from continuous import pause_task, save_state, state_file_path
+
+    await _clear_awaiting_pin(state, ctx)
+    state = pause_task(state)
+    save_state(state_file_path(name), state)
+    await _refresh_topic_marker(state, ctx)
+    _journal_scheduler_event(
+        task_name=name,
+        event_type="stopped",
+        outcome="ok",
+        payload={"prev_status": status},
+    )
+    _log_action(ctx, macro, name, name, "stopped")
+    noun = "in pausa" if macro == "pause_task" else "fermato"
+    return "Task `%s` %s. Riprendi con: `ripristina %s`." % (name, noun, name)
+
+
+async def _stop_task(t: dict, ctx: DispatchContext) -> str:
+    """Spec 006 stop: terminate the running step and preserve resumability."""
     entry = t["entry"]
     name = entry.get("name") or "?"
     tk = _type_key(entry)
-    reason = _stop_reason(ctx, "stopped")
     if tk == "continuous" and t["state"] is not None:
-        from continuous import pause_task, save_state, state_file_path
-        state = pause_task(t["state"])  # writes canonical "stopped"
-        save_state(state_file_path(name), state)
-        try:
-            from scheduler import cancel_task_by_name, _journal_scheduler_event
-            cancel_task_by_name(name, reason=reason)
-            _journal_scheduler_event(
-                task_name=name,
-                event_type="stopped",
-                outcome="ok",
-                payload={"prev_status": entry.get("status")},
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            log.warning("stop_task: cancel_task_by_name failed for %s: %s", name, exc)
-    else:
-        from scheduler import cancel_task_by_name
-        cancel_task_by_name(name, reason=reason)
+        return await _stop_continuous_task(t, ctx, macro="stop_task")
+
+    from scheduler import cancel_task_by_name
+
+    cancel_task_by_name(name, reason=_stop_reason(ctx, "stopped"))
     _log_action(ctx, "stop_task", name, name, "stopped")
     return "Task `%s` fermato. Riprendi con: `ripristina %s`." % (name, name)
 
 
-def _pause_task(t: dict, ctx: DispatchContext) -> str:
-    """Spec 006 alias for stop — preserved for the Italian 'metti in pausa'
-    macro. Behaviourally identical to _stop_task for continuous tasks.
-    """
+async def _pause_task(t: dict, ctx: DispatchContext) -> str:
+    """Italian pause alias for the spec-006 stop operation."""
     entry = t["entry"]
     name = entry.get("name") or "?"
     tk = _type_key(entry)
@@ -516,29 +891,11 @@ def _pause_task(t: dict, ctx: DispatchContext) -> str:
             "Usa `ferma %s` per fermarlo definitivamente."
             % (tk, name)
         )
-    from continuous import pause_task, save_state, state_file_path
-    state = pause_task(t["state"])  # writes canonical "stopped"
-    save_state(state_file_path(name), state)
-    try:
-        from scheduler import _journal_scheduler_event
-        _journal_scheduler_event(
-            task_name=name,
-            event_type="stopped",
-            outcome="ok",
-            payload={"via": "pause_task"},
-        )
-    except Exception:
-        pass
-    _log_action(ctx, "pause_task", name, name, "paused")
-    return (
-        "Task `%s` in pausa. Riprendi con: `ripristina %s`." % (name, name)
-    )
+    return await _stop_continuous_task(t, ctx, macro="pause_task")
 
 
-def _complete_task(t: dict, ctx: DispatchContext) -> str:
-    """Spec 006 FR-014 complete: terminal success. History + topic
-    preserved as permanent record; no further dispatches; not resumable.
-    """
+async def _complete_task(t: dict, ctx: DispatchContext) -> str:
+    """Spec 006 complete: terminate the running step, then commit terminal state."""
     entry = t["entry"]
     name = entry.get("name") or "?"
     tk = _type_key(entry)
@@ -548,21 +905,42 @@ def _complete_task(t: dict, ctx: DispatchContext) -> str:
             "Complete non supportato per task di tipo `%s`. "
             "Usa `ferma %s` per fermarlo." % (tk, name)
         )
+
+    state = t["state"]
+    status = state.get("status") or "pending"
+    if status in ("completed", "deleted"):
+        _log_action(ctx, "complete_task", name, name, "terminal_state:%s" % status)
+        return _terminal_error("completare", name, status)
+
+    state = await _drain_for_lifecycle(
+        name,
+        _stop_reason(ctx, "completed"),
+        state,
+    )
+    current = state.get("status") or status
+    if current in ("completed", "deleted"):
+        _log_action(ctx, "complete_task", name, name, "terminal_state:%s" % current)
+        return _terminal_error("completare", name, current)
+
     from continuous import complete_task as _complete, save_state, state_file_path
-    state = _complete(t["state"])
+    from scheduler import _journal_scheduler_event
+
+    await _clear_awaiting_pin(state, ctx)
+    state = _complete(state)
     save_state(state_file_path(name), state)
-    reason = _stop_reason(ctx, "completed")
-    try:
-        from scheduler import cancel_task_by_name, _journal_scheduler_event
-        cancel_task_by_name(name, reason=reason)
-        _journal_scheduler_event(
-            task_name=name,
-            event_type="completed",
-            outcome="ok",
-            payload={"total_steps": state.get("total_steps_completed", 0)},
-        )
-    except Exception:
-        pass
+    await _refresh_topic_marker(state, ctx)
+    await _send_lifecycle_notice(
+        state,
+        ctx,
+        "✅ Task *%s* completato. Step completati: %d."
+        % (name, state.get("total_steps_completed", 0)),
+    )
+    _journal_scheduler_event(
+        task_name=name,
+        event_type="completed",
+        outcome="ok",
+        payload={"total_steps": state.get("total_steps_completed", 0)},
+    )
     _log_action(ctx, "complete_task", name, name, "completed")
     return (
         "Task `%s` marcato come completato. Stato preservato come record "
@@ -573,12 +951,9 @@ def _complete_task(t: dict, ctx: DispatchContext) -> str:
 async def _delete_task(t: dict, ctx: DispatchContext) -> str:
     """Spec 006 FR-014 delete: purge + archive dedicated topic + free name.
 
-    Order:
-      1. Cancel queue entry (belt).
-      2. Archive the dedicated topic (rename to [Archived] <name> + close).
-      3. Mark state `deleted` with archived_at timestamp.
-      4. Remove the agent definition file so the name becomes free.
-      5. Journal delete + archived events.
+    The queue is canceled before the bounded process termination to close the
+    scheduler race; after the process is gone the user-visible notice, topic
+    archive, registry cleanup, tombstone, and journal events are committed.
     """
     entry = t["entry"]
     name = entry.get("name") or "?"
@@ -593,16 +968,41 @@ async def _delete_task(t: dict, ctx: DispatchContext) -> str:
     from pathlib import Path
 
     state = t["state"]
+    if state.get("status") == "deleted":
+        from scheduler import cancel_task_by_name
+
+        cancel_task_by_name(name, reason=_stop_reason(ctx, "deleted"))
+        _log_action(ctx, "delete_task", name, name, "noop")
+        return (
+            "Task `%s` è già eliminato/archiviato. Per ricrearlo usa "
+            "`[CONTINUOUS name=\"%s\" …]`." % (name, name)
+        )
+
+    # Persist intent before yielding to process termination. The delivery
+    # watcher uses this durable marker to route a concurrently finishing step
+    # into the bounded full-body journal rather than racing topic archival.
+    from continuous import save_state, state_file_path
+
+    state["delete_in_progress_at"] = datetime.now(timezone.utc).isoformat()
+    save_state(state_file_path(name), state)
+    state = await _drain_for_lifecycle(
+        name,
+        _stop_reason(ctx, "deleted"),
+        state,
+    )
     dedicated_thread_id = state.get("dedicated_thread_id")
     display_name = state.get("name") or name
 
     from scheduler import cancel_task_by_name, _journal_scheduler_event
 
-    reason = _stop_reason(ctx, "deleted")
-    try:
-        cancel_task_by_name(name, reason=reason)
-    except Exception as exc:
-        log.warning("delete_task: cancel_task_by_name failed for %s: %s", name, exc)
+    await _clear_awaiting_pin(state, ctx)
+    await _send_lifecycle_notice(
+        state,
+        ctx,
+        "🗑 Task *%s* eliminato — archiviazione del topic in corso." % display_name,
+    )
+    reference_was_pending = bool(state.get("drain_delete_reference_pending"))
+    reference_sent = await _send_drain_delete_reference(state, ctx)
 
     # Archive the dedicated topic (best-effort).
     archive_ok = False
@@ -622,9 +1022,15 @@ async def _delete_task(t: dict, ctx: DispatchContext) -> str:
                 name, dedicated_thread_id, exc,
             )
 
+    now = datetime.now(timezone.utc).isoformat()
     state["status"] = "deleted"
-    state["archived_at"] = datetime.now(timezone.utc).isoformat()
-    from continuous import save_state, state_file_path
+    state["archived_at"] = now
+    state["delete_in_progress_at"] = None
+    if reference_was_pending and not reference_sent:
+        # Once archive finishes the platform may reject new messages. Keep the
+        # journal authoritative and record why the optional reference vanished.
+        state["drain_delete_reference_pending"] = False
+        state["drain_delete_reference_omitted_at"] = now
     save_state(state_file_path(name), state)
 
     # Remove agent definition file so the name is freed.
@@ -646,6 +1052,10 @@ async def _delete_task(t: dict, ctx: DispatchContext) -> str:
                 "delete_task: manager.remove_agent failed for %s: %s",
                 name, exc,
             )
+
+    # The drain already canceled the entry before yielding; repeat here to
+    # make the documented postcondition explicit and idempotent.
+    cancel_task_by_name(name, reason=_stop_reason(ctx, "deleted"))
 
     _journal_scheduler_event(
         task_name=name,
@@ -675,7 +1085,7 @@ async def _delete_task(t: dict, ctx: DispatchContext) -> str:
     return "Task `%s` eliminato.%s" % (name, archive_note)
 
 
-def _resume_task(t: dict, ctx: DispatchContext) -> str:
+async def _resume_task(t: dict, ctx: DispatchContext) -> str:
     entry = t["entry"]
     name = entry.get("name") or "?"
     tk = _type_key(entry)
@@ -685,8 +1095,17 @@ def _resume_task(t: dict, ctx: DispatchContext) -> str:
             "Resume non supportato per task di tipo `%s`." % tk
         )
     state = t["state"]
+    status = state.get("status")
+    if status == "deleted":
+        _log_action(ctx, "resume_task", name, name, "not_found:deleted")
+        return (
+            "Impossibile riprendere `%s`: il task è stato eliminato. La storia è "
+            "disponibile nel topic `[Archived] %s` e via "
+            "`[GET_EVENTS task=\"%s\"]`. Per ricrearlo usa "
+            "`[CONTINUOUS name=\"%s\" …]`." % (name, name, name, name)
+        )
     # Spec 006: accept both legacy and canonical resumable states.
-    if state.get("status") not in (
+    if status not in (
         "stopped", "paused",
         "rate_limited", "rate-limited",
         "awaiting_input", "awaiting-input",
@@ -694,11 +1113,30 @@ def _resume_task(t: dict, ctx: DispatchContext) -> str:
     ):
         _log_action(ctx, "resume_task", name, name, "noop")
         return (
-            "Task `%s` non è in pausa (status: %s)." % (name, state.get("status"))
+            "Task `%s` non è in pausa (status: %s)." % (name, status)
         )
     from continuous import resume_task, save_state, state_file_path
+    from scheduler import reactivate_continuous_task_by_name, _journal_scheduler_event
+
+    await _clear_awaiting_pin(state, ctx)
+    # Reactivate the queue while state is still blocked.  A concurrent
+    # scheduler can safely observe pending+stopped; only the following atomic
+    # state write makes the task dispatchable.
+    reactivate_continuous_task_by_name(name)
     state = resume_task(state)
     save_state(state_file_path(name), state)
+    await _refresh_topic_marker(state, ctx)
+    outcome = (
+        "from_awaiting_input"
+        if status in ("awaiting_input", "awaiting-input")
+        else "from_stopped"
+    )
+    _journal_scheduler_event(
+        task_name=name,
+        event_type="resumed",
+        outcome=outcome,
+        payload={"prev_status": status},
+    )
     _log_action(ctx, "resume_task", name, name, "resumed")
     return "Task `%s` ripreso." % name
 
@@ -754,7 +1192,20 @@ async def _handle_mutating(
 ) -> str:
     import inspect
     query = inv.name or ""
-    matches = _match_by_name(_list_active_tasks(ctx), query)
+    candidates = _list_active_tasks(ctx)
+    if macro in (
+        "stop_task", "pause_task", "resume_task", "complete_task", "delete_task",
+    ):
+        # Terminal continuous states are intentionally hidden from the active
+        # task list, but lifecycle operations still need to find them: delete
+        # applies to completed tasks and repeated stop/delete must report their
+        # specified idempotent/terminal result instead of a false not-found.
+        candidates = [
+            t for t in _list_scoped_tasks(ctx)
+            if _is_active_status(t["status"])
+            or (_type_key(t["entry"]) == "continuous" and t["state"] is not None)
+        ]
+    matches = _match_by_name(candidates, query)
     if not matches:
         _log_action(ctx, macro, query, None, "not_found")
         # Spec 006 — richer not-found message with recreation hint.
@@ -770,10 +1221,55 @@ async def _handle_mutating(
     if len(matches) > 1:
         _log_action(ctx, macro, query, None, "ambiguous:%d" % len(matches))
         return render_ambiguous_candidates(matches, query)
-    result = action(matches[0], ctx)
-    if inspect.isawaitable(result):
-        result = await result
-    return result
+
+    matched = matches[0]
+    entry = matched["entry"]
+    task_name = entry.get("name") or query
+    serialize = (
+        macro in (
+            "stop_task", "pause_task", "resume_task", "complete_task", "delete_task",
+        )
+        and _type_key(entry) == "continuous"
+        and matched["state"] is not None
+    )
+
+    async def _invoke(selected: dict):
+        result = action(selected, ctx)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    if not serialize:
+        return await _invoke(matched)
+
+    # Matching happens before lock acquisition for responsive ambiguity/error
+    # handling.  Once serialized, refresh state so an operation that waited
+    # behind delete/complete never mutates from its stale pre-lock snapshot.
+    expected_id = matched["state"].get("id")
+    async with _lifecycle_task_lock(task_name):
+        fresh_state = _load_continuous_state(entry, ctx)
+        if fresh_state is None:
+            _log_action(ctx, macro, task_name, task_name, "state_missing_after_lock")
+            return (
+                "Impossibile applicare `%s` al task `%s`: lo stato non è più "
+                "disponibile. Rileggi lo stato con `[TASK_STATUS name=\"%s\"]` "
+                "e riprova." % (macro, task_name, task_name)
+            )
+        fresh_id = fresh_state.get("id")
+        if expected_id and fresh_id and expected_id != fresh_id:
+            _log_action(ctx, macro, task_name, task_name, "generation_changed")
+            return (
+                "Impossibile applicare `%s` al task `%s`: nel frattempo il nome "
+                "è stato riutilizzato da un nuovo task. Rileggi lo stato e "
+                "ripeti esplicitamente l'operazione se riguarda il nuovo task."
+                % (macro, task_name)
+            )
+        refreshed = {
+            "entry": entry,
+            "state": fresh_state,
+            "status": _effective_status(entry, fresh_state),
+        }
+        return await _invoke(refreshed)
 
 
 async def _handle_stop_task(

@@ -54,11 +54,11 @@ Reminder modes — when to use which:
   [REMIND at="2026-04-10T09:00:00+02:00" agent="cleanup" text="Run the daily cleanup and post the summary to your topic."]
   [REMIND in="1h" agent="monitor" text="Snapshot the dashboard and report anomalies."]
 
-NEVER write to `data/queue.json` directly. For plain reminders use
-the `[REMIND ...]` pattern. If you need a future autonomous run that does
-real work, use `scheduler.add_task(...)` instead of appending raw
-JSON to `data/queue.json` yourself. Multiple `[REMIND ...]` lines in
-one response are allowed. After scheduling,
+NEVER write to `data/queue.json` directly or call `scheduler.add_task(...)`
+from an agent turn; those paths do not carry the authenticated workspace
+scope. Use `[REMIND ... agent="..."]` for future one-shot work and ask the
+primary orchestrator to configure recurring work. Multiple `[REMIND ...]`
+lines in one response are allowed. After scheduling,
 briefly confirm to the user what you set up
 ("Ho impostato un reminder per …" / "Reminder set for …").
 
@@ -70,7 +70,8 @@ writes `/loop` — suggest setting it up as a continuous task:
 
 > This kind of work benefits from an agentic loop. I can set it up as a
 > continuous task with a dedicated git branch and structured state;
-> step reports arrive here in this chat with a `🔄` prefix. Want me to proceed?
+> step reports and questions arrive in a dedicated task topic, while you
+> control it from this workspace. Want me to proceed?
 
 **Do NOT execute long iterative work inline.** The continuous task
 mechanism gives each step a clean context, versioned artifacts, and

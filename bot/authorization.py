@@ -11,6 +11,7 @@ import logging
 from typing import Any
 
 from collaborative import CollabStore, CollabWorkspace, Role
+from execution_policy import ExecutionProfile, InvocationSecurityContext
 
 log = logging.getLogger("robyx.authorization")
 
@@ -53,6 +54,31 @@ def get_user_role(
 def can_send_executive(role: Role | None) -> bool:
     """Return True if the user's role allows executive instructions."""
     return role in (Role.OWNER, Role.OPERATOR)
+
+
+def invocation_context_for_role(
+    role: Role,
+    *,
+    actor_id: int | str,
+    collab_workspace_id: str,
+) -> InvocationSecurityContext:
+    """Translate a persisted collaborative role into an execution profile.
+
+    This is the sole role-to-capability mapping.  Callers must pass the
+    :class:`Role` resolved from :class:`CollabStore`; prompt text and sender
+    annotations are deliberately not inputs to this decision.
+    """
+    profile = (
+        ExecutionProfile.EXECUTIVE
+        if can_send_executive(role)
+        else ExecutionProfile.PARTICIPANT_READ_ONLY
+    )
+    return InvocationSecurityContext(
+        profile=profile,
+        actor_id=actor_id,
+        role=role.value,
+        collab_workspace_id=collab_workspace_id,
+    )
 
 
 def can_close_workspace(

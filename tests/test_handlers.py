@@ -1,5 +1,6 @@
 """Tests for bot.handlers — command handlers, owner_only decorator, message routing."""
 
+import asyncio
 import json
 import unittest.mock
 import uuid
@@ -8,8 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import agents as agents_mod
-from handlers import make_handlers, owner_only
+from handlers import _message_chat_ref, make_handlers, owner_only
 from i18n import STRINGS
+from maintenance import MAINTENANCE_MESSAGE, get_maintenance_gate
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +33,20 @@ def make_message(user_id=12345, text="hello", thread_id=None, voice_file_id=None
 
 def make_voice_message(user_id=12345, thread_id=None):
     return make_message(user_id=user_id, text=None, thread_id=thread_id, voice_file_id="test-file-id")
+
+
+def test_slack_message_boundary_builds_team_channel_chat_ref():
+    from messaging.slack import SlackPlatform
+
+    platform = SlackPlatform("xoxb-test", "C01", "U01")
+    platform.set_team_id("T01")
+    msg = make_message()
+    msg.chat_id = "C02"
+
+    assert _message_chat_ref(platform, msg).to_dict() == {
+        "platform": "slack",
+        "chat_id": "T01:C02",
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +113,7 @@ class TestMakeHandlers:
         expected = {
             "start", "help", "workspaces", "specialists", "status",
             "reset", "clear", "focus", "ping", "checkupdate", "doupdate",
+            "stop", "resume", "complete", "delete",
             "voice", "message",
             # Spec 006: [GET_EVENTS] handler always exposed (no collab dep).
             "_handle_get_events",
@@ -104,6 +121,209 @@ class TestMakeHandlers:
             "_handle_get_archive",
         }
         assert set(handlers.keys()) == expected
+
+    @pytest.mark.asyncio
+    async def test_exclusive_update_rejects_new_mutating_command(
+        self,
+        handlers,
+        agent_manager,
+        mock_platform,
+        msg_ref,
+    ):
+        agent = agent_manager.get("robyx")
+        original_session = agent.session_id
+        message = make_message(args=["robyx"])
+
+        async with get_maintenance_gate().exclusive():
+            await asyncio.create_task(
+                handlers["reset"](mock_platform, message, msg_ref),
+            )
+
+        assert agent.session_id == original_session
+        mock_platform.reply.assert_awaited_with(msg_ref, MAINTENANCE_MESSAGE)
+
+    @pytest.mark.asyncio
+    async def test_exclusive_update_waits_for_inflight_command_writer(
+        self,
+        handlers,
+        mock_platform,
+        msg_ref,
+    ):
+        reply_entered = asyncio.Event()
+        release_reply = asyncio.Event()
+
+        async def blocking_reply(*_args, **_kwargs):
+            reply_entered.set()
+            await release_reply.wait()
+
+        mock_platform.reply.side_effect = blocking_reply
+        message = make_message(args=["robyx"])
+        command = asyncio.create_task(
+            handlers["reset"](mock_platform, message, msg_ref),
+        )
+        await reply_entered.wait()
+
+        writer_entered = asyncio.Event()
+
+        async def writer():
+            async with get_maintenance_gate().exclusive(wait_timeout=1):
+                writer_entered.set()
+
+        update = asyncio.create_task(writer())
+        await asyncio.sleep(0)
+        assert not writer_entered.is_set()
+        release_reply.set()
+        await command
+        await asyncio.wait_for(update, timeout=1)
+        assert writer_entered.is_set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("command", "kind"),
+        (
+            ("stop", "stop_task"),
+            ("resume", "resume_task"),
+            ("complete", "complete_task"),
+            ("delete", "delete_task"),
+        ),
+    )
+    async def test_lifecycle_slash_uses_shared_macro_engine(
+        self, command, kind, handlers, agent_manager, mock_platform, msg_ref,
+    ):
+        agent_manager.add_agent(
+            "workspace-a",
+            "/tmp/workspace-a",
+            "Workspace A",
+            thread_id=77,
+        )
+        msg = make_message(
+            user_id=12345,
+            text="/%s task-a" % command,
+            thread_id=77,
+            args=["task-a"],
+        )
+
+        async def render(invocations, context):
+            assert len(invocations) == 1
+            assert invocations[0].kind == kind
+            assert invocations[0].name == "task-a"
+            assert context.chat_id == -100999
+            assert context.thread_id == 77
+            return {invocations[0].span: "shared-engine-result"}
+
+        with patch(
+            "handlers.handle_lifecycle_macros",
+            new=AsyncMock(side_effect=render),
+        ):
+            await handlers[command](mock_platform, msg, msg_ref)
+
+        mock_platform.reply.assert_awaited_once_with(
+            msg_ref,
+            "shared-engine-result",
+            parse_mode="markdown",
+        )
+
+
+class TestDestinationBoundary:
+    """Standard handlers must never treat an unrelated chat as HQ."""
+
+    @pytest.mark.asyncio
+    async def test_owner_message_in_foreign_telegram_chat_is_rejected(
+        self, handlers, mock_platform, msg_ref,
+    ):
+        msg = make_message(user_id=12345, text="show me HQ state")
+        msg.chat_id = -200888
+        mock_platform.is_main_thread = MagicMock(return_value=False)
+
+        with patch("handlers.invoke_ai", new_callable=AsyncMock) as invoke:
+            await handlers["message"](mock_platform, msg, msg_ref)
+
+        invoke.assert_not_awaited()
+        mock_platform.reply.assert_awaited_once_with(
+            msg_ref,
+            STRINGS["unauthorized"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_hq_slash_command_is_not_sent_to_ai(
+        self, handlers, mock_platform, msg_ref,
+    ):
+        msg = make_message(user_id=12345, text="/not-a-command")
+
+        with patch("handlers.invoke_ai", new_callable=AsyncMock) as invoke:
+            await handlers["message"](mock_platform, msg, msg_ref)
+
+        invoke.assert_not_awaited()
+        mock_platform.reply.assert_awaited_once_with(
+            msg_ref,
+            STRINGS["unknown_command"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_owner_command_in_foreign_telegram_chat_is_rejected(
+        self, handlers, mock_platform, msg_ref,
+    ):
+        msg = make_message(user_id=12345, text="/status")
+        msg.chat_id = -200888
+        mock_platform.is_main_thread = MagicMock(return_value=False)
+
+        await handlers["status"](mock_platform, msg, msg_ref)
+
+        mock_platform.reply.assert_awaited_once_with(
+            msg_ref,
+            STRINGS["unauthorized"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_foreign_telegram_topic_cannot_collide_with_workspace_thread(
+        self, handlers, agent_manager, mock_platform, msg_ref,
+    ):
+        agent_manager.add_agent(
+            "private-workspace",
+            "/tmp/private-workspace",
+            "Private",
+            thread_id=77,
+        )
+        msg = make_message(user_id=12345, text="read workspace", thread_id=77)
+        msg.chat_id = -200888
+        mock_platform.is_main_thread = MagicMock(return_value=False)
+
+        with patch("handlers.invoke_ai", new_callable=AsyncMock) as invoke:
+            await handlers["message"](mock_platform, msg, msg_ref)
+
+        invoke.assert_not_awaited()
+        mock_platform.reply.assert_awaited_once_with(
+            msg_ref,
+            STRINGS["unauthorized"],
+        )
+
+    def test_corrupt_collab_registry_fails_closed_before_routing(
+        self, tmp_path,
+    ):
+        from collaborative import CollabStore
+        from persistence_recovery import PersistenceUnavailableError
+
+        collab_file = tmp_path / "collaborative_workspaces.json"
+        collab_file.write_text("{corrupt")
+
+        with pytest.raises(PersistenceUnavailableError):
+            CollabStore(collab_file)
+
+    @pytest.mark.asyncio
+    async def test_owner_voice_in_foreign_chat_rejected_before_download(
+        self, handlers, mock_platform, msg_ref,
+    ):
+        msg = make_voice_message(user_id=12345)
+        msg.chat_id = -200888
+        mock_platform.is_main_thread = MagicMock(return_value=False)
+
+        await handlers["voice"](mock_platform, msg, msg_ref)
+
+        mock_platform.download_voice.assert_not_awaited()
+        mock_platform.reply.assert_awaited_once_with(
+            msg_ref,
+            STRINGS["unauthorized"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -347,23 +567,77 @@ class TestHandleMessage:
     @pytest.mark.asyncio
     @patch("handlers.restart_service")
     @patch("handlers.invoke_ai", new_callable=AsyncMock)
+    async def test_sensitive_assignment_is_redacted_and_never_reaches_ai(
+        self, mock_invoke, mock_restart, handlers, mock_platform, msg_ref, caplog,
+        tmp_path,
+    ):
+        secret = "telegram-secret-must-not-leak"
+        msg = make_message(text="Please set ROBYX_BOT_TOKEN=%s" % secret)
+        env_file = tmp_path / ".env"
+        original = b"ROBYX_BOT_TOKEN=original\n"
+        env_file.write_bytes(original)
+
+        with patch("handlers._config.PROJECT_ROOT", tmp_path):
+            await handlers["message"](mock_platform, msg, msg_ref)
+
+        mock_invoke.assert_not_awaited()
+        mock_restart.assert_not_called()
+        reply_text = mock_platform.reply.call_args.args[1]
+        assert "ROBYX_BOT_TOKEN" in reply_text
+        assert "cannot be changed" in reply_text
+        assert secret not in reply_text
+        assert secret not in caplog.text
+        assert env_file.read_bytes() == original
+
+    @pytest.mark.asyncio
+    @patch("handlers.restart_service")
+    @patch("handlers.invoke_ai", new_callable=AsyncMock)
     async def test_direct_config_update_bypasses_ai_and_restarts(
         self, mock_invoke, mock_restart, handlers, mock_platform, msg_ref, tmp_path
     ):
         env_file = tmp_path / ".env"
         env_file.write_text("AI_BACKEND=claude\n")
 
-        with patch("handlers._config.PROJECT_ROOT", tmp_path):
+        with patch("handlers._config.PROJECT_ROOT", tmp_path), patch(
+            "config_updates.preflight_candidate_config",
+        ) as mock_preflight:
             msg = make_message(text="OPENAI_API_KEY=sk-test")
             await handlers["message"](mock_platform, msg, msg_ref)
 
         mock_invoke.assert_not_awaited()
         mock_restart.assert_called_once()
+        mock_preflight.assert_called_once_with(
+            tmp_path,
+            python_executable=None,
+            timeout=15.0,
+        )
         assert "OPENAI_API_KEY=sk-test" in env_file.read_text()
+        assert (env_file.stat().st_mode & 0o777) == 0o600
         mock_platform.reply.assert_awaited_once()
         reply_text = mock_platform.reply.call_args.args[1]
         assert "OPENAI_API_KEY" in reply_text
         assert "sk-test" not in reply_text
+
+    @pytest.mark.asyncio
+    @patch("handlers.restart_service")
+    @patch("handlers.invoke_ai", new_callable=AsyncMock)
+    async def test_invalid_direct_config_is_local_and_does_not_restart(
+        self, mock_invoke, mock_restart, handlers, mock_platform, msg_ref, tmp_path
+    ):
+        env_file = tmp_path / ".env"
+        original = b"SCHEDULER_INTERVAL=60\n"
+        env_file.write_bytes(original)
+
+        with patch("handlers._config.PROJECT_ROOT", tmp_path):
+            msg = make_message(text="SCHEDULER_INTERVAL=not-a-number")
+            await handlers["message"](mock_platform, msg, msg_ref)
+
+        mock_invoke.assert_not_awaited()
+        mock_restart.assert_not_called()
+        assert env_file.read_bytes() == original
+        reply_text = mock_platform.reply.call_args.args[1]
+        assert "SCHEDULER_INTERVAL" in reply_text
+        assert "not-a-number" not in reply_text
 
     @pytest.mark.asyncio
     @patch("handlers.invoke_ai", new_callable=AsyncMock, return_value="AI says hi")
@@ -1136,7 +1410,8 @@ class TestRestartPattern:
         handlers, mock_platform, msg_ref
     ):
         msg = make_message(text="set OPENAI_API_KEY=sk-test")
-        await handlers["message"](mock_platform, msg, msg_ref)
+        with patch("config_updates.preflight_candidate_config"):
+            await handlers["message"](mock_platform, msg, msg_ref)
 
         mock_restart.assert_called_once()
         # The [RESTART] tag should be stripped from the response
@@ -1550,6 +1825,11 @@ class TestHandleRemind:
         assert entry["message"] == "⏰ sei un figo"
         assert entry["id"].startswith("r-")
         assert entry["fire_at"]  # populated
+        assert entry["workspace_scope"] == {
+            "platform": "telegram",
+            "chat_id": "-100999",
+            "parent_thread_id": None,
+        }
 
     @pytest.mark.asyncio
     @patch("handlers.invoke_ai", new_callable=AsyncMock)

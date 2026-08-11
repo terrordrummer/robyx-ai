@@ -70,10 +70,40 @@ class TestAgentsToInvalidate:
         )
         assert result is None
 
+    def test_global_trigger_collaborative_prompt(self):
+        result = agents_to_invalidate(
+            ["templates/prompt_collaborative_agent.md"],
+            known_agent_names={"robyx", "collab-atlas"},
+        )
+        assert result is None
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "templates/prompt_orchestrator.md",
+            "templates/prompt_workspace_agent.md",
+            "templates/prompt_focused_agent.md",
+            "templates/prompt_collaborative_agent.md",
+            "templates/CONTINUOUS_SETUP.md",
+        ],
+    )
+    def test_every_runtime_prompt_is_a_global_trigger(self, path):
+        result = agents_to_invalidate(
+            [path], known_agent_names={"robyx", "workspace", "specialist"},
+        )
+        assert result is None
+
     def test_global_trigger_files_listed_correctly(self):
         # Sanity guard: the constant must contain at least these two paths.
         assert "bot/config.py" in GLOBAL_INVALIDATION_FILES
         assert "bot/ai_invoke.py" in GLOBAL_INVALIDATION_FILES
+        assert {
+            "templates/prompt_orchestrator.md",
+            "templates/prompt_workspace_agent.md",
+            "templates/prompt_focused_agent.md",
+            "templates/prompt_collaborative_agent.md",
+            "templates/CONTINUOUS_SETUP.md",
+        } <= GLOBAL_INVALIDATION_FILES
 
     def test_per_agent_brief(self):
         result = agents_to_invalidate(

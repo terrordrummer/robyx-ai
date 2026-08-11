@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,18 @@ from ai_backend import (
     get_or_create_backend,
     list_backends,
     reset_backend_cache,
+)
+from execution_policy import (
+    ExecutionProfile,
+    InvocationSecurityContext,
+)
+
+
+PARTICIPANT_CONTEXT = InvocationSecurityContext(
+    profile=ExecutionProfile.PARTICIPANT_READ_ONLY,
+    actor_id=999,
+    role="participant",
+    collab_workspace_id="collab-test",
 )
 
 
@@ -120,6 +133,27 @@ class TestClaudeBackend:
         )
         assert "--session-id" not in cmd
         assert "--resume" not in cmd
+
+    def test_participant_command_is_read_only_and_stateless(self, claude_backend):
+        invocation = claude_backend.build_invocation(
+            message="delete everything",
+            session_id="executive-session",
+            system_prompt="collab",
+            model="sonnet",
+            work_dir="/tmp",
+            is_resume=True,
+            security_context=PARTICIPANT_CONTEXT,
+        )
+        cmd = invocation.argv
+        assert cmd[cmd.index("--permission-mode") + 1] == "plan"
+        assert cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep"
+        assert "--safe-mode" in cmd
+        assert "--strict-mcp-config" in cmd
+        assert "--no-session-persistence" in cmd
+        assert "--resume" not in cmd
+        assert "--session-id" not in cmd
+        assert "bypassPermissions" not in cmd
+        assert invocation.persist_session is False
 
     # ── build_spawn_command ──
 
@@ -313,6 +347,79 @@ class TestCodexBackend:
         assert 'approval_policy="on-request"' in cmd
         assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
 
+    def test_participant_command_forces_fail_closed_read_only_profile(self, codex_backend):
+        invocation = codex_backend.build_invocation(
+            message="run deploy",
+            session_id=None,
+            system_prompt="collab",
+            model="gpt-5",
+            work_dir="/tmp",
+            is_resume=False,
+            security_context=PARTICIPANT_CONTEXT,
+        )
+        cmd = invocation.argv
+        assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+        assert 'approval_policy="never"' in cmd
+        assert "--ignore-user-config" in cmd
+        assert "--ignore-rules" in cmd
+        assert "--strict-config" in cmd
+        assert "--ephemeral" in cmd
+        assert 'web_search="disabled"' in cmd
+        assert "mcp_servers={}" in cmd
+        assert 'shell_environment_policy.inherit="none"' in cmd
+        assert "danger-full-access" not in cmd
+        for feature in codex_backend.PARTICIPANT_DISABLED_FEATURES:
+            assert feature in cmd
+        assert invocation.persist_session is False
+
+    def test_participant_probe_rejects_unknown_enabled_feature(self, codex_backend):
+        help_text = " ".join((
+            "--sandbox read-only --ignore-user-config --ignore-rules",
+            "--strict-config --ephemeral --disable",
+        ))
+        feature_lines = [
+            "%s  stable  false" % feature
+            for feature in codex_backend.PARTICIPANT_DISABLED_FEATURES
+        ]
+        feature_lines.extend([
+            "unified_exec                         stable             true",
+            "view_image                           stable             true",
+            "future_remote_connector              under development  true",
+        ])
+
+        error = codex_backend.validate_participant_probe([
+            help_text,
+            "\n".join(feature_lines),
+        ])
+
+        assert error == (
+            "Codex has unclassified enabled features: future_remote_connector"
+        )
+
+    def test_participant_probe_accepts_reviewed_enabled_and_cli_disabled_features(
+        self, codex_backend,
+    ):
+        help_text = " ".join((
+            "--sandbox read-only --ignore-user-config --ignore-rules",
+            "--strict-config --ephemeral --disable",
+        ))
+        feature_lines = [
+            "%s  stable  %s" % (
+                feature,
+                "true" if feature in {"hooks", "in_app_browser"} else "false",
+            )
+            for feature in codex_backend.PARTICIPANT_DISABLED_FEATURES
+        ]
+        feature_lines.extend([
+            "unified_exec                         stable             true",
+            "view_image                           stable             true",
+        ])
+
+        assert codex_backend.validate_participant_probe([
+            help_text,
+            "\n".join(feature_lines),
+        ]) is None
+
 
 # ═══════════════════════════════════════════════════════════════════
 # OpenCodeBackend
@@ -456,8 +563,7 @@ class TestOpenCodeBackend:
     # ── managed-config for unsafe-autonomy defaults ──
 
     def test_managed_config_written_with_allow_permission(self, tmp_path, monkeypatch):
-        """Instantiating OpenCodeBackend must write a managed config with
-        ``permission: allow`` and export OPENCODE_CONFIG so the CLI picks it up."""
+        """The privileged lane passes its managed config only to the child."""
         import config as cfg
         from ai_backend import OpenCodeBackend
 
@@ -466,8 +572,13 @@ class TestOpenCodeBackend:
         monkeypatch.delenv("OPENCODE_PERMISSION", raising=False)
 
         backend = OpenCodeBackend("/usr/bin/opencode")
+        assert "OPENCODE_CONFIG" not in os.environ
+        invocation = backend.build_spawn_invocation(
+            prompt="scheduled work", model="openai/gpt-5", work_dir="/tmp",
+        )
         expected = tmp_path / "opencode-managed.json"
-        assert os.environ.get("OPENCODE_CONFIG") == str(expected)
+        assert "OPENCODE_CONFIG" not in os.environ
+        assert invocation.env_overrides["OPENCODE_CONFIG"] == str(expected)
         assert expected.exists()
         data = json.loads(expected.read_text())
         assert data["permission"] == "allow"
@@ -492,9 +603,116 @@ class TestOpenCodeBackend:
         monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
         monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
         monkeypatch.setenv("OPENCODE_PERMISSION", "ask")
-        OpenCodeBackend("/usr/bin/opencode")
+        backend = OpenCodeBackend("/usr/bin/opencode")
+        backend.build_spawn_command("scheduled work", "openai/gpt-5", "/tmp")
         data = json.loads((tmp_path / "opencode-managed.json").read_text())
         assert data["permission"] == "ask"
+
+    def test_participant_first_use_does_not_export_permissive_global_config(
+        self, tmp_path, monkeypatch,
+    ):
+        import config as cfg
+        from ai_backend import OpenCodeBackend
+
+        monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+        monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+        backend = OpenCodeBackend("/usr/bin/opencode")
+
+        invocation = backend.build_invocation(
+            message="inspect code",
+            session_id=None,
+            system_prompt="collab",
+            model="openai/gpt-5",
+            work_dir="/tmp",
+            is_resume=False,
+            security_context=PARTICIPANT_CONTEXT,
+        )
+
+        assert "OPENCODE_CONFIG" not in os.environ
+        assert Path(invocation.env_overrides["OPENCODE_CONFIG"]).name == (
+            "opencode-participant.json"
+        )
+        assert not (tmp_path / "opencode-managed.json").exists()
+
+    def test_participant_uses_child_specific_deny_by_default_config(
+        self, tmp_path, monkeypatch,
+    ):
+        import config as cfg
+        from ai_backend import OpenCodeBackend
+
+        monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+        monkeypatch.setenv("OPENCODE_CONFIG", "/user/permissive.json")
+        monkeypatch.setenv(
+            "OPENCODE_CONFIG_CONTENT", '{"permission":{"*":"allow"}}',
+        )
+        monkeypatch.setenv("OPENCODE_CONFIG_DIR", "/user/permissive-config")
+        monkeypatch.setenv("OPENCODE_PERMISSION", "allow")
+        backend = OpenCodeBackend("/usr/bin/opencode")
+        invocation = backend.build_invocation(
+            message="write a file",
+            session_id="ses_executive",
+            system_prompt="collab",
+            model="openai/gpt-5",
+            work_dir="/tmp",
+            is_resume=True,
+            security_context=PARTICIPANT_CONTEXT,
+        )
+
+        participant_path = invocation.env_overrides["OPENCODE_CONFIG"]
+        assert participant_path != "/user/permissive.json"
+        assert os.environ["OPENCODE_CONFIG"] == "/user/permissive.json"
+        assert os.environ["OPENCODE_CONFIG_CONTENT"] == (
+            '{"permission":{"*":"allow"}}'
+        )
+        assert os.environ["OPENCODE_CONFIG_DIR"] == "/user/permissive-config"
+        assert os.environ["OPENCODE_PERMISSION"] == "allow"
+        assert invocation.env_overrides["OPENCODE_DISABLE_PROJECT_CONFIG"] == "true"
+        assert invocation.env_overrides["OPENCODE_DISABLE_DEFAULT_PLUGINS"] == "true"
+        assert invocation.env_overrides[
+            "OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS"
+        ] == "false"
+        assert invocation.env_overrides["OPENCODE_PERMISSION"] == "deny"
+        assert Path(invocation.env_overrides["OPENCODE_CONFIG_DIR"]).is_dir()
+        data = json.loads(Path(participant_path).read_text())
+        permissions = data["permission"]
+        assert permissions["*"] == "deny"
+        for allowed in ("read", "glob", "grep"):
+            assert permissions[allowed] == "allow"
+        assert "list" not in permissions
+        assert "lsp" not in permissions
+        assert permissions["external_directory"] == "deny"
+        assert "--pure" in invocation.argv
+        assert invocation.argv[invocation.argv.index("--agent") + 1] == "robyx-participant"
+        assert "--session" not in invocation.argv
+        assert invocation.persist_session is False
+
+    def test_participant_probe_rejects_resolved_config_escalation(
+        self, tmp_path, monkeypatch,
+    ):
+        import config as cfg
+        from ai_backend import OpenCodeBackend
+
+        monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+        monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+        backend = OpenCodeBackend("/usr/bin/opencode")
+        unsafe_config = {
+            "permission": {"*": "allow"},
+            "plugin": [],
+            "mcp": {},
+            "agent": {
+                "robyx-participant": {"permission": {"*": "allow"}},
+            },
+        }
+
+        error = backend.validate_participant_probe([
+            "1.18.15",
+            "--pure --agent",
+            json.dumps(unsafe_config),
+        ])
+
+        assert error == (
+            "OpenCode resolved participant config is not deny-by-default"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -1,8 +1,11 @@
 """Tests for bot.messaging.slack — SlackPlatform adapter."""
 
+import asyncio
+import os
 import tempfile
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from messaging.slack import SlackPlatform
@@ -240,6 +243,22 @@ class TestReply:
         )
         assert result == {"channel": "C01", "ts": "9999.0000"}
 
+    @pytest.mark.asyncio
+    async def test_reply_uses_shared_retry_policy(self, slack_platform, mock_client):
+        mock_client.chat_postMessage.side_effect = [
+            RuntimeError("temporary outage"),
+            {"channel": "C01", "ts": "9999.0000"},
+        ]
+
+        with patch("messaging.base.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            result = await slack_platform.reply(
+                {"channel": "C01", "ts": "1111.2222"}, "thanks",
+            )
+
+        assert result == {"channel": "C01", "ts": "9999.0000"}
+        assert mock_client.chat_postMessage.await_count == 2
+        sleep.assert_awaited_once_with(1.0)
+
 
 # ---------------------------------------------------------------------------
 # edit_message
@@ -255,6 +274,18 @@ class TestEditMessage:
         mock_client.chat_update.assert_awaited_once_with(
             channel="C01", ts="1111.2222", text="updated text",
         )
+
+    @pytest.mark.asyncio
+    async def test_edit_message_uses_shared_retry_policy(self, slack_platform, mock_client):
+        mock_client.chat_update.side_effect = [RuntimeError("temporary outage"), None]
+
+        with patch("messaging.base.asyncio.sleep", new_callable=AsyncMock) as sleep:
+            await slack_platform.edit_message(
+                {"channel": "C01", "ts": "1111.2222"}, "updated text",
+            )
+
+        assert mock_client.chat_update.await_count == 2
+        sleep.assert_awaited_once_with(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -276,52 +307,111 @@ class TestSendTyping:
 # download_voice
 # ---------------------------------------------------------------------------
 
-def _mock_slack_response(content: bytes = b"audio", is_redirect: bool = False, location: str = ""):
-    """Build a mocked httpx response with the sync attributes the new
-    validator path reads (``is_redirect``, ``headers``, ``url``)."""
-    resp = MagicMock()
-    resp.content = content
-    resp.is_redirect = is_redirect
-    resp.headers = {"location": location} if location else {}
-    resp.url = "https://files.slack.com/original"
-    resp.raise_for_status = MagicMock()
-    return resp
+class _MockSlackResponse:
+    """Small async streaming-response double used by voice download tests."""
+
+    def __init__(
+        self,
+        chunks=(b"audio",),
+        *,
+        is_redirect=False,
+        location="",
+        content_length=None,
+        url="https://files.slack.com/original",
+    ):
+        self.chunks = list(chunks)
+        self.is_redirect = is_redirect
+        self.headers = {}
+        if location:
+            self.headers["location"] = location
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
+        self.url = url
+        self.raise_for_status = MagicMock()
+        self.exited_with = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        self.exited_with = exc_type
+        return False
+
+    async def aiter_bytes(self, chunk_size):
+        assert chunk_size > 0
+        for chunk in self.chunks:
+            if isinstance(chunk, BaseException):
+                raise chunk
+            yield chunk
+
+
+class _MockSlackClient:
+    """AsyncClient double that records each bounded streaming request."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.stream_calls = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return False
+
+    def stream(self, method, url, **kwargs):
+        self.stream_calls.append((method, url, kwargs))
+        return self.responses.pop(0)
+
+
+def _tempfiles_in(path):
+    # The suite's autouse config fixture creates unrelated runtime
+    # directories under ``tmp_path``; only adapter-created voice files matter.
+    return list(path.glob("*.ogg"))
+
+
+def _named_tempfile_in(path):
+    real_named_tempfile = tempfile.NamedTemporaryFile
+    return patch(
+        "messaging.slack.tempfile.NamedTemporaryFile",
+        side_effect=lambda **kwargs: real_named_tempfile(dir=path, **kwargs),
+    )
 
 
 class TestDownloadVoice:
     @pytest.mark.asyncio
     async def test_download_voice_saves_file(self, slack_platform):
-        mock_response = _mock_slack_response(content=b"audio-data-here")
+        mock_response = _MockSlackResponse(chunks=(b"audio-", b"data-here"))
+        client = _MockSlackClient(mock_response)
 
-        with patch("messaging.slack.httpx.AsyncClient") as MockClient:
-            client_instance = AsyncMock()
-            client_instance.get.return_value = mock_response
-            MockClient.return_value.__aenter__ = AsyncMock(return_value=client_instance)
-            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-
+        with patch("messaging.slack.httpx.AsyncClient", return_value=client):
             path = await slack_platform.download_voice("https://files.slack.com/audio.ogg")
 
-        assert path.endswith(".ogg")
-        # Verify auth header was passed
-        call_kwargs = client_instance.get.call_args
-        assert call_kwargs[1]["headers"]["Authorization"] == "Bearer xoxb-test-token"
+        try:
+            assert path.endswith(".ogg")
+            with open(path, "rb") as downloaded:
+                assert downloaded.read() == b"audio-data-here"
+            assert client.stream_calls[0][0:2] == (
+                "GET", "https://files.slack.com/audio.ogg",
+            )
+            assert client.stream_calls[0][2]["headers"]["Authorization"] == (
+                "Bearer xoxb-test-token"
+            )
+        finally:
+            os.unlink(path)
 
     @pytest.mark.asyncio
     async def test_download_voice_uses_url_as_file_id(self, slack_platform):
         """file_id for Slack is the url_private_download URL."""
-        mock_response = _mock_slack_response(content=b"data")
+        client = _MockSlackClient(_MockSlackResponse(chunks=(b"data",)))
 
-        with patch("messaging.slack.httpx.AsyncClient") as MockClient:
-            client_instance = AsyncMock()
-            client_instance.get.return_value = mock_response
-            MockClient.return_value.__aenter__ = AsyncMock(return_value=client_instance)
-            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-
+        with patch("messaging.slack.httpx.AsyncClient", return_value=client):
             url = "https://files.slack.com/files-pri/T01-F01/download/voice.ogg"
-            await slack_platform.download_voice(url)
+            path = await slack_platform.download_voice(url)
 
-        client_instance.get.assert_awaited_once()
-        assert client_instance.get.call_args[0][0] == url
+        try:
+            assert client.stream_calls[0][1] == url
+        finally:
+            os.unlink(path)
 
     @pytest.mark.asyncio
     async def test_download_voice_rejects_non_slack_host(self, slack_platform):
@@ -347,38 +437,158 @@ class TestDownloadVoice:
     async def test_download_voice_rejects_cross_host_redirect(self, slack_platform):
         """A 302 Location pointing outside the Slack allow-list is rejected
         before the bearer token is replayed to the redirect target."""
-        redirect_resp = _mock_slack_response(is_redirect=True, location="https://attacker.example.com/pickup")
+        redirect_resp = _MockSlackResponse(
+            is_redirect=True,
+            location="https://attacker.example.com/pickup",
+        )
+        client = _MockSlackClient(redirect_resp)
 
-        with patch("messaging.slack.httpx.AsyncClient") as MockClient:
-            client_instance = AsyncMock()
-            client_instance.get.return_value = redirect_resp
-            MockClient.return_value.__aenter__ = AsyncMock(return_value=client_instance)
-            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-
+        with patch("messaging.slack.httpx.AsyncClient", return_value=client):
             with pytest.raises(ValueError, match="non-Slack host"):
                 await slack_platform.download_voice("https://files.slack.com/initial.ogg")
 
-            # Exactly one request was made (the initial) — the redirect was
-            # validated and rejected before any cross-host fetch.
-            assert client_instance.get.await_count == 1
+        # Exactly one request was made (the initial) — the redirect was
+        # validated and rejected before any cross-host fetch.
+        assert len(client.stream_calls) == 1
 
     @pytest.mark.asyncio
     async def test_download_voice_follows_in_allowlist_redirect(self, slack_platform):
         """A 302 to another Slack-hosted URL is followed — the token is
         safe because the target is still in the allow-list."""
-        redirect_resp = _mock_slack_response(is_redirect=True, location="https://files.slack-edge.com/final.ogg")
-        final_resp = _mock_slack_response(content=b"final-audio")
+        redirect_resp = _MockSlackResponse(
+            is_redirect=True,
+            location="https://files.slack-edge.com/final.ogg",
+        )
+        final_resp = _MockSlackResponse(chunks=(b"final-audio",))
+        client = _MockSlackClient(redirect_resp, final_resp)
 
-        with patch("messaging.slack.httpx.AsyncClient") as MockClient:
-            client_instance = AsyncMock()
-            client_instance.get.side_effect = [redirect_resp, final_resp]
-            MockClient.return_value.__aenter__ = AsyncMock(return_value=client_instance)
-            MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
-
+        with patch("messaging.slack.httpx.AsyncClient", return_value=client):
             path = await slack_platform.download_voice("https://files.slack.com/initial.ogg")
 
-        assert path.endswith(".ogg")
-        assert client_instance.get.await_count == 2
+        try:
+            assert path.endswith(".ogg")
+            assert len(client.stream_calls) == 2
+            assert client.stream_calls[1][1] == "https://files.slack-edge.com/final.ogg"
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.asyncio
+    async def test_download_voice_rejects_oversize_content_length(
+        self, slack_platform, tmp_path,
+    ):
+        response = _MockSlackResponse(chunks=(), content_length=11)
+        client = _MockSlackClient(response)
+
+        with (
+            patch("messaging.slack._MAX_SLACK_VOICE_BYTES", 10),
+            patch("messaging.slack.httpx.AsyncClient", return_value=client),
+            _named_tempfile_in(tmp_path) as named_tempfile,
+            pytest.raises(ValueError, match="declared=11"),
+        ):
+            await slack_platform.download_voice("https://files.slack.com/huge.ogg")
+
+        named_tempfile.assert_not_called()
+        assert _tempfiles_in(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_download_voice_streams_without_content_length(
+        self, slack_platform, tmp_path,
+    ):
+        response = _MockSlackResponse(chunks=(b"1234", b"567890"))
+        client = _MockSlackClient(response)
+
+        with (
+            patch("messaging.slack._MAX_SLACK_VOICE_BYTES", 10),
+            patch("messaging.slack.httpx.AsyncClient", return_value=client),
+            _named_tempfile_in(tmp_path),
+        ):
+            path = await slack_platform.download_voice(
+                "https://files.slack.com/no-length.ogg",
+            )
+
+        try:
+            with open(path, "rb") as downloaded:
+                assert downloaded.read() == b"1234567890"
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.asyncio
+    async def test_download_voice_rejects_lying_content_length_and_cleans_up(
+        self, slack_platform, tmp_path,
+    ):
+        response = _MockSlackResponse(
+            chunks=(b"123456", b"78901"),
+            content_length=1,
+        )
+        client = _MockSlackClient(response)
+
+        with (
+            patch("messaging.slack._MAX_SLACK_VOICE_BYTES", 10),
+            patch("messaging.slack.httpx.AsyncClient", return_value=client),
+            _named_tempfile_in(tmp_path),
+            pytest.raises(ValueError, match="actual"),
+        ):
+            await slack_platform.download_voice("https://files.slack.com/liar.ogg")
+
+        assert _tempfiles_in(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_download_voice_bounds_redirects(self, slack_platform, tmp_path):
+        redirects = [
+            _MockSlackResponse(
+                is_redirect=True,
+                location="https://files.slack.com/hop-%d.ogg" % hop,
+            )
+            for hop in range(6)
+        ]
+        client = _MockSlackClient(*redirects)
+
+        with (
+            patch("messaging.slack.httpx.AsyncClient", return_value=client),
+            _named_tempfile_in(tmp_path) as named_tempfile,
+            pytest.raises(ValueError, match="exceeded 5 redirects"),
+        ):
+            await slack_platform.download_voice("https://files.slack.com/start.ogg")
+
+        assert len(client.stream_calls) == 6
+        named_tempfile.assert_not_called()
+        assert _tempfiles_in(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_download_voice_interrupted_stream_cleans_partial_file(
+        self, slack_platform, tmp_path,
+    ):
+        response = _MockSlackResponse(
+            chunks=(b"partial", httpx.ReadError("stream interrupted")),
+        )
+        client = _MockSlackClient(response)
+
+        with (
+            patch("messaging.slack.httpx.AsyncClient", return_value=client),
+            _named_tempfile_in(tmp_path),
+            pytest.raises(httpx.ReadError, match="interrupted"),
+        ):
+            await slack_platform.download_voice("https://files.slack.com/broken.ogg")
+
+        assert _tempfiles_in(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_download_voice_cancellation_cleans_partial_file(
+        self, slack_platform, tmp_path,
+    ):
+        response = _MockSlackResponse(
+            chunks=(b"partial", asyncio.CancelledError()),
+        )
+        client = _MockSlackClient(response)
+
+        with (
+            patch("messaging.slack.httpx.AsyncClient", return_value=client),
+            _named_tempfile_in(tmp_path),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await slack_platform.download_voice("https://files.slack.com/cancelled.ogg")
+
+        assert _tempfiles_in(tmp_path) == []
 
 
 class TestValidateSlackFileUrl:
@@ -495,3 +705,17 @@ class TestSendToChannel:
 
         call_kwargs = mock_client.chat_postMessage.call_args[1]
         assert "parse_mode" not in call_kwargs
+
+    @pytest.mark.asyncio
+    async def test_archived_channel_raises_topic_unreachable(
+        self, slack_platform, mock_client,
+    ):
+        from messaging.base import TopicUnreachable
+
+        class SlackFailure(Exception):
+            response = {"error": "is_archived"}
+
+        mock_client.chat_postMessage.side_effect = SlackFailure("archived")
+        with pytest.raises(TopicUnreachable) as exc:
+            await slack_platform.send_to_channel("C_ARCHIVED", "text")
+        assert exc.value.channel_id == "C_ARCHIVED"

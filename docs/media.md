@@ -12,6 +12,12 @@ Send a voice message to any channel. Robyx will:
 
 If `OPENAI_API_KEY` is not configured, the bot replies with a clear message explaining what's missing and how to fix it. You can also send `OPENAI_API_KEY=sk-...` in chat and Robyx will update `.env` locally and restart.
 
+Voice downloads are streamed to a temporary file and limited to 25 MB on all
+supported platforms. Slack redirects are followed only between approved Slack
+file hosts, with a bounded redirect count; rejected or interrupted downloads
+do not leave partial files behind. Slack send, reply, and edit operations share
+the same bounded delivery-retry policy.
+
 ## Receiving Images
 
 Any workspace agent can send you an image file when you explicitly ask for one. Just ask in plain language — *"mandami il risultato dell'ultima iterazione"*, *"show me the benchmark output"*, *"send me the latest render"* — and the agent will deliver the file to the chat.

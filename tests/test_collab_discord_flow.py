@@ -143,7 +143,7 @@ class TestFlowADiscord:
         # In-channel welcome posted.
         channel_sends = [
             c for c in mock_platform.send_message.call_args_list
-            if c.kwargs.get("chat_id") == "111:222"
+            if c.kwargs.get("chat_id") == 222
         ]
         assert channel_sends, "Expected welcome in the bound channel"
         assert "Atlas Test" in channel_sends[0].kwargs["text"]

@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from task_scope import TaskScope
+
 log = logging.getLogger("robyx.continuous_macro")
 
 
@@ -80,6 +82,7 @@ class ContinuousMacroTokens:
     program_span: tuple[int, int] | None = None
     name_raw: str | None = None
     work_dir_raw: str | None = None
+    drain_timeout_raw: str | None = None
     program_raw: str | None = None
     surrounding_fence: tuple[int, int] | None = None
     unclosed_program: bool = False
@@ -111,6 +114,7 @@ class ApplyContext:
     chat_id: Any
     platform: Any
     manager: Any
+    task_scope: TaskScope | None = None
     is_executive: bool = True
     # Optional override for tests: a callable with the same signature as
     # ``topics.create_continuous_workspace``. If ``None``, the real one is
@@ -126,16 +130,51 @@ class ApplyContext:
 # one variant and close with another.
 _QUOTE = r'["\u201C\u201D\u2018\u2019]'
 
-# ``[CREATE_CONTINUOUS name="..." work_dir="..."]``
+# ``[CREATE_CONTINUOUS name="..." work_dir="..." drain_timeout="1h"]``
 # Case-insensitive; ``\s+`` between tag token and attributes and between
-# attributes (covers newlines); attribute order fixed as per grammar.
+# attributes (covers newlines); the optional spec-006 timeout follows the
+# original fixed-order grammar so existing tolerant extraction stays
+# unambiguous.
 _CREATE_CONTINUOUS_RE = re.compile(
     r'\[\s*CREATE_CONTINUOUS'
     r'\s+name\s*=\s*' + _QUOTE + r'([^"\u201C\u201D\u2018\u2019]+)' + _QUOTE +
     r'\s+work_dir\s*=\s*' + _QUOTE + r'([^"\u201C\u201D\u2018\u2019]+)' + _QUOTE +
+    r'(?:\s+drain_timeout\s*=\s*' + _QUOTE
+    + r'([^"\u201C\u201D\u2018\u2019]+)' + _QUOTE + r')?'
     r'\s*\]',
     re.IGNORECASE | re.DOTALL,
 )
+
+_DRAIN_TIMEOUT_RE = re.compile(r"^(\d+)\s*([smh]?)$", re.IGNORECASE)
+_DRAIN_TIMEOUT_MIN_SECONDS = 60
+_DRAIN_TIMEOUT_MAX_SECONDS = 7200
+
+
+def _parse_drain_timeout(value: Any) -> int | None:
+    """Parse the spec-006 chat duration into bounded seconds.
+
+    Bare integer values remain supported for compatibility with the earlier
+    JSON ``drain_timeout_seconds`` field. Chat attributes additionally accept
+    ``s``, ``m`` and ``h`` suffixes (for example ``3600s`` or ``1h``).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        seconds = value
+    elif isinstance(value, str):
+        match = _DRAIN_TIMEOUT_RE.fullmatch(value.strip())
+        if match is None:
+            return None
+        amount = int(match.group(1))
+        multiplier = {"": 1, "s": 1, "m": 60, "h": 3600}[
+            match.group(2).lower()
+        ]
+        seconds = amount * multiplier
+    else:
+        return None
+    if not _DRAIN_TIMEOUT_MIN_SECONDS <= seconds <= _DRAIN_TIMEOUT_MAX_SECONDS:
+        return None
+    return seconds
 
 # ``[CONTINUOUS_PROGRAM] ... [/CONTINUOUS_PROGRAM]`` — paired form.
 _CONTINUOUS_PROGRAM_PAIR_RE = re.compile(
@@ -228,6 +267,7 @@ def extract_continuous_macros(
             open_span=(open_m.start(), open_m.end()),
             name_raw=open_m.group(1),
             work_dir_raw=open_m.group(2),
+            drain_timeout_raw=open_m.group(3),
         )
         # Prefer the closest following paired program block.
         paired = None
@@ -559,28 +599,25 @@ async def apply_continuous_macros(
 
         # ── 7. Side effects ──────────────────────────────────────────
         name = tok.name_raw or "?"
-        # Spec 006 T062 — optional `drain_timeout_seconds` override
-        # travels inside the program payload. Valid range clamped to
-        # [60, 21600] = 1 min … 6 h.
+        # Spec 006 T062 — the chat-facing duration attribute is authoritative;
+        # the earlier numeric JSON field remains accepted for compatibility.
+        # Both paths share the contractual [60, 7200] second range.
         drain_timeout: int | None = None
-        raw_drain = program.get("drain_timeout_seconds") if isinstance(program, dict) else None
+        raw_drain = (
+            tok.drain_timeout_raw
+            if tok.drain_timeout_raw is not None
+            else program.get("drain_timeout_seconds")
+        )
         if raw_drain is not None:
-            try:
-                drain_val = int(raw_drain)
-                if 60 <= drain_val <= 21600:
-                    drain_timeout = drain_val
-                else:
-                    log.warning(
-                        "continuous.macro: drain_timeout_seconds=%s out of "
-                        "range [60, 21600] — ignoring", raw_drain,
-                    )
-            except (TypeError, ValueError):
+            drain_timeout = _parse_drain_timeout(raw_drain)
+            if drain_timeout is None:
                 log.warning(
-                    "continuous.macro: drain_timeout_seconds=%r not an int — ignoring",
+                    "continuous.macro: drain_timeout=%r is not a valid duration "
+                    "in range [60, 7200] seconds — ignoring",
                     raw_drain,
                 )
         try:
-            result = await create_ws(
+            create_kwargs = dict(
                 name=name,
                 program=program,
                 work_dir=work_dir,
@@ -591,6 +628,9 @@ async def apply_continuous_macros(
                 parent_thread_id=ctx.thread_id,
                 drain_timeout_seconds=drain_timeout,
             )
+            if ctx.task_scope is not None:
+                create_kwargs["workspace_scope"] = ctx.task_scope
+            result = await create_ws(**create_kwargs)
         except ValueError as exc:
             msg = str(exc)
             if msg.lower().startswith("name taken") or "already" in msg.lower():

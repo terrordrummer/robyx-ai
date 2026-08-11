@@ -4,6 +4,14 @@
 
 Robyx has a **unified scheduler** that runs every 60 seconds (configurable via `SCHEDULER_INTERVAL`). It manages everything that happens automatically — from simple reminders to long-running autonomous tasks. All entries live in a single `data/queue.json` file.
 
+Queue entries created through Robyx's chat/runtime boundaries persist an
+immutable `workspace_scope` containing the platform, canonical chat id, and
+parent thread/channel id. Lifecycle reads and mutations compare all three
+components; a continuous task's mutable delivery topic is never its ownership
+boundary. A legacy record is migrated only when its non-null parent and
+configured host prove one unambiguous owner. External code should use the
+validated chat macros rather than calling `scheduler.add_task` without scope.
+
 ## What the scheduler can do
 
 **Reminders** — plain text delivered at an exact time, no AI involved. Any agent can schedule one with the `[REMIND ...]` pattern. "Remind me Thursday at 9am — dentist appointment" just works. Survives restarts, no LLM invocation needed.
@@ -15,8 +23,8 @@ Robyx has a **unified scheduler** that runs every 60 seconds (configurable via `
 **Continuous tasks (agentic loop)** — autonomous, iterative work that the scheduler keeps alive step-by-step until the objective is reached or the user intervenes. Each continuous task gets:
 - A **git branch** in the target project's repo
 - A **state file** tracking progress, completed steps, and the plan for the next step
-- A **plan file** (`data/continuous/<name>/plan.md`) capturing the objective, success criteria, and intent
-- Step reports delivered into the **parent workspace chat** with a `🔄 [<task-name>]` prefix (no dedicated sub-topic — the user talks to the primary workspace agent to control the task lifecycle)
+- An authoritative, revisioned **program record** (`data/continuous/<name>/program.json`) plus a repaired-on-load human-readable `plan.md`
+- A **dedicated task topic/channel** for step reports, state markers, pinned questions, incidents, and final notices; ownership still comes from the immutable parent `workspace_scope`
 
 The scheduler dispatches one step at a time. Each step: executes, commits its changes, updates the state, and plans the next step. The scheduler picks up the next step on the following cycle. This is how you can say "refactor the auth module into smaller files" and walk away — the agent works through it methodically, one step at a time.
 
@@ -50,11 +58,13 @@ You never need a dedicated control panel: everything happens by talking to the *
 |-------|-------|--------|
 | `[LIST_TASKS]` | Any active task in this workspace | Renders a grouped summary of continuous / periodic / one-shot / reminders. |
 | `[TASK_STATUS name="…"]` | Any active task | Detailed status — objective, steps completed, constraints, last step (for continuous); next run / fire-at (for scheduled). |
-| `[STOP_TASK name="…"]` | Any active task | Cancels the queue entry so the scheduler never re-picks it. For continuous, also marks `status: completed` on the state file. |
-| `[PAUSE_TASK name="…"]` | Continuous only | Sets `status: paused`. Scheduler skips the task silently until resumed. |
-| `[RESUME_TASK name="…"]` | Continuous only | Resumes a `paused` / `rate-limited` / `awaiting-input` task — the next tick dispatches the planned step. |
+| `[STOP_TASK name="…"]` | Any active task | For a continuous task, cancels future dispatch first, terminates the live step (SIGTERM, at most 5 s grace, then SIGKILL), and records resumable `stopped` state only after the process exits. |
+| `[PAUSE_TASK name="…"]` | Continuous only | User-facing alias of stop: the live step is terminated and the task remains resumable. |
+| `[RESUME_TASK name="…"]` | Continuous only | Reactivates the canceled queue generation and resumes a `stopped` / `rate-limited` / `awaiting-input` / recoverable `error` task; the next tick dispatches the planned step. |
+| `[COMPLETE_TASK name="…"]` | Continuous only | Terminates the live step and commits terminal `completed` state. History and the name remain reserved. |
+| `[DELETE_TASK name="…"]` | Continuous only | Terminates the live step, archives the topic when supported, writes a `deleted` tombstone, removes the agent registration, and frees the name for a new generation. |
 | `[GET_PLAN name="…"]` | Continuous only | Streams `data/continuous/<name>/plan.md` inline (truncated at ~2000 chars). |
-| `[UPDATE_PLAN name="…"]` + `[CONTINUOUS_PROGRAM]{…}[/CONTINUOUS_PROGRAM]` | Continuous only | In-place partial update of `objective`, `success_criteria`, `constraints`, `checkpoint_policy`, `context`, or the free-form `plan_text` body of `plan.md`. Only the fields you provide are merged. |
+| `[UPDATE_PLAN name="…"]` + `[CONTINUOUS_PROGRAM]{…}[/CONTINUOUS_PROGRAM]` | Continuous only | Revisioned partial update of `objective`, `success_criteria`, `constraints`, `checkpoint_policy`, `context`, or `plan_text`. The accepted program and exact plan body live in `program.json`; stale step snapshots cannot roll them back and `plan.md` is repaired after an interrupted commit. |
 
 All macros are **workspace-scoped**: a task owned by another workspace is reported as `not found` rather than touched, so one workspace can never silently mutate another's state. Ambiguous name queries (substring match) surface a disambiguation prompt instead of acting.
 
@@ -70,7 +80,7 @@ The scheduler ticks every `SCHEDULER_INTERVAL` seconds (default 60). That is the
 
 - **Periodic tasks re-arm from the real clock, not from the previous run.** If a daily task was scheduled for `09:00` and fired 20 minutes late at `09:20` (bot was busy or offline), the next run is still set for `next_day 09:00`, not `next_day 09:20`. `_next_run_after()` advances `run_at` by full intervals until it is strictly in the future, so drift does not accumulate.
 
-- **Continuous tasks are not claim-based.** They re-check their state file every tick and spawn the next step whenever `is_ready_for_next_step(state)` is true. Rate-limited tasks retry on the following tick; `awaiting-input` and `paused` states are skipped silently until the user changes them.
+- **Continuous tasks are not claim-based.** They re-check their state file every tick and spawn the next step whenever `is_ready_for_next_step(state)` is true. Rate-limited tasks retry on the following tick; `awaiting_input` and `stopped` states (plus their legacy aliases) are skipped silently until the user changes them.
 
 ## Agent interruption
 
@@ -79,15 +89,41 @@ Any user message to a busy agent **interrupts the running subprocess immediately
 ## Runtime contract
 
 - Each task spawns an independent AI CLI process.
+- Lifecycle mutations for the same continuous-task name are serialized. State is
+  reloaded after subprocess termination, and a post-spawn generation check reaps
+  a child if stop/delete won while it was being created. A deleted name can be
+  recreated without leaving an ambiguous canceled queue entry.
 - PID lock files under `data/<task>/lock` prevent duplicate runs and are cleaned both lazily (by `check_lock` during polling) and proactively on the first scheduler cycle of each boot, so locks on workspaces that have no queue entry never accumulate.
 - Tasks execute in the target agent's stored `work_dir`.
 - Output is logged per-task and relayed back into the target topic/channel.
+- Long-lived scheduler/update loops and every scheduled-delivery watcher are
+  retained by the runtime supervisor. Watchers still wait/reap and remove the
+  lock when no messaging platform is attached; uncaught task exceptions are
+  logged instead of disappearing into a detached `asyncio.Task`.
 - An atomic claim system prevents double-dispatch on concurrent access within one process, and a POSIX `fcntl.LOCK_EX` advisory lock on `data/queue.json.lock` prevents two bot processes (e.g. during a rolling restart) from double-claiming the same entry. On non-POSIX systems the file-level lock is a no-op; single-instance deployments remain fully protected by the in-process lock.
 - One-shot tasks are marked `dispatched` after firing; closing a workspace cancels all its pending queue entries.
 - Reminders that keep failing for longer than `REMINDER_MAX_AGE_SECONDS` (default 7 d, raised from 24 h in v0.20.28) past their `fire_at` are marked `failed` with `failure_reason="expired"` so a persistent delivery failure does not bloat the queue indefinitely.
 - A task stuck in `dispatching` longer than `CLAIM_TIMEOUT_SECONDS` (default 600 s, raised from 300 s in v0.20.28) has its claim reset so the next cycle can re-dispatch. Results arriving with a stale claim token are logged loudly rather than silently applied.
 - The bot also maintains `data/active-pids.json`, a registry of subprocesses it spawned. On startup any survivor that is still alive **and** looks like one of our process names (`claude`, `codex`, `opencode`, `python`, `node`) is force-killed, so a crash during `agent.interrupt()` no longer leaks an unmonitored AI process. Since v0.20.28 the bot spawns every CLI with `start_new_session=True` and signals the whole process group during interrupt, so grandchildren (a `node` worker spawned by a CLI, etc.) are reaped with their parent instead of surviving as re-parented orphans.
+- On normal adapter shutdown, the supervisor first refuses new child work,
+  sends SIGTERM to every isolated AI process group, escalates to SIGKILL after
+  a bounded grace period, reaps the immediate children, then cancels and
+  drains its background tasks. SIGTERM/atexit also has a bounded synchronous
+  fallback if the event loop is already unavailable.
 - Periodic recovery: a periodic task that has missed N intervals while the bot was offline fires **once** on resume (the currently-due instance), and its `next_run` is advanced past `now`. The intermediate missed instances are intentionally skipped to avoid a thundering-herd on startup.
+
+## Corrupt-state recovery
+
+`queue.json` is never silently replaced with an empty list after a decode or
+shape error. Robyx quarantines the original bytes, searches updater snapshots
+from newest to oldest for a verified copy, and installs that one file atomically.
+The same recovery path protects every continuous task's `state.json`.
+
+If no valid snapshot exists, the scheduler reports a degraded
+`queue_unavailable` cycle and all queue mutations fail closed. A durable
+`.recovery-pending` marker lets the next boot resume recovery if the process
+stops between quarantine and install. Recovery can roll state back to the
+snapshot time, so the CRITICAL log and event require operator reconciliation.
 
 ---
 

@@ -10,6 +10,7 @@ import pytest
 
 import config as cfg
 import scheduler as sched_mod
+from task_scope import TaskScope
 from scheduler import (
     FREQUENCY_SECONDS,
     _next_run_after,
@@ -46,6 +47,10 @@ def _now_iso(offset_seconds=0):
     return (datetime.now(timezone.utc) + timedelta(seconds=offset_seconds)).isoformat()
 
 
+def _scope(thread_id=903):
+    return TaskScope("telegram", "-100999", thread_id)
+
+
 def _make_task(name="t1", task_type="one-shot", offset=-10, **kwargs):
     t = {
         "id": "id-%s" % name,
@@ -58,6 +63,9 @@ def _make_task(name="t1", task_type="one-shot", offset=-10, **kwargs):
         "model": "claude-haiku-4-5-20251001",
     }
     t.update(kwargs)
+    if task_type == "periodic":
+        t.setdefault("interval_seconds", 3600)
+        t.setdefault("next_run", t["scheduled_at"])
     return t
 
 
@@ -100,7 +108,10 @@ class TestQueueIO:
 
     def test_load_queue_corrupt_json(self):
         sched_mod.QUEUE_FILE.write_text("NOT JSON")
-        assert load_queue() == []
+        with pytest.raises(sched_mod.QueueUnavailableError):
+            load_queue()
+        assert not sched_mod.QUEUE_FILE.exists()
+        assert list(sched_mod.QUEUE_FILE.parent.glob("queue.json.corrupt-*"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -111,7 +122,7 @@ class TestQueueIO:
 class TestAddTask:
     def test_generates_defaults(self):
         add_task({"name": "x", "agent_file": "agents/a.md", "type": "one-shot",
-                  "scheduled_at": _now_iso(60), "model": "haiku"})
+                  "scheduled_at": _now_iso(60), "model": "haiku"}, scope=_scope())
         q = load_queue()
         assert len(q) == 1
         assert q[0]["status"] == "pending"
@@ -120,29 +131,29 @@ class TestAddTask:
 
     def test_rejects_missing_scheduled_at_for_one_shot(self):
         with pytest.raises(ValueError, match="scheduled_at is required"):
-            add_task({"name": "x", "agent_file": "agents/a.md", "type": "one-shot", "model": "haiku"})
+            add_task({"name": "x", "agent_file": "agents/a.md", "type": "one-shot", "model": "haiku"}, scope=_scope())
         assert load_queue() == []
 
     def test_rejects_invalid_agent_file_ref(self):
         with pytest.raises(ValueError, match="agent_file must be"):
             add_task({"name": "x", "agent_file": "../secrets.md", "type": "one-shot",
-                      "scheduled_at": _now_iso(60), "model": "haiku"})
+                      "scheduled_at": _now_iso(60), "model": "haiku"}, scope=_scope())
         assert load_queue() == []
 
     def test_rejects_invalid_task_name(self):
         with pytest.raises(ValueError, match="task name must be"):
             add_task({"name": "../escape", "agent_file": "agents/a.md", "type": "one-shot",
-                      "scheduled_at": _now_iso(60), "model": "haiku"})
+                      "scheduled_at": _now_iso(60), "model": "haiku"}, scope=_scope())
         assert load_queue() == []
 
     def test_preserves_existing(self):
-        add_task(_make_task("a"))
-        add_task(_make_task("b"))
+        add_task(_make_task("a"), scope=_scope())
+        add_task(_make_task("b"), scope=_scope())
         assert len(load_queue()) == 2
 
     def test_normalizes_naive_scheduled_at(self):
         add_task({"name": "x", "agent_file": "agents/a.md", "type": "one-shot",
-                  "scheduled_at": "2099-06-01T12:00:00", "model": "haiku"})
+                  "scheduled_at": "2099-06-01T12:00:00", "model": "haiku"}, scope=_scope())
         q = load_queue()
         assert q[0]["scheduled_at"] == "2099-06-01T12:00:00+00:00"
 
@@ -159,7 +170,7 @@ class TestAddReminder:
             "fire_at": _now_iso(60),
             "chat_id": -100999,
             "thread_id": 903,
-        })
+        }, scope=_scope())
         q = load_queue()
         assert len(q) == 1
         assert q[0]["type"] == "reminder"
@@ -168,7 +179,10 @@ class TestAddReminder:
         assert "id" in q[0]
 
     def test_unicode_preserved(self):
-        add_reminder({"message": "⏰ caffè ☕", "fire_at": _now_iso(60)})
+        add_reminder(
+            {"message": "⏰ caffè ☕", "fire_at": _now_iso(60)},
+            scope=_scope(),
+        )
         q = load_queue()
         assert q[0]["message"] == "⏰ caffè ☕"
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import tempfile
 from typing import Any
@@ -19,6 +20,13 @@ _SLACK_FILE_HOSTS = (
     "files.slack-edge.com",
     "slack-files.com",
 )
+
+# Slack supports much larger files than Whisper accepts.  Keep the adapter's
+# download ceiling aligned with Telegram and Discord so an untrusted event or
+# Slack CDN response cannot consume unbounded process memory / local disk.
+_MAX_SLACK_VOICE_BYTES = 25 * 1024 * 1024
+_MAX_SLACK_REDIRECTS = 5
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 
 
 def _validate_slack_file_url(url: str) -> None:
@@ -65,7 +73,16 @@ class SlackPlatform(Platform):
         self._bot_token = bot_token
         self._channel_id = channel_id
         self._owner_id = owner_id
+        self._team_id: str | None = None
         self._client = None  # set via set_bot()
+
+    def set_team_id(self, team_id: str | None) -> None:
+        """Bind the authenticated Slack workspace for canonical ChatRefs."""
+        self._team_id = str(team_id) if team_id else None
+
+    @property
+    def team_id(self) -> str | None:
+        return self._team_id
 
     # ------------------------------------------------------------------
     # Platform properties
@@ -133,20 +150,28 @@ class SlackPlatform(Platform):
     async def reply(self, msg_ref: Any, text: str, parse_mode: str | None = None) -> Any:
         """Reply in the same thread as ``msg_ref``.
 
-        ``msg_ref`` is a dict with ``channel`` and ``ts``.
+        ``msg_ref`` is a dict with ``channel`` and ``ts``.  Delivery uses the
+        same bounded retry policy as top-level messages.
         """
-        resp = await self._client.chat_postMessage(
-            channel=msg_ref["channel"],
-            text=text,
-            thread_ts=msg_ref["ts"],
+        resp = await retry_send(
+            lambda: self._client.chat_postMessage(
+                channel=msg_ref["channel"],
+                text=text,
+                thread_ts=msg_ref["ts"],
+            ),
+            label="slack.reply",
         )
         return {"channel": resp["channel"], "ts": resp["ts"]}
 
     async def edit_message(self, msg_ref: Any, text: str, parse_mode: str | None = None) -> None:
-        await self._client.chat_update(
-            channel=msg_ref["channel"],
-            ts=msg_ref["ts"],
-            text=text,
+        """Edit a Slack message using the shared bounded retry policy."""
+        await retry_send(
+            lambda: self._client.chat_update(
+                channel=msg_ref["channel"],
+                ts=msg_ref["ts"],
+                text=text,
+            ),
+            label="slack.edit_message",
         )
 
     async def send_typing(self, chat_id: Any, thread_id: Any = None) -> None:
@@ -160,7 +185,6 @@ class SlackPlatform(Platform):
         caption: str | None = None,
         thread_id: Any = None,
     ) -> Any:
-        import os
         from media import prepare_image_for_upload, MediaError
 
         try:
@@ -200,36 +224,96 @@ class SlackPlatform(Platform):
         ``file_id`` is the ``url_private_download`` URL of the file.
         The bot token is used as a Bearer token for authentication.
 
-        Security: the URL is validated against an allow-list of Slack-hosted
-        hostnames before each request, and 3xx redirects are followed
-        manually so that the bearer token is never sent to a non-Slack host
-        (httpx's ``follow_redirects=True`` would forward Authorization
-        verbatim on cross-host redirects, enabling token exfiltration via
-        a crafted Location header).
+        Security:
+
+        * the URL is validated against an allow-list of Slack-hosted hostnames
+          before every request;
+        * redirects are followed manually and are bounded, so the bearer token
+          is never sent to a non-Slack host;
+        * both declared and actually streamed bytes are capped at 25 MB;
+        * partial files are removed on HTTP/read/write errors and cancellation.
         """
         _validate_slack_file_url(file_id)
         headers = {"Authorization": "Bearer %s" % self._bot_token}
         current_url = file_id
-        max_hops = 5
-        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as http:
-            while True:
-                resp = await http.get(current_url, headers=headers)
-                if resp.is_redirect and max_hops > 0:
-                    location = resp.headers.get("location", "")
-                    if not location:
+        redirect_count = 0
+        tmp_path: str | None = None
+        completed = False
+        try:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=False) as http:
+                while True:
+                    async with http.stream(
+                        "GET", current_url, headers=headers,
+                    ) as resp:
+                        if resp.is_redirect:
+                            if redirect_count >= _MAX_SLACK_REDIRECTS:
+                                raise ValueError(
+                                    "Slack file download exceeded %d redirects"
+                                    % _MAX_SLACK_REDIRECTS
+                                )
+                            location = resp.headers.get("location", "")
+                            if not location:
+                                raise ValueError("Slack file redirect has no Location")
+                            if location.startswith("/") or not location.startswith("http"):
+                                from urllib.parse import urljoin
+
+                                location = urljoin(str(resp.url), location)
+                            _validate_slack_file_url(location)
+                            current_url = location
+                            redirect_count += 1
+                            continue
+
+                        resp.raise_for_status()
+
+                        # Content-Length provides a cheap refusal path, but it
+                        # is never trusted as the sole size check: it may be
+                        # absent, malformed, or smaller than the actual body.
+                        content_length = resp.headers.get("Content-Length")
+                        declared = None
+                        if content_length is not None:
+                            try:
+                                declared = int(content_length)
+                            except (TypeError, ValueError):
+                                declared = None
+                        if declared is not None and declared > _MAX_SLACK_VOICE_BYTES:
+                            raise ValueError(
+                                "Slack voice file exceeds %d-byte cap (declared=%d)"
+                                % (_MAX_SLACK_VOICE_BYTES, declared)
+                            )
+
+                        with tempfile.NamedTemporaryFile(
+                            suffix=".ogg", delete=False,
+                        ) as tmp:
+                            tmp_path = tmp.name
+
+                        total = 0
+                        with open(tmp_path, "wb") as output:
+                            async for chunk in resp.aiter_bytes(
+                                chunk_size=_DOWNLOAD_CHUNK_BYTES,
+                            ):
+                                total += len(chunk)
+                                if total > _MAX_SLACK_VOICE_BYTES:
+                                    raise ValueError(
+                                        "Slack voice file exceeds %d-byte cap (actual>%d)"
+                                        % (
+                                            _MAX_SLACK_VOICE_BYTES,
+                                            _MAX_SLACK_VOICE_BYTES,
+                                        )
+                                    )
+                                output.write(chunk)
                         break
-                    if location.startswith("/") or not location.startswith("http"):
-                        from urllib.parse import urljoin
-                        location = urljoin(str(resp.url), location)
-                    _validate_slack_file_url(location)
-                    current_url = location
-                    max_hops -= 1
-                    continue
-                break
-            resp.raise_for_status()
-            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-                tmp.write(resp.content)
-                return tmp.name
+            # Mark success only after both response and client context managers
+            # have exited cleanly.  A teardown-time transport error must still
+            # remove the otherwise complete-looking temporary file.
+            completed = True
+            assert tmp_path is not None
+            return tmp_path
+        finally:
+            if tmp_path is not None and not completed:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # Channels
@@ -282,17 +366,40 @@ class SlackPlatform(Platform):
             return False
 
     async def send_to_channel(self, channel_id: Any, text: str, parse_mode: str | None = None) -> bool:
+        return bool(
+            await self.send_to_channel_with_ref(channel_id, text, parse_mode=parse_mode)
+        )
+
+    async def send_to_channel_with_ref(
+        self,
+        channel_id: Any,
+        text: str,
+        parse_mode: str | None = None,
+    ) -> Any:
+        from .base import TopicUnreachable
         try:
-            await self._client.chat_postMessage(channel=str(channel_id), text=text)
-            return True
+            resp = await self._client.chat_postMessage(channel=str(channel_id), text=text)
+            return {"channel": resp.get("channel", str(channel_id)), "ts": resp.get("ts")}
+        except TopicUnreachable:
+            raise
         except Exception as e:
+            response = getattr(e, "response", None)
+            error = ""
+            if response is not None:
+                try:
+                    error = str(response.get("error") or "")
+                except (AttributeError, TypeError):
+                    error = ""
+            error = error.lower()
+            if error and ("channel_not_found" in error or "is_archived" in error):
+                raise TopicUnreachable(channel_id, reason=error)
             log.error("Error sending to channel %s: %s", channel_id, e)
-            return False
+            return None
 
     async def leave_chat(self, chat_id: Any) -> None:
         raise NotImplementedError(
             "leave_chat is not yet supported on Slack — external collaborative "
-            "groups are Telegram-only in this iteration"
+            "workspaces are currently supported on Telegram and Discord"
         )
 
     # ── Spec 006 — dedicated-topic operations ──────────────────────────
@@ -321,6 +428,10 @@ class SlackPlatform(Platform):
         slugify ``new_title`` here so callers can pass a human-readable
         form and still succeed.
         """
+        self._warn_once(
+            "edit_topic_title",
+            "channel titles are slugified and visible workspace-wide",
+        )
         from .base import TopicUnreachable
         try:
             slug = _channel_slug(new_title)
@@ -427,3 +538,15 @@ class SlackPlatform(Platform):
             "Slack archive is permanent (admin required to unarchive)",
         )
         return await self.close_channel(channel_id)
+
+    async def archive_topic(
+        self,
+        channel_id: Any,
+        display_name: str,
+    ) -> bool:
+        """Rename then archive, documenting Slack's permanent UX once."""
+        self._warn_once(
+            "archive_topic",
+            "archived channels disappear from most UIs and require admin to restore",
+        )
+        return await super().archive_topic(channel_id, display_name)

@@ -2,7 +2,7 @@
 
 import json
 import time
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -145,6 +145,32 @@ class TestAgent:
         a = Agent(name="b", work_dir="/w", description="d")
         assert a.backend is None
 
+    @pytest.mark.asyncio
+    async def test_interrupt_preserves_busy_evidence_when_tree_does_not_stop(
+        self,
+        monkeypatch,
+    ):
+        from agents import Agent
+        import runtime_supervisor
+
+        proc = MagicMock(pid=99101)
+        supervisor = MagicMock()
+        supervisor.terminate_process = AsyncMock(return_value=False)
+        monkeypatch.setattr(runtime_supervisor, "get_runtime_supervisor", lambda: supervisor)
+        agent = Agent(name="x", work_dir="/w", description="d", busy=True)
+        agent.running_proc = proc
+        agent.running_profile = "default"
+
+        assert await agent.interrupt() is False
+        assert agent.running_proc is proc
+        assert agent.busy is True
+        assert agent.running_profile == "default"
+
+        supervisor.terminate_process.return_value = True
+        assert await agent.interrupt() is True
+        assert agent.running_proc is None
+        assert agent.busy is False
+
 
 # ---------------------------------------------------------------------------
 # AgentManager — initialisation and state persistence
@@ -172,16 +198,15 @@ class TestAgentManagerInit:
         assert list(mgr.agents.keys()) == ["robyx"]
 
     def test_load_state_corrupt_json(self, tmp_path):
-        """Corrupt JSON with no snapshot available -> quarantine, start fresh."""
+        """Corrupt JSON with no snapshot available blocks startup."""
         from agents import AgentManager
         import agents as _agents_mod
+        from persistence_recovery import PersistenceUnavailableError
 
         _agents_mod.STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _agents_mod.STATE_FILE.write_text("{not valid json!!")
-        mgr = AgentManager()
-        assert "robyx" in mgr.agents
-        # Should only have robyx (corrupt state is discarded).
-        assert len(mgr.agents) == 1
+        with pytest.raises(PersistenceUnavailableError):
+            AgentManager()
         # Original state.json is gone (renamed), replaced by a .corrupt-*
         # sibling that preserves the bad bytes for forensics.
         parent = _agents_mod.STATE_FILE.parent
@@ -189,9 +214,26 @@ class TestAgentManagerInit:
         assert len(siblings) == 1, "expected exactly one quarantined file"
         assert siblings[0].read_text() == "{not valid json!!"
         assert not _agents_mod.STATE_FILE.exists(), (
-            "state file should be quarantined, not present — otherwise "
-            "the next save_state() would overwrite the original"
+            "state file should be quarantined, not silently replaced"
         )
+        assert _agents_mod.STATE_FILE.with_suffix(
+            ".json.recovery-pending"
+        ).exists()
+
+    def test_corruption_discovered_before_mutation_does_not_change_memory(self, fresh_manager):
+        from agents import Agent
+        import agents as _agents_mod
+        from persistence_recovery import PersistenceUnavailableError
+
+        fresh_manager.save_state()
+        _agents_mod.STATE_FILE.write_text("{broken")
+        before = fresh_manager.agents["robyx"].session_id
+
+        with pytest.raises(PersistenceUnavailableError):
+            fresh_manager.reset_sessions({"robyx"})
+
+        assert fresh_manager.agents["robyx"].session_id == before
+        assert list(_agents_mod.STATE_FILE.parent.glob("state.json.corrupt-*"))
 
     def test_load_state_corrupt_recovers_from_snapshot(self, tmp_path):
         """When the latest updater snapshot has a valid state.json copy,
@@ -299,8 +341,9 @@ class TestAgentManagerInit:
             info.size = len(good_bytes)
             tf.addfile(info, io.BytesIO(good_bytes))
 
-        # Newer snapshot has a corrupt state.json — recovery must skip it.
-        bad_bytes = b"{not parseable"
+        # Newer snapshot parses as JSON but violates the state schema —
+        # recovery must validate semantics and skip it.
+        bad_bytes = json.dumps({"agents": []}).encode("utf-8")
         new_snap = backups_dir / "pre-update-0.20.0-to-0.21.0-20260101T000000Z.tar.gz"
         with tarfile.open(str(new_snap), "w:gz") as tf:
             info = tarfile.TarInfo(name="./state.json")
@@ -1118,3 +1161,31 @@ class TestResetSessionsSurvivesSubsequentSaveState:
         on_disk = json.loads(state_file.read_text())
         assert on_disk["agents"]["a"]["session_id"] == "stale-fixed-uuid"
         assert on_disk["agents"]["a"]["session_id"] != "would-be-fresh-uuid"
+
+    @pytest.mark.asyncio
+    async def test_maintenance_restore_reload_prevents_future_save_clobber(
+        self,
+        fresh_manager,
+        tmp_path,
+    ):
+        agent = fresh_manager.add_agent(
+            "a", "/a", "agent a", "workspace", thread_id=1,
+        )
+        agent.message_count = 7
+        fresh_manager.save_state()
+        state_file = tmp_path / "data" / "state.json"
+        pre_update_bytes = state_file.read_bytes()
+
+        # Simulate target migration changes in both the live graph and disk,
+        # followed by updater snapshot restore of the pre-update bytes.
+        fresh_manager.agents["a"].message_count = 999
+        fresh_manager.save_state()
+        state_file.write_bytes(pre_update_bytes)
+
+        await fresh_manager.reload_state_after_maintenance_restore()
+        assert fresh_manager.agents["a"].message_count == 7
+
+        # A later interaction/save must preserve the restored generation.
+        fresh_manager.save_state()
+        on_disk = json.loads(state_file.read_text())
+        assert on_disk["agents"]["a"]["message_count"] == 7

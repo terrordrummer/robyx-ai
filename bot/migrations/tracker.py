@@ -19,34 +19,70 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from persistence_recovery import guard_json_write, load_json_with_recovery
 
 log = logging.getLogger("robyx.migrations.tracker")
 
 CHAIN_KEY = "_chain_"
 SEED_VERSION = "0.20.11"  # version immediately before the framework landed
+_VERSION_RE = re.compile(r"^\d+(?:\.\d+)+$")
 
 
 def _file(data_dir: Path) -> Path:
     return data_dir / "migrations.json"
 
 
+def valid_tracker(value: Any) -> bool:
+    """Validate chain progress while tolerating historical legacy values."""
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        return False
+    if CHAIN_KEY not in value:
+        return True
+    chain = value[CHAIN_KEY]
+    if not isinstance(chain, dict):
+        return False
+    current = chain.get("current_version", SEED_VERSION)
+    history = chain.get("history", [])
+    if (
+        not isinstance(current, str)
+        or _VERSION_RE.fullmatch(current) is None
+        or not isinstance(history, list)
+    ):
+        return False
+    for entry in history:
+        if not isinstance(entry, dict):
+            return False
+        if any(not isinstance(entry.get(key), str) for key in ("from", "to", "status")):
+            return False
+        if any(
+            key in entry and not isinstance(entry[key], str)
+            for key in ("from", "to", "status", "applied_at", "error")
+        ):
+            return False
+        for key in ("from", "to"):
+            if key in entry and _VERSION_RE.fullmatch(entry[key]) is None:
+                return False
+    return True
+
+
 def load(data_dir: Path) -> dict[str, Any]:
-    """Load the raw tracker dict, returning ``{}`` if absent or corrupt."""
+    """Load the tracker, failing closed when existing progress is corrupt."""
     path = _file(data_dir)
-    if not path.exists():
+    result = load_json_with_recovery(
+        path,
+        data_dir=data_dir,
+        validator=valid_tracker,
+        kind="migration tracker",
+        logger=log,
+    )
+    if result.status == "missing":
         return {}
-    try:
-        data = json.loads(path.read_text())
-    except Exception as e:
-        log.warning("Cannot read %s: %s — treating as empty", path, e)
-        return {}
-    if not isinstance(data, dict):
-        log.warning("%s has unexpected shape, treating as empty", path)
-        return {}
-    return data
+    return result.value
 
 
 def save(data_dir: Path, data: dict[str, Any]) -> None:
@@ -60,6 +96,15 @@ def save(data_dir: Path, data: dict[str, Any]) -> None:
     Closes Pass 2 C2 (crash-matrix.md).
     """
     path = _file(data_dir)
+    if not valid_tracker(data):
+        raise ValueError("refusing to persist malformed migration tracker")
+    guard_json_write(
+        path,
+        data_dir=data_dir,
+        validator=valid_tracker,
+        kind="migration tracker",
+        logger=log,
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     payload = json.dumps(data, indent=2)
@@ -86,12 +131,17 @@ def get_chain_state(tracker: dict[str, Any]) -> dict[str, Any]:
     version immediately before the framework landed — so that the
     0.20.12 migration runs next on an existing install.
     """
-    chain = tracker.get(CHAIN_KEY)
-    if not isinstance(chain, dict):
+    if CHAIN_KEY not in tracker:
         chain = {"current_version": SEED_VERSION, "history": []}
         tracker[CHAIN_KEY] = chain
+    else:
+        chain = tracker[CHAIN_KEY]
+        if not isinstance(chain, dict):
+            raise ValueError("malformed migration chain state")
     chain.setdefault("current_version", SEED_VERSION)
     chain.setdefault("history", [])
+    if not isinstance(chain["current_version"], str) or not isinstance(chain["history"], list):
+        raise ValueError("malformed migration chain progress")
     return chain
 
 

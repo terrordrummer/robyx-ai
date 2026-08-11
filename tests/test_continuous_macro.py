@@ -67,6 +67,7 @@ def test_tokens_dataclass_defaults():
     assert tok.program_span is None
     assert tok.name_raw is None
     assert tok.work_dir_raw is None
+    assert tok.drain_timeout_raw is None
     assert tok.program_raw is None
     assert tok.surrounding_fence is None
 
@@ -207,6 +208,37 @@ def test_extra_whitespace_between_attributes_is_tolerated():
     assert len(tokens) == 1
     assert tokens[0].name_raw == "whitespace"
     assert "CONTINUOUS_PROGRAM" not in stripped.upper()
+
+
+def test_drain_timeout_attribute_is_extracted_and_stripped():
+    text = (
+        '[CREATE_CONTINUOUS name="bounded" work_dir="/tmp/bounded" '
+        'drain_timeout="1h"]\n'
+        '[CONTINUOUS_PROGRAM]{"objective":"x"}[/CONTINUOUS_PROGRAM]'
+    )
+    stripped, tokens = extract_continuous_macros(text)
+
+    assert stripped == ""
+    assert len(tokens) == 1
+    assert tokens[0].drain_timeout_raw == "1h"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (60, 60),
+        ("120", 120),
+        ("3600s", 3600),
+        ("2h", 7200),
+        ("59s", None),
+        ("121m", None),
+        ("3h", None),
+        ("forever", None),
+        (True, None),
+    ],
+)
+def test_drain_timeout_parser_enforces_contract(raw, expected):
+    assert cm._parse_drain_timeout(raw) == expected
 
 
 # ─────────────────────────────────────────────────────────────────────────

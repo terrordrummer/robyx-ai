@@ -46,6 +46,7 @@ from ai_invoke import (
 from continuous_macro import (
     ApplyContext,
     apply_continuous_macros,
+    extract_continuous_macros,
     strip_control_tokens_for_user,
 )
 from lifecycle_macros import (
@@ -53,6 +54,11 @@ from lifecycle_macros import (
     handle_lifecycle_macros,
     parse_lifecycle_macros,
     substitute_macros as substitute_lifecycle_macros,
+)
+from maintenance import (
+    MAINTENANCE_MESSAGE,
+    MaintenanceActiveError,
+    get_maintenance_gate,
 )
 from update_plan_macro import (
     UpdatePlanContext,
@@ -81,6 +87,13 @@ _EXECUTIVE_MARKERS = (
     ("GET_EVENTS", GET_EVENTS_PATTERN),
     ("GET_ARCHIVE", GET_ARCHIVE_PATTERN),
 )
+
+_COLLAB_ALLOWED_MARKERS = {
+    "SEND_IMAGE",
+    "REMIND",
+    "COLLAB_SETUP_COMPLETE",
+    "NOTIFY_HQ",
+}
 
 
 def _strip_executive_markers(response: str, agent_name: str) -> str:
@@ -114,8 +127,56 @@ def _strip_executive_markers(response: str, agent_name: str) -> str:
             )
             response = pattern.sub("", response)
     return re.sub(r"\n{3,}", "\n\n", response).strip()
+
+
+def _strip_collab_cross_workspace_markers(response: str, agent_name: str) -> str:
+    """Remove markers whose authority cannot be scoped to an external chat.
+
+    Owners/operators may execute code inside the collaborative agent's own
+    work directory, and may use the four explicitly supported chat-local
+    actions above.  Workspace creation, lifecycle, archive/event reads and
+    global focus/restart actions are HQ control-plane operations.  A
+    collaborative agent has no HQ ``thread_id`` and must never fall back to
+    the orchestrator tenant when dispatching them.
+    """
+    if not response:
+        return response
+
+    continuous_requested = bool(extract_continuous_macros(response)[1])
+    for label, pattern in _EXECUTIVE_MARKERS:
+        if label in _COLLAB_ALLOWED_MARKERS:
+            continue
+        if pattern.search(response):
+            log.warning(
+                "Dropped [%s] cross-workspace marker from collaborative "
+                "response by [%s]",
+                label,
+                agent_name,
+            )
+            response = pattern.sub("", response)
+
+    # Continuous/update-plan token grammars include paired blocks and quote
+    # variants that are deliberately broader than the legacy regex aliases.
+    response = strip_control_tokens_for_user(response)
+
+    lifecycle = parse_lifecycle_macros(response)
+    if lifecycle:
+        log.warning(
+            "Dropped %d lifecycle marker(s) from collaborative response by [%s]",
+            len(lifecycle),
+            agent_name,
+        )
+        response = substitute_lifecycle_macros(
+            response,
+            {item.span: "" for item in lifecycle},
+        )
+
+    if continuous_requested:
+        refusal = STRINGS["collab_continuous_hq_only"]
+        response = "%s\n\n%s" % (response.strip(), refusal) if response.strip() else refusal
+    return re.sub(r"\n{3,}", "\n\n", response).strip()
 import config as _config
-from config_updates import apply_env_updates, parse_direct_env_updates
+from config_command_service import ConfigCommandService
 from config import WORKSPACE
 from scheduler import add_reminder, add_task as _timed_add_task
 from i18n import STRINGS
@@ -128,12 +189,58 @@ from updater import (
     restart_service,
 )
 from collaborative import CollabStore, CollabWorkspace
+from execution_policy import EXECUTIVE_INVOCATION, SYSTEM_INVOCATION
+from messaging.base import ChatRef, PlatformMessage
+from task_scope import TaskScope, attach_scope
 from voice import is_available as voice_available, transcribe_voice
 
 log = logging.getLogger("robyx.handlers")
 
 
 _background_tasks: set[asyncio.Task] = set()
+
+
+def _message_chat_ref(platform, msg) -> ChatRef:
+    """Return the unambiguous chat identity for an incoming message.
+
+    Legacy Telegram callers still provide a numeric ``chat_id``.  Discord
+    messages provide the canonical, serialisable ``"<guild>:<channel>"``
+    string.  Resolve the adapter from its module in production and fall back
+    to the canonical encoding for lightweight test doubles.
+
+    Keeping this conversion at the handler boundary avoids teaching
+    ``CollabStore`` to guess that arbitrary raw strings belong to a platform;
+    its backwards-compatible raw-id path intentionally assumes Telegram.
+    """
+    adapter = type(platform).__module__.rsplit(".", 1)[-1].lower()
+    if adapter not in {"telegram", "discord", "slack"}:
+        raw = str(msg.chat_id)
+        if re.fullmatch(r"\d+:\d+", raw):
+            adapter = "discord"
+        elif re.fullmatch(r"T[A-Z0-9]+:[A-Z][A-Z0-9]+", raw):
+            adapter = "slack"
+        elif re.fullmatch(r"[CDG][A-Z0-9]+", raw):
+            # Lightweight Slack test doubles and legacy callbacks may carry
+            # the native channel id before team/channel canonicalisation.
+            adapter = "slack"
+        else:
+            adapter = "telegram"
+    chat_id = str(msg.chat_id)
+    if adapter == "slack" and ":" not in chat_id:
+        team_id = getattr(platform, "team_id", None)
+        if isinstance(team_id, (str, int)) and str(team_id).strip():
+            chat_id = "%s:%s" % (team_id, chat_id)
+    return ChatRef(platform=adapter, chat_id=chat_id)
+
+
+def _native_delivery_chat_id(chat_ref: ChatRef):
+    """Translate a canonical chat identity to an adapter delivery target."""
+    if chat_ref.platform == "discord":
+        from collaborative import parse_discord_chat_id
+
+        _, channel_id = parse_discord_chat_id(chat_ref.chat_id)
+        return channel_id
+    return chat_ref.chat_id
 
 
 def _spawn_tracked(coro, *, name: str | None = None) -> asyncio.Task:
@@ -204,6 +311,89 @@ def owner_only(func):
 def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: CollabStore | None = None):
     """Return all handler functions bound to a given AgentManager and AI backend."""
 
+    config_commands = ConfigCommandService(
+        project_root=lambda: _config.PROJECT_ROOT,
+        restart_service=lambda: restart_service(),
+        strings=STRINGS,
+        logger=log,
+    )
+
+    def _is_known_destination(platform, msg) -> bool:
+        """Return whether a standard command/message may run here.
+
+        Collaborative chats are registered explicitly.  Ordinary Robyx and
+        workspace traffic must remain inside the configured control surface;
+        in particular Telegram topic identifiers are scoped to a chat and can
+        collide across unrelated groups, so a matching ``thread_id`` alone is
+        never sufficient there.
+        """
+        chat_ref = _message_chat_ref(platform, msg)
+        if collab_store is not None and collab_store.get_by_chat_id(chat_ref):
+            return True
+
+        if chat_ref.platform == "telegram":
+            configured_chat = getattr(_config, "CHAT_ID", None)
+            return (
+                configured_chat is not None
+                and str(msg.chat_id) == str(configured_chat)
+            )
+
+        if platform.is_main_thread(msg.chat_id, msg.thread_id):
+            return True
+        route_id = msg.thread_id if msg.thread_id is not None else msg.chat_id
+        return manager.get_by_thread(route_id) is not None
+
+    def _known_destination_only(func):
+        """Fail closed before standard handlers inspect a foreign chat."""
+        @functools.wraps(func)
+        async def wrapper(platform, msg, msg_ref):
+            if not _is_known_destination(platform, msg):
+                log.warning(
+                    "Rejected message from unregistered destination: "
+                    "chat=%s thread=%s user=%s",
+                    msg.chat_id,
+                    msg.thread_id,
+                    msg.user_id,
+                )
+                await platform.reply(msg_ref, STRINGS["unauthorized"])
+                return
+            return await func(platform, msg, msg_ref)
+
+        return wrapper
+
+    def _maintenance_command_only(func):
+        """Run a command/message under a shared lease; doupdate opts out."""
+        @functools.wraps(func)
+        async def wrapper(platform, msg, msg_ref):
+            try:
+                async with get_maintenance_gate().shared():
+                    return await func(platform, msg, msg_ref)
+            except MaintenanceActiveError:
+                await platform.reply(msg_ref, MAINTENANCE_MESSAGE)
+
+        return wrapper
+
+    def _maintenance_event_only(func):
+        """Defer gateway events to the updater's final data tree, never drop."""
+        @functools.wraps(func)
+        async def wrapper(platform, event):
+            gate = get_maintenance_gate()
+
+            async def _run_with_lease():
+                async with gate.shared():
+                    return await func(platform, event)
+
+            try:
+                return await _run_with_lease()
+            except MaintenanceActiveError:
+                log.info(
+                    "Deferred %s until update transaction finalisation",
+                    func.__name__,
+                )
+                return await gate.defer(_run_with_lease)
+
+        return wrapper
+
     @owner_only
     async def cmd_help(platform, msg, msg_ref):
         focus_info = ""
@@ -272,6 +462,99 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         else:
             await platform.reply(msg_ref, STRINGS["agent_not_found"] % name)
 
+    async def _direct_lifecycle_command(action, platform, msg, msg_ref):
+        try:
+            async with get_maintenance_gate().shared():
+                return await _direct_lifecycle_command_leased(
+                    action,
+                    platform,
+                    msg,
+                    msg_ref,
+                )
+        except MaintenanceActiveError:
+            await platform.reply(msg_ref, MAINTENANCE_MESSAGE)
+
+    async def _direct_lifecycle_command_leased(action, platform, msg, msg_ref):
+        """Dispatch a slash lifecycle command through the macro engine.
+
+        This is deliberately the same authoritative implementation used for
+        AI-emitted lifecycle macros. External collaborative chats are excluded
+        until task identity persists a canonical ChatRef; allowing the legacy
+        ``thread_id=None`` scope would cross tenant boundaries.
+        """
+        if len(msg.args or []) != 1:
+            await platform.reply(
+                msg_ref,
+                STRINGS["lifecycle_command_usage"] % action,
+            )
+            return
+        name = str(msg.args[0]).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name):
+            await platform.reply(
+                msg_ref,
+                STRINGS["lifecycle_command_usage"] % action,
+            )
+            return
+
+        if collab_store is not None and collab_store.get_by_chat_id(
+            _message_chat_ref(platform, msg),
+        ):
+            await platform.reply(
+                msg_ref,
+                STRINGS["continuous_task_error_permission_denied"],
+            )
+            return
+
+        route_id = msg.thread_id if msg.thread_id is not None else msg.chat_id
+        parent = manager.get_by_thread(route_id)
+        if parent is None or parent.name == "robyx":
+            await platform.reply(msg_ref, STRINGS["unmapped_topic"])
+            return
+
+        macro_names = {
+            "stop": "STOP_TASK",
+            "resume": "RESUME_TASK",
+            "complete": "COMPLETE_TASK",
+            "delete": "DELETE_TASK",
+        }
+        source = '[%s name="%s"]' % (macro_names[action], name)
+        invocations = parse_lifecycle_macros(source)
+        substitutions = await handle_lifecycle_macros(
+            invocations,
+            LifecycleDispatchContext(
+                chat_id=msg.chat_id,
+                thread_id=msg.thread_id,
+                task_scope=TaskScope.from_chat_ref(
+                    _message_chat_ref(platform, msg),
+                    msg.thread_id,
+                ),
+                platform=platform,
+                manager=manager,
+                user_message=source,
+            ),
+        )
+        await platform.reply(
+            msg_ref,
+            substitute_lifecycle_macros(source, substitutions),
+            parse_mode="markdown",
+        )
+
+    @owner_only
+    async def cmd_stop(platform, msg, msg_ref):
+        await _direct_lifecycle_command("stop", platform, msg, msg_ref)
+
+    @owner_only
+    async def cmd_resume(platform, msg, msg_ref):
+        await _direct_lifecycle_command("resume", platform, msg, msg_ref)
+
+    @owner_only
+    async def cmd_complete(platform, msg, msg_ref):
+        await _direct_lifecycle_command("complete", platform, msg, msg_ref)
+
+    @owner_only
+    async def cmd_delete(platform, msg, msg_ref):
+        await _direct_lifecycle_command("delete", platform, msg, msg_ref)
+
     async def cmd_clear(platform, msg, msg_ref):
         """Spec 007.1 — archive the current conversation as a markdown
         file and reset the agent's AI-CLI session.
@@ -297,7 +580,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         # Resolve the collab workspace (if any) early — used for agent
         # fallback AND for the authorisation branch.
         if collab_store is not None:
-            collab_ws = collab_store.get_by_chat_id(msg.chat_id)
+            collab_ws = collab_store.get_by_chat_id(
+                _message_chat_ref(platform, msg),
+            )
         else:
             collab_ws = None
 
@@ -503,12 +788,12 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
     @owner_only
     async def cmd_doupdate(platform, msg, msg_ref):
         sent_ref = await platform.reply(msg_ref, STRINGS["update_checking_manual"])
+        force = bool(msg.args and msg.args[0] == "force")
 
         # Check for busy agents
         busy_agents = [a for a in manager.list_active() if a.busy]
         if busy_agents:
             names = ", ".join("*%s*" % a.name for a in busy_agents)
-            force = msg.args and msg.args[0] == "force"
             if not force:
                 await platform.edit_message(
                     sent_ref,
@@ -529,7 +814,6 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             (t["name"], t["_pid"]) for t in await get_running_tasks()
         ]
         if running_tasks:
-            force = msg.args and msg.args[0] == "force"
             task_list = ", ".join("*%s* (PID %d)" % (n, p) for n, p in running_tasks)
             if not force:
                 await platform.edit_message(
@@ -572,7 +856,12 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             except Exception:
                 pass
 
-        success, result = await apply_update(version, notify_fn=notify_progress, manager=manager)
+        success, result = await apply_update(
+            version,
+            notify_fn=notify_progress,
+            manager=manager,
+            force=force,
+        )
 
         if success:
             await platform.edit_message(
@@ -589,7 +878,30 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             )
 
     async def _process_and_send(
-        agent, message, chat_id, platform, thread_id=None, *, is_executive=True,
+        agent, message, chat_id, platform, thread_id=None, *,
+        security_context, chat_ref=None,
+    ):
+        try:
+            async with get_maintenance_gate().shared():
+                return await _process_and_send_leased(
+                    agent,
+                    message,
+                    chat_id,
+                    platform,
+                    thread_id=thread_id,
+                    security_context=security_context,
+                    chat_ref=chat_ref,
+                )
+        except MaintenanceActiveError:
+            await platform.send_message(
+                chat_id=chat_id,
+                text=MAINTENANCE_MESSAGE,
+                thread_id=thread_id,
+            )
+
+    async def _process_and_send_leased(
+        agent, message, chat_id, platform, thread_id=None, *,
+        security_context, chat_ref=None,
     ):
         stop_typing = asyncio.Event()
 
@@ -610,11 +922,21 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
         typing_task = asyncio.create_task(_typing_loop())
         try:
+            task_scope = (
+                TaskScope.from_chat_ref(chat_ref, thread_id)
+                if chat_ref is not None
+                else None
+            )
             is_robyx = agent.name == "robyx"
             response = await invoke_ai(
-                agent, message, chat_id, platform, manager, backend, is_robyx, thread_id=thread_id,
+                agent, message, chat_id, platform, manager, backend, is_robyx,
+                thread_id=thread_id, security_context=security_context,
             )
-            manager.save_state()
+            # Participant turns are stateless and must not rewrite the
+            # executive agent/session record. Privileged invocation retains
+            # the existing eager persistence behaviour.
+            if security_context.may_dispatch_side_effects:
+                manager.save_state()
 
             # None means the agent was interrupted — skip sending, the
             # user's new message will be processed as a fresh invocation.
@@ -627,10 +949,16 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             # The agent is *told* not to emit these in non-executive context,
             # but a prompt-injection attempt could still slip them through —
             # silently dropping them here closes that gap.
-            if not is_executive:
+            if not security_context.may_dispatch_side_effects:
                 response = _strip_executive_markers(response, agent.name)
                 needs_restart = False
             else:
+                if agent.collab_workspace_id:
+                    response = _strip_collab_cross_workspace_markers(
+                        response,
+                        agent.name,
+                    )
+
                 # Handle AI-generated commands
                 response = await handle_focus_commands(
                     response, chat_id, platform, manager, thread_id=thread_id,
@@ -654,6 +982,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                         chat_id=chat_id,
                         platform=platform,
                         manager=manager,
+                        task_scope=task_scope,
                         is_executive=True,
                     ),
                 )
@@ -668,6 +997,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                     UpdatePlanContext(
                         thread_id=thread_id,
                         chat_id=chat_id,
+                        task_scope=task_scope,
                         manager=manager,
                         platform=platform,
                     ),
@@ -685,6 +1015,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                         LifecycleDispatchContext(
                             chat_id=chat_id,
                             thread_id=thread_id,
+                            task_scope=task_scope,
                             platform=platform,
                             manager=manager,
                             user_message=message,
@@ -709,7 +1040,13 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                     response = await handle_delegations(
                         response, chat_id, platform, manager, backend, thread_id=thread_id,
                     )
-                    response = await _handle_workspace_commands(response, chat_id, platform, thread_id)
+                    response = await _handle_workspace_commands(
+                        response,
+                        chat_id,
+                        platform,
+                        thread_id,
+                        task_scope=task_scope,
+                    )
                     response = await _handle_collab_announce(response, chat_id, platform, thread_id)
                     response = await _handle_collab_send(response, chat_id, platform)
                 else:
@@ -741,7 +1078,13 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 )
 
                 # Schedule any [REMIND ...] requests into the reminder engine.
-                response = _handle_remind_commands(response, agent, chat_id, thread_id)
+                response = _handle_remind_commands(
+                    response,
+                    agent,
+                    chat_id,
+                    thread_id,
+                    task_scope=task_scope,
+                )
 
             # Strip TTS summary blocks — redundant recap not useful on chat.
             response = TTS_SUMMARY_PATTERN.sub("", response).strip()
@@ -1035,7 +1378,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             )
             try:
                 await platform.send_message(
-                    chat_id=collab_ws.chat_id,
+                    chat_id=_native_delivery_chat_id(collab_ws.chat_ref),
                     text=STRINGS["collab_setup_failed_group"],
                     parse_mode="markdown",
                 )
@@ -1135,8 +1478,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 continue
 
             try:
+                delivery_chat_id = _native_delivery_chat_id(ws.chat_ref)
                 await platform.send_message(
-                    chat_id=ws.chat_id,
+                    chat_id=delivery_chat_id,
                     text=text,
                     thread_id=None,
                 )
@@ -1476,7 +1820,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
         return stripped
 
-    async def _handle_workspace_commands(response, chat_id, platform, thread_id):
+    async def _handle_workspace_commands(
+        response, chat_id, platform, thread_id, *, task_scope=None,
+    ):
         """Parse and execute workspace/specialist creation/closure commands from Robyx."""
         # Handle CREATE_WORKSPACE (supports multiple in one response)
         ws_matches = list(CREATE_WORKSPACE_PATTERN.finditer(response))
@@ -1519,6 +1865,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                         work_dir=str(WORKSPACE),
                         platform=platform,
                         backend=ws_backend,
+                        workspace_scope=task_scope,
                     )
                 except ValueError as e:
                     # Reserved name / duplicate name — surface the reason
@@ -1706,7 +2053,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
     def _queue_action_reminder(
         attrs: dict, text: str, fire_at, target_agent_name: str,
-        target_thread, agent, now,
+        target_thread, agent, now, task_scope=None,
     ) -> str | None:
         """Queue an action-mode reminder into the timed task queue.
 
@@ -1743,8 +2090,15 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             "created_at": now.isoformat(),
             "source": "remind",
         }
+        target_scope = None
+        if task_scope is not None:
+            target_scope = task_scope.for_parent_channel(target_thread)
+            attach_scope(
+                task_entry,
+                target_scope,
+            )
         try:
-            _timed_add_task(task_entry)
+            _timed_add_task(task_entry, scope=target_scope)
             log.info(
                 "REMIND action queued: id=%s fire_at=%s target=@%s "
                 "thread=%s prompt=%r (from=%s)",
@@ -1758,6 +2112,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
     def _queue_text_reminder(
         text: str, fire_at, chat_id, target_thread, agent, now,
+        task_scope=None,
     ) -> str | None:
         """Queue a text-mode reminder into the unified queue.
 
@@ -1772,8 +2127,19 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             "created_at": now.isoformat(),
             "status": "pending",
         }
+        reminder_scope = None
+        if task_scope is not None:
+            reminder_scope = TaskScope(
+                task_scope.platform,
+                task_scope.chat_id,
+                target_thread,
+            )
+            attach_scope(
+                entry,
+                reminder_scope,
+            )
         try:
-            add_reminder(entry)
+            add_reminder(entry, scope=reminder_scope)
             log.info(
                 "REMIND queued: id=%s fire_at=%s thread=%s text=%r (agent=%s)",
                 entry["id"], entry["fire_at"], target_thread,
@@ -1784,7 +2150,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             return "Reminder could not be saved: %s" % e
         return None
 
-    def _handle_remind_commands(response, agent, chat_id, thread_id):
+    def _handle_remind_commands(
+        response, agent, chat_id, thread_id, *, task_scope=None,
+    ):
         """Parse and queue ``[REMIND ...]`` requests from an agent response.
 
         Single dispatch path: parse every match, validate ``text`` and
@@ -1833,13 +2201,14 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                     target_thread = thread_id
                 err = _queue_action_reminder(
                     attrs, text, fire_at, target_agent_name,
-                    target_thread, agent, now,
+                    target_thread, agent, now, task_scope,
                 )
             else:
                 if target_thread is None:
                     target_thread = thread_id
                 err = _queue_text_reminder(
                     text, fire_at, chat_id, target_thread, agent, now,
+                    task_scope,
                 )
             if err:
                 errors.append(err)
@@ -1899,10 +2268,50 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 except Exception:
                     pass
 
-    @owner_only
     async def handle_voice(platform, msg, msg_ref):
         if not msg.voice_file_id:
             return
+
+        # Voice must cross the same authorization boundary as text.  The old
+        # ``@owner_only`` wrapper rejected legitimate collaborative users and,
+        # more importantly, the post-transcription call to
+        # ``_route_and_process`` always selected the executive invocation
+        # profile. Resolve collaborative identity before downloading anything;
+        # standalone chats retain the historical global-owner restriction.
+        collab_ws = None
+        if collab_store is not None:
+            collab_ws = collab_store.get_by_chat_id(
+                _message_chat_ref(platform, msg),
+            )
+        if collab_ws is None and not platform.is_owner(msg.user_id):
+            log.warning("Rejected non-owner voice message: user=%s", msg.user_id)
+            await platform.reply(msg_ref, STRINGS["unauthorized"])
+            return
+
+        # Do not pay the download/transcription cost for a turn that the AI
+        # boundary is guaranteed to reject. Unknown collaborative members use
+        # the same in-memory PARTICIPANT default as the text path; the global
+        # owner and persisted operators remain executive. The transcript still
+        # re-enters ``handle_message`` below for the authoritative routing
+        # decision when participant access is explicitly enabled.
+        if collab_ws is not None:
+            from authorization import get_user_role
+            from collaborative import Role
+
+            voice_role, _ = get_user_role(
+                msg.user_id,
+                _message_chat_ref(platform, msg),
+                collab_store,
+                owner_id=getattr(_config, "OWNER_ID", None),
+            )
+            voice_role = voice_role or Role.PARTICIPANT
+            if (
+                voice_role is Role.PARTICIPANT
+                and getattr(_config, "COLLAB_PARTICIPANT_POLICY", "disabled")
+                == "disabled"
+            ):
+                await platform.reply(msg_ref, STRINGS["collab_participant_disabled"])
+                return
 
         # Early check: if Whisper is not configured, tell the user immediately
         if not voice_available():
@@ -1934,7 +2343,20 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             parse_mode="markdown",
         )
 
-        await _route_and_process(platform, msg, msg_ref, text)
+        # Re-enter the ordinary message boundary with the transcript. This
+        # preserves local-only secret interception and derives the typed
+        # participant/operator/owner execution profile from the collaborative
+        # role instead of granting voice turns implicit executive authority.
+        transcribed_msg = PlatformMessage(
+            user_id=msg.user_id,
+            chat_id=msg.chat_id,
+            text=text,
+            thread_id=msg.thread_id,
+            command=None,
+            args=list(getattr(msg, "args", None) or []),
+            user_name=getattr(msg, "user_name", None),
+        )
+        await handle_message(platform, transcribed_msg, msg_ref)
 
     async def _route_and_process(platform, msg, msg_ref, text):
         """Resolve which agent should handle *text* and dispatch.
@@ -1977,18 +2399,51 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             await platform.reply(msg_ref, STRINGS["empty_message"])
             return
 
-        await _process_and_send(agent, message, chat_id, platform, thread_id=thread_id)
+        await _process_and_send(
+            agent, message, chat_id, platform, thread_id=thread_id,
+            security_context=EXECUTIVE_INVOCATION,
+            chat_ref=_message_chat_ref(platform, msg),
+        )
 
     async def handle_message(platform, msg, msg_ref):
         text = msg.text
         if not text:
             return
 
+        # Credential, authority and sandbox assignments are local-only. This
+        # guard runs before collaborative routing and logs only the key name,
+        # never the supplied value. Collaborative lanes also reject the
+        # otherwise owner-HQ-editable OPENAI_API_KEY.
+        if await config_commands.reject_sensitive_assignment(
+            text,
+            platform,
+            msg_ref,
+        ):
+            return
+
         # ── Collaborative workspace messages bypass owner_only ──
         if collab_store is not None:
-            collab_ws = collab_store.get_by_chat_id(msg.chat_id)
+            collab_ws = collab_store.get_by_chat_id(
+                _message_chat_ref(platform, msg),
+            )
             if collab_ws:
-                await _handle_collaborative_message(platform, msg, msg_ref, collab_ws)
+                if await config_commands.reject_sensitive_assignment(
+                    text,
+                    platform,
+                    msg_ref,
+                    include_chat_secrets=True,
+                ):
+                    return
+                try:
+                    async with get_maintenance_gate().shared():
+                        await _handle_collaborative_message(
+                            platform,
+                            msg,
+                            msg_ref,
+                            collab_ws,
+                        )
+                except MaintenanceActiveError:
+                    await platform.reply(msg_ref, MAINTENANCE_MESSAGE)
                 return
 
         # ── Standard HQ path: owner_only ──
@@ -2002,39 +2457,24 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             await cmd_help(platform, msg, msg_ref)
             return
 
-        direct_updates = parse_direct_env_updates(text)
-        if direct_updates:
-            keys = ", ".join("`%s`" % key for key in direct_updates)
-            try:
-                apply_env_updates(_config.PROJECT_ROOT / ".env", direct_updates)
-            except Exception as e:
-                log.error(
-                    "Direct config update failed for keys [%s]: %s",
-                    ", ".join(sorted(direct_updates)),
-                    e,
-                    exc_info=True,
-                )
-                await _safe_send(
-                    platform,
-                    msg.chat_id,
-                    STRINGS["ai_error"] % str(e),
-                    thread_id=msg.thread_id,
-                )
-                return
+        # Platform runners route unknown slash commands through this handler
+        # so they are never silently dropped. Collaborative commands were
+        # intercepted above; remaining slash commands are not AI prompts.
+        if text.lstrip().startswith("/"):
+            await platform.reply(msg_ref, STRINGS["unknown_command"])
+            return
 
-            log.info("Applied direct config update for keys: %s", ", ".join(sorted(direct_updates)))
-            await platform.reply(
-                msg_ref,
-                STRINGS["config_updated"] % keys,
-                parse_mode="markdown",
-            )
-            await platform.send_message(
-                chat_id=msg.chat_id,
-                text=STRINGS["restart_pending"],
-                thread_id=msg.thread_id,
-                parse_mode="markdown",
-            )
-            restart_service()
+        try:
+            async with get_maintenance_gate().shared():
+                if await config_commands.handle_owner_update(
+                    text,
+                    platform,
+                    msg,
+                    msg_ref,
+                ):
+                    return
+        except MaintenanceActiveError:
+            await platform.reply(msg_ref, MAINTENANCE_MESSAGE)
             return
 
         log.info(
@@ -2065,7 +2505,10 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         Lifecycle commands (/promote, /demote, /role, /mode, /close) are
         intercepted here before reaching the AI agent.
         """
-        from authorization import get_user_role, can_send_executive, can_manage_roles
+        from authorization import (
+            get_user_role,
+            invocation_context_for_role,
+        )
         from collaborative import Role
 
         # OWNER_ID is None when unconfigured: pass through as-is so that
@@ -2075,7 +2518,8 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         owner_id = getattr(_config, "OWNER_ID", None)
 
         role, _ = get_user_role(
-            msg.user_id, msg.chat_id, collab_store, owner_id=owner_id,
+            msg.user_id, _message_chat_ref(platform, msg), collab_store,
+            owner_id=owner_id,
         )
 
         # Unknown senders default to PARTICIPANT in-memory only — we trust
@@ -2108,7 +2552,12 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             return
 
         user_display = msg.user_name or str(msg.user_id)
-        is_executive = can_send_executive(role)
+        security_context = invocation_context_for_role(
+            role,
+            actor_id=msg.user_id,
+            collab_workspace_id=collab_ws.id,
+        )
+        is_executive = security_context.may_dispatch_side_effects
 
         # Passive mode: respond only to explicit @bot mentions or to
         # messages from executive users (owner/operator). When the
@@ -2142,7 +2591,8 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
         await _process_and_send(
             agent, formatted_text, msg.chat_id, platform,
-            thread_id=msg.thread_id, is_executive=is_executive,
+            thread_id=msg.thread_id, security_context=security_context,
+            chat_ref=_message_chat_ref(platform, msg),
         )
 
     async def _handle_collab_command(platform, msg, msg_ref, collab_ws, role):
@@ -2386,10 +2836,13 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
                 "Could not read agent file for %s: %s", ws.agent_name, e,
             )
 
-        # Send welcome message in the new group — references purpose.
+        # Discord persists ``guild:channel`` but discord.py sends to the
+        # numeric channel id. Lifecycle messages have no incoming thread id
+        # from which the adapter could otherwise derive that destination.
+        delivery_chat_id = _native_delivery_chat_id(chat_ref)
         try:
             await platform.send_message(
-                chat_id=chat_id,
+                chat_id=delivery_chat_id,
                 text=STRINGS["collab_welcome_pending"] % (
                     ws.display_name, purpose,
                 ),
@@ -2513,25 +2966,26 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             )
             return
 
-        # Build the canonical Discord chat_id. The on_message adapter
-        # path sets ``msg.chat_id = guild.id`` and ``msg.thread_id =
-        # channel.id``; the workspace is bound to the channel where the
-        # ``/im-the-owner`` message was posted.
-        from collaborative import make_discord_chat_id
-        from messaging.base import ChatRef
-        guild_id = msg.chat_id
-        channel_id = msg.thread_id
-        if guild_id is None or channel_id is None:
+        # The Discord runner supplies the canonical ``guild:channel`` value;
+        # validate it before binding so persistence and subsequent lookups
+        # share the same unambiguous identity.
+        from collaborative import parse_discord_chat_id
+
+        chat_ref = _message_chat_ref(platform, msg)
+        if chat_ref.platform != "discord":
             log.warning(
-                "collab.discord.manual_claim: missing guild/channel "
-                "(guild=%s channel=%s) — refusing",
-                guild_id, channel_id,
+                "collab.discord.manual_claim: non-Discord message chat=%s — refusing",
+                msg.chat_id,
             )
             return
-        chat_ref = ChatRef(
-            platform="discord",
-            chat_id=make_discord_chat_id(int(guild_id), int(channel_id)),
-        )
+        try:
+            parse_discord_chat_id(chat_ref.chat_id)
+        except ValueError:
+            log.warning(
+                "collab.discord.manual_claim: malformed canonical chat_id=%r — refusing",
+                chat_ref.chat_id,
+            )
+            return
         if not collab_store.update_chat_id(
             ws.id, chat_ref, expected_creator_id=msg.user_id,
         ):
@@ -2574,6 +3028,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
 
         chat_ref = event.chat_ref
         chat_id = chat_ref.chat_id
+        delivery_chat_id = _native_delivery_chat_id(chat_ref)
         added_by_id = event.added_by_id
         chat_title = event.chat_title or "Unnamed group"
 
@@ -2592,7 +3047,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             )
             try:
                 await platform.send_message(
-                    chat_id=chat_id,
+                    chat_id=delivery_chat_id,
                     text=STRINGS["discord_audit_log_unavailable"],
                     parse_mode="markdown",
                 )
@@ -2613,7 +3068,7 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             )
             try:
                 await platform.send_message(
-                    chat_id=chat_id,
+                    chat_id=delivery_chat_id,
                     text=STRINGS["collab_unauthorised_adder"],
                     parse_mode="markdown",
                 )
@@ -2824,8 +3279,9 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
         )
         try:
             await _process_and_send(
-                agent, bootstrap, chat_id, platform,
-                thread_id=None, is_executive=True,
+                agent, bootstrap, delivery_chat_id, platform,
+                thread_id=None, security_context=SYSTEM_INVOCATION,
+                chat_ref=chat_ref,
             )
         except Exception as e:
             log.error("Flow-B bootstrap AI turn failed for %s: %s", ws_id, e, exc_info=True)
@@ -2975,19 +3431,23 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
             return Role.PARTICIPANT
 
     result = {
-        "start": cmd_help,
-        "help": cmd_help,
-        "workspaces": cmd_workspaces,
-        "specialists": cmd_specialists,
-        "status": cmd_status,
-        "reset": cmd_reset,
-        "clear": cmd_clear,
-        "focus": cmd_focus,
-        "ping": cmd_ping,
-        "checkupdate": cmd_checkupdate,
-        "doupdate": cmd_doupdate,
-        "voice": handle_voice,
-        "message": handle_message,
+        "start": _known_destination_only(_maintenance_command_only(cmd_help)),
+        "help": _known_destination_only(_maintenance_command_only(cmd_help)),
+        "workspaces": _known_destination_only(_maintenance_command_only(cmd_workspaces)),
+        "specialists": _known_destination_only(_maintenance_command_only(cmd_specialists)),
+        "status": _known_destination_only(_maintenance_command_only(cmd_status)),
+        "reset": _known_destination_only(_maintenance_command_only(cmd_reset)),
+        "clear": _known_destination_only(_maintenance_command_only(cmd_clear)),
+        "focus": _known_destination_only(_maintenance_command_only(cmd_focus)),
+        "ping": _known_destination_only(_maintenance_command_only(cmd_ping)),
+        "checkupdate": _known_destination_only(_maintenance_command_only(cmd_checkupdate)),
+        "doupdate": _known_destination_only(cmd_doupdate),
+        "stop": _known_destination_only(_maintenance_command_only(cmd_stop)),
+        "resume": _known_destination_only(_maintenance_command_only(cmd_resume)),
+        "complete": _known_destination_only(_maintenance_command_only(cmd_complete)),
+        "delete": _known_destination_only(_maintenance_command_only(cmd_delete)),
+        "voice": _known_destination_only(_maintenance_command_only(handle_voice)),
+        "message": _known_destination_only(_maintenance_command_only(handle_message)),
     }
 
     # Spec 006 — [GET_EVENTS] handler is always exposed; it has no
@@ -2997,15 +3457,15 @@ def make_handlers(manager: AgentManager, backend: AIBackend, collab_store: Colla
     result["_handle_get_archive"] = _handle_get_archive
 
     if collab_store is not None:
-        result["collab_bot_added"] = collab_bot_added
-        result["collab_bot_removed"] = collab_bot_removed
-        result["collab_bot_migrated"] = collab_bot_migrated
+        result["collab_bot_added"] = _maintenance_event_only(collab_bot_added)
+        result["collab_bot_removed"] = _maintenance_event_only(collab_bot_removed)
+        result["collab_bot_migrated"] = _maintenance_event_only(collab_bot_migrated)
         # Spec 007 — Discord audit-log fallback. Exposed via the same
         # command dispatcher as cmd_help / cmd_status so it surfaces as
         # ``/im-the-owner`` on Discord (and on Slack post-spec-008).
         # Keyed with the hyphenated form to match the COMMANDS tuple in
         # ``_run_discord``.
-        result["im-the-owner"] = _handle_im_the_owner
+        result["im-the-owner"] = _maintenance_command_only(_handle_im_the_owner)
         # Exposed for unit tests; stable internal API, not user commands.
         result["_handle_collab_announce"] = _handle_collab_announce
         result["_handle_collab_setup_complete"] = _handle_collab_setup_complete

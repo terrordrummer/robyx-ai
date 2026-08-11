@@ -16,9 +16,12 @@ import platform
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tarfile
+import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,10 +30,16 @@ from packaging.version import Version
 from config import (
     DATA_DIR,
     PROJECT_ROOT,
-    RELEASES_DIR,
     UPDATES_STATE_FILE,
     VERSION_FILE,
 )
+from dependency_locks import (
+    DependencyLockError,
+    dependency_fingerprint,
+    dependency_lock_path,
+)
+from maintenance import MaintenanceBusyError, get_maintenance_gate
+from runtime_supervisor import get_runtime_supervisor
 from session_lifecycle import invalidate_sessions_via_manager
 
 log = logging.getLogger("robyx.updater")
@@ -86,12 +95,240 @@ _CHILD_ENV_SCRUB = frozenset({
     "ANTHROPIC_API_KEY",
 })
 
+_SENSITIVE_ENV_NAME = re.compile(
+    r"(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL)",
+    re.IGNORECASE,
+)
+_URL_CREDENTIAL_ENV = frozenset({
+    "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+})
+_MIGRATION_ENV_NAMES = frozenset({
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "SHELL",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "WINDIR",
+    "PATHEXT",
+    "COMSPEC",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+})
+
 
 def _scrubbed_child_env() -> dict[str, str]:
     """Return a copy of ``os.environ`` with platform tokens / AI provider
     keys removed. Used as the ``env=`` argument when spawning pip or
     migration steps during ``apply_update``."""
-    return {k: v for k, v in os.environ.items() if k not in _CHILD_ENV_SCRUB}
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _CHILD_ENV_SCRUB
+        and not (
+            _SENSITIVE_ENV_NAME.search(key)
+            and key not in _URL_CREDENTIAL_ENV
+        )
+    }
+
+
+def _migration_child_env() -> dict[str, str]:
+    """Return the minimum operational environment for release migrations.
+
+    Unlike pip, migrations do not need index/proxy configuration.  Keeping an
+    allowlist prevents an author-controlled migration command from reading
+    unrelated bot credentials or newly-added secret variables.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key in _MIGRATION_ENV_NAMES or key.startswith("LC_")
+    }
+
+
+def _redact_sensitive_text(value: object) -> str:
+    """Redact inherited credentials and common inline secret forms."""
+    text = str(value)
+    for key, secret in os.environ.items():
+        if not secret:
+            continue
+        if _SENSITIVE_ENV_NAME.search(key) or key in _URL_CREDENTIAL_ENV:
+            text = text.replace(secret, "[REDACTED]")
+        if key in _URL_CREDENTIAL_ENV:
+            userinfo = re.match(
+                r"(?i)[a-z][a-z0-9+.-]*://([^/@\s]+)@",
+                secret,
+            )
+            if userinfo:
+                for credential_part in userinfo.group(1).split(":"):
+                    if credential_part:
+                        text = text.replace(credential_part, "[REDACTED]")
+    # Credentials embedded in a URL may not be present in the current env.
+    text = re.sub(
+        r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@",
+        r"\1[REDACTED]@",
+        text,
+    )
+    # Also cover diagnostics such as ``token=...`` and ``password: ...``.
+    text = re.sub(
+        r"(?i)\b(token|secret|password|passwd|api[_-]?key|credential)"
+        r"\s*[:=]\s*[^\s,;]+",
+        lambda match: "%s=[REDACTED]" % match.group(1),
+        text,
+    )
+    return text
+
+
+def _safe_diagnostic_tail(value: object, *, max_chars: int = 1600) -> str:
+    """Return a bounded, redacted diagnostic tail safe for chat/history."""
+    return _redact_sensitive_text(value)[-max_chars:]
+
+
+def _is_real_async_process(proc: asyncio.subprocess.Process) -> bool:
+    """Distinguish real children from lightweight subprocess test doubles."""
+    return isinstance(getattr(proc, "pid", None), int) and proc.pid > 1
+
+
+def _track_update_child(proc: asyncio.subprocess.Process, owner: str) -> bool:
+    """Register an isolated updater child immediately after its spawn."""
+    if not _is_real_async_process(proc):
+        return False
+    get_runtime_supervisor().track_process(
+        proc,
+        owner="update:%s" % owner,
+        process_group=sys.platform != "win32",
+    )
+    return True
+
+
+async def _await_cleanup_uninterruptibly(task: asyncio.Task):
+    """Finish mandatory child/rollback cleanup despite caller cancellation."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
+
+
+async def _terminate_update_child(
+    proc: asyncio.subprocess.Process,
+    *,
+    tracked: bool,
+) -> None:
+    """Terminate a child tree, await leader reap, and retain orphan evidence."""
+    if tracked:
+        cleanup = asyncio.create_task(
+            get_runtime_supervisor().terminate_process(proc, grace_seconds=2.0),
+        )
+        await _await_cleanup_uninterruptibly(cleanup)
+        return
+
+    # Compatibility path for subprocess test doubles and platforms where a
+    # process could not be registered. Real updater children use the branch
+    # above and therefore receive process-group termination.
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+    wait = getattr(proc, "wait", None)
+    if callable(wait):
+        result = wait()
+        if asyncio.iscoroutine(result):
+            await result
+
+
+async def _communicate_update_child(
+    proc: asyncio.subprocess.Process,
+    *,
+    timeout: float,
+    owner: str,
+    already_tracked: bool = False,
+) -> tuple[bytes, bytes]:
+    """Communicate with an updater child and never leak it on timeout/cancel."""
+    tracked = already_tracked
+    if not tracked:
+        try:
+            tracked = _track_update_child(proc, owner)
+        except BaseException:
+            # ``track_process`` can reject during concurrent shutdown after it
+            # has registered/signalled the child. Finish that termination
+            # before propagating the shutdown/cancellation signal.
+            await _terminate_update_child(
+                proc,
+                tracked=_is_real_async_process(proc),
+            )
+            raise
+    try:
+        result = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except BaseException:
+        await _terminate_update_child(proc, tracked=tracked)
+        raise
+    if tracked:
+        # A clean leader exit is not enough if a descendant kept the captured
+        # group alive. ``untrack_process`` deliberately retains that evidence;
+        # terminate the captured PGID and fail the phase even if cleanup works,
+        # because a child escaped the command's declared lifetime.
+        supervisor = get_runtime_supervisor()
+        if not supervisor.untrack_process(proc):
+            cleanup = asyncio.create_task(
+                supervisor.terminate_process(proc, grace_seconds=2.0),
+            )
+            stopped = await _await_cleanup_uninterruptibly(cleanup)
+            if not stopped:
+                raise RuntimeError(
+                    "%s child left a live descendant process group that "
+                    "could not be terminated" % owner
+                )
+            raise RuntimeError(
+                "%s child left a lingering descendant process group; "
+                "the group was terminated and the update phase was rejected"
+                % owner
+            )
+    return result
+
+
+async def _spawn_update_child(
+    *argv: str,
+    owner: str,
+    **kwargs,
+) -> tuple[asyncio.subprocess.Process, bool]:
+    """Spawn, isolate, and track a child without a cancellation leak window."""
+    spawn = asyncio.create_task(asyncio.create_subprocess_exec(*argv, **kwargs))
+    try:
+        proc = await asyncio.shield(spawn)
+    except BaseException as spawn_error:
+        # asyncio cancellation can arrive after the OS child exists but before
+        # create_subprocess_exec returns its handle. Shield the spawn, recover
+        # that handle, then terminate/reap it before propagating cancellation.
+        try:
+            proc = await _await_cleanup_uninterruptibly(spawn)
+        except BaseException:
+            raise spawn_error
+        tracked = False
+        try:
+            tracked = _track_update_child(proc, owner)
+        finally:
+            await _terminate_update_child(proc, tracked=tracked)
+        raise spawn_error
+
+    try:
+        tracked = _track_update_child(proc, owner)
+    except BaseException:
+        await _terminate_update_child(
+            proc,
+            tracked=_is_real_async_process(proc),
+        )
+        raise
+    return proc, tracked
 
 
 # ── Pre-update data backup + post-update smoke test ──
@@ -99,6 +336,7 @@ def _scrubbed_child_env() -> dict[str, str]:
 BACKUPS_DIR_NAME = "backups"
 SNAPSHOT_RETENTION = 3
 SNAPSHOT_PREFIX = "pre-update-"
+UPDATE_TRANSACTION_MARKER = "active-update.json"
 
 # Defense-in-depth cap for the restore path (Pass 2 T067 / P2-72). A
 # hostile or accidentally-massive snapshot would otherwise fill the
@@ -106,6 +344,142 @@ SNAPSHOT_PREFIX = "pre-update-"
 # (SQLite memory.db + media cache) with generous headroom while still
 # refusing a zip-bomb-style archive.
 MAX_RESTORE_TOTAL_BYTES = 5 * 1024**3
+
+
+def _data_snapshot_required() -> bool:
+    """Return whether an update must have a verified data snapshot.
+
+    An empty/missing ``data/`` directory has no pre-update runtime state to
+    protect. Everything except the snapshot directory itself is runtime state
+    and therefore makes the snapshot mandatory.
+    """
+    try:
+        for child in DATA_DIR.iterdir():
+            if child.name == BACKUPS_DIR_NAME:
+                continue
+            if child.is_file() or child.is_symlink():
+                return True
+            if child.is_dir() and any(descendant.is_file() or descendant.is_symlink()
+                                      for descendant in child.rglob("*")):
+                return True
+        return False
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # If we cannot inspect runtime state, fail closed by requiring a
+        # snapshot; the snapshot helper will provide the actionable failure.
+        return True
+
+
+def _checkpoint_sqlite_databases() -> tuple[bool, str]:
+    """Checkpoint every runtime SQLite WAL before the filesystem snapshot.
+
+    The maintenance gate guarantees there are no application writers while
+    this runs.  A busy/corrupt/unreadable database aborts the update rather
+    than producing a tarball whose main DB and WAL represent different points
+    in time.
+    """
+    try:
+        databases = sorted(
+            path for path in DATA_DIR.rglob("*.db")
+            if BACKUPS_DIR_NAME not in path.relative_to(DATA_DIR).parts
+        )
+    except (OSError, ValueError) as exc:
+        return False, "could not enumerate SQLite databases: %s" % exc
+
+    for database in databases:
+        try:
+            connection = sqlite3.connect(str(database), timeout=5.0)
+            try:
+                row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if row is not None and int(row[0]) != 0:
+                    return False, "SQLite database remained busy: %s" % database
+            finally:
+                connection.close()
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            return False, "SQLite checkpoint failed for %s: %s" % (database, exc)
+    return True, ""
+
+
+def _write_dependency_marker(marker: Path, fingerprint: str) -> None:
+    """Atomically publish a fingerprint only after pip completed successfully."""
+    fd, temp_name = tempfile.mkstemp(
+        prefix=".%s." % marker.name,
+        suffix=".tmp",
+        dir=str(marker.parent),
+    )
+    temporary = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(fingerprint)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _update_transaction_marker_path() -> Path:
+    return DATA_DIR / BACKUPS_DIR_NAME / UPDATE_TRANSACTION_MARKER
+
+
+def _write_update_transaction_marker(payload: dict) -> None:
+    """Durably record a code/data transaction before its first mutation."""
+    marker = _update_transaction_marker_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(payload, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    fd, temp_name = tempfile.mkstemp(
+        prefix=".%s." % marker.name,
+        suffix=".tmp",
+        dir=str(marker.parent),
+    )
+    temporary = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, marker)
+        try:
+            directory_fd = os.open(marker.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = -1
+        if directory_fd >= 0:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _clear_update_transaction_marker() -> None:
+    marker = _update_transaction_marker_path()
+    marker.unlink(missing_ok=True)
+    try:
+        directory_fd = os.open(marker.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(directory_fd)
 
 
 def _snapshot_data_dir(from_version: str, to_version: str) -> Path | None:
@@ -117,10 +491,8 @@ def _snapshot_data_dir(from_version: str, to_version: str) -> Path | None:
     ``backups/`` subdirectory itself to avoid runaway recursive growth
     across successive updates.
 
-    Returns the snapshot path, or ``None`` on failure (snapshot failure
-    is logged but never blocks the update — better to attempt an
-    unprotected update than to refuse to update because backup is
-    flaky).
+    Returns the snapshot path, or ``None`` on failure.  The caller decides
+    whether a snapshot is mandatory for the specific update.
     """
     backups = DATA_DIR / BACKUPS_DIR_NAME
     try:
@@ -132,6 +504,17 @@ def _snapshot_data_dir(from_version: str, to_version: str) -> Path | None:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     name = "%s%s-to-%s-%s.tar.gz" % (SNAPSHOT_PREFIX, from_version, to_version, ts)
     out = backups / name
+    try:
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=".%s" % SNAPSHOT_PREFIX,
+            suffix=".tmp",
+            dir=str(backups),
+        )
+        os.close(fd)
+        temporary = Path(temporary_name)
+    except OSError as e:
+        log.warning("Cannot create temporary snapshot in %s: %s", backups, e)
+        return None
 
     def _filter(tarinfo):
         rel = tarinfo.name.lstrip("./")
@@ -140,23 +523,75 @@ def _snapshot_data_dir(from_version: str, to_version: str) -> Path | None:
         return tarinfo
 
     try:
-        with tarfile.open(str(out), "w:gz") as tf:
+        with tarfile.open(str(temporary), "w:gz") as tf:
             tf.add(str(DATA_DIR), arcname=".", filter=_filter)
+        os.replace(temporary, out)
     except (OSError, tarfile.TarError) as e:
         log.warning("Snapshot of %s failed: %s", DATA_DIR, e)
         try:
-            out.unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
         except OSError:
             pass
         return None
 
     log.info("Created data/ snapshot: %s", out)
-    _prune_old_snapshots(backups)
     return out
 
 
-def _prune_old_snapshots(backups: Path, keep: int = SNAPSHOT_RETENTION) -> None:
-    """Keep only the most recent *keep* snapshots; best-effort prune."""
+def _verify_snapshot(snapshot: Path) -> tuple[bool, str]:
+    """Fully read and validate a newly-created snapshot.
+
+    Opening a gzip tar is not sufficient: truncation and CRC errors may only
+    surface while member payloads are consumed.  This verification reads every
+    regular member and applies the same path/link/size policy as restore.
+    """
+    if not snapshot.exists() or not snapshot.is_file():
+        return False, "snapshot file is missing"
+    try:
+        archived_files: set[str] = set()
+        with tarfile.open(str(snapshot), "r:gz") as tf:
+            total_uncompressed = 0
+            for member in tf.getmembers():
+                if member.issym() or member.islnk():
+                    return False, "unsafe link member %s" % member.name
+                if member.name.startswith("/") or ".." in Path(member.name).parts:
+                    return False, "unsafe member path %s" % member.name
+                rel = member.name.lstrip("./")
+                if rel == BACKUPS_DIR_NAME or rel.startswith(BACKUPS_DIR_NAME + "/"):
+                    return False, "snapshot recursively contains backups/"
+                total_uncompressed += max(member.size, 0)
+                if total_uncompressed > MAX_RESTORE_TOTAL_BYTES:
+                    return False, "uncompressed size exceeds %d bytes" % MAX_RESTORE_TOTAL_BYTES
+                if member.isfile():
+                    archived_files.add(
+                        member.name[2:] if member.name.startswith("./") else member.name
+                    )
+                    payload = tf.extractfile(member)
+                    if payload is None:
+                        return False, "could not read member %s" % member.name
+                    while payload.read(1024 * 1024):
+                        pass
+        expected_files = {
+            path.relative_to(DATA_DIR).as_posix()
+            for path in DATA_DIR.rglob("*")
+            if BACKUPS_DIR_NAME not in path.relative_to(DATA_DIR).parts
+            and path.is_file()
+        }
+        missing = sorted(expected_files - archived_files)
+        if missing:
+            return False, "snapshot is missing runtime file(s): %s" % ", ".join(missing[:10])
+    except (OSError, tarfile.TarError, EOFError) as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def _prune_old_snapshots(
+    backups: Path,
+    keep: int = SNAPSHOT_RETENTION,
+    *,
+    preserve: Path | None = None,
+) -> None:
+    """Keep the newest snapshots without deleting the active transaction's."""
     try:
         snaps = sorted(
             backups.glob(SNAPSHOT_PREFIX + "*.tar.gz"),
@@ -166,7 +601,9 @@ def _prune_old_snapshots(backups: Path, keep: int = SNAPSHOT_RETENTION) -> None:
         return
     if len(snaps) <= keep:
         return
-    for p in snaps[:-keep]:
+    remove_count = len(snaps) - keep
+    candidates = [p for p in snaps if preserve is None or p != preserve]
+    for p in candidates[:remove_count]:
         try:
             p.unlink()
             log.debug("Pruned old snapshot: %s", p)
@@ -175,17 +612,26 @@ def _prune_old_snapshots(backups: Path, keep: int = SNAPSHOT_RETENTION) -> None:
 
 
 def _restore_data_dir(snapshot: Path) -> bool:
-    """Extract *snapshot* back into ``DATA_DIR`` overwriting any files
-    mutated since the snapshot was taken.
+    """Restore *snapshot* into ``DATA_DIR`` as the authoritative prior state.
 
     The snapshot was created with ``backups/`` excluded, so existing
-    snapshots in ``DATA_DIR/backups/`` are untouched by the restore.
+    snapshots in ``DATA_DIR/backups/`` are untouched by the restore. The
+    archive is fully validated and extracted to a sibling staging directory
+    before current runtime entries are replaced. Files created by a failed
+    migration are therefore removed instead of leaking across rollback.
     Returns ``True`` on success.
     """
     if not snapshot.exists():
         log.error("Cannot restore: snapshot %s missing", snapshot)
         return False
+    staging: Path | None = None
+    previous: Path | None = None
+    displaced_new: Path | None = None
     try:
+        DATA_DIR.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(
+            prefix=".robyx-data-restore-", dir=str(DATA_DIR.parent),
+        ))
         with tarfile.open(str(snapshot), "r:gz") as tf:
             # Validate members before extraction to avoid half-restoring a
             # corrupt archive on top of DATA_DIR. Reject absolute paths,
@@ -222,10 +668,65 @@ def _restore_data_dir(snapshot: Path) -> bool:
                         snapshot, MAX_RESTORE_TOTAL_BYTES,
                     )
                     return False
-            tf.extractall(str(DATA_DIR))
-    except (OSError, tarfile.TarError) as e:
+            if sys.version_info >= (3, 12):
+                tf.extractall(str(staging), filter="data")
+            else:  # pragma: no cover - supported legacy Python path
+                tf.extractall(str(staging))
+
+        # Commit with same-filesystem directory renames. The current data tree
+        # remains intact under ``previous`` until both the staged tree and its
+        # retained backups directory are in place. Any failure before commit
+        # swaps the original tree back instead of deleting the only good copy.
+        previous = Path(tempfile.mkdtemp(
+            prefix=".robyx-data-before-restore-", dir=str(DATA_DIR.parent),
+        ))
+        previous.rmdir()  # reserve a unique absent rename target
+        os.replace(DATA_DIR, previous)
+        try:
+            os.replace(staging, DATA_DIR)
+            staging = None
+
+            old_backups = previous / BACKUPS_DIR_NAME
+            if old_backups.exists():
+                new_backups = DATA_DIR / BACKUPS_DIR_NAME
+                if new_backups.exists():
+                    raise OSError("restored tree unexpectedly contains backups/")
+                os.replace(old_backups, new_backups)
+        except Exception:
+            # Move the staged/new tree aside, then restore the original path.
+            # Keep a unique quarantine if either compensating rename fails so
+            # an operator still has both trees available for manual recovery.
+            if DATA_DIR.exists():
+                displaced_new = Path(tempfile.mkdtemp(
+                    prefix=".robyx-data-failed-restore-", dir=str(DATA_DIR.parent),
+                ))
+                displaced_new.rmdir()
+                os.replace(DATA_DIR, displaced_new)
+            os.replace(previous, DATA_DIR)
+            previous = None
+            raise
+
+        # Commit point: DATA_DIR is the complete snapshot and backups have
+        # their stable public path again. Cleanup failure is non-fatal; the
+        # prior tree is merely left as an explicit recovery quarantine.
+        try:
+            shutil.rmtree(previous)
+            previous = None
+        except OSError as cleanup_error:
+            log.warning(
+                "Restored data but could not remove previous-tree quarantine %s: %s",
+                previous, cleanup_error,
+            )
+    except (OSError, tarfile.TarError, EOFError, ValueError) as e:
         log.error("Restore from %s failed: %s", snapshot, e)
         return False
+    finally:
+        for temporary in (staging, displaced_new):
+            if temporary is not None and temporary.exists():
+                try:
+                    shutil.rmtree(temporary)
+                except OSError:
+                    log.warning("Could not clean restore staging path %s", temporary)
     log.info("Restored data/ from %s", snapshot)
     return True
 
@@ -253,24 +754,31 @@ async def _post_update_smoke_test() -> tuple[bool, str]:
         return False, "venv python not found at %s" % py
 
     bot_py = PROJECT_ROOT / "bot" / "bot.py"
-    proc = await asyncio.create_subprocess_exec(
+    proc, tracked = await _spawn_update_child(
         str(py), str(bot_py), "--smoke-test",
+        owner="smoke-test",
         cwd=str(PROJECT_ROOT),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=sys.platform != "win32",
     )
     smoke_timeout = int(os.environ.get("SMOKE_TEST_TIMEOUT_SECONDS", "60"))
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=smoke_timeout,
+        stdout, stderr = await _communicate_update_child(
+            proc,
+            timeout=smoke_timeout,
+            owner="smoke-test",
+            already_tracked=tracked,
         )
     except asyncio.TimeoutError:
-        proc.kill()
         return False, "smoke test timed out after %ds" % smoke_timeout
 
     if proc.returncode != 0:
         err = (stderr.decode(errors="replace") or stdout.decode(errors="replace")).strip()
-        return False, "bot.py --smoke-test exited %d: %s" % (proc.returncode, err[-500:])
+        return False, "bot.py --smoke-test exited %d: %s" % (
+            proc.returncode,
+            _safe_diagnostic_tail(err, max_chars=500),
+        )
     return True, ""
 
 
@@ -358,17 +866,22 @@ def _parse_release_notes(text: str) -> dict:
 
 async def _git(*args, check=True) -> subprocess.CompletedProcess:
     """Run a git command in the project root without blocking the event loop."""
-    proc = await asyncio.create_subprocess_exec(
+    proc, tracked = await _spawn_update_child(
         "git", *args,
+        owner="git:%s" % (args[0] if args else "command"),
         cwd=str(PROJECT_ROOT),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=sys.platform != "win32",
     )
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=60)
+        stdout_b, stderr_b = await _communicate_update_child(
+            proc,
+            timeout=60,
+            owner="git:%s" % (args[0] if args else "command"),
+            already_tracked=tracked,
+        )
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
         raise subprocess.TimeoutExpired(["git", *args], 60)
     stdout = stdout_b.decode(errors="replace")
     stderr = stderr_b.decode(errors="replace")
@@ -437,7 +950,9 @@ async def _safe_stash_pop(*, strict: bool = False) -> None:
     if result.returncode == 0:
         return
 
-    stderr_out = (result.stderr or result.stdout).strip() or "(no output)"
+    stderr_out = _safe_diagnostic_tail(
+        (result.stderr or result.stdout).strip() or "(no output)",
+    )
     unmerged = await _git("ls-files", "--unmerged", check=False)
     unmerged_paths = sorted({
         line.split("\t", 1)[1] for line in unmerged.stdout.splitlines()
@@ -520,24 +1035,173 @@ async def _preflight_git_state() -> tuple[bool, str]:
     return True, ""
 
 
-async def _rollback_code_to(tag: str) -> None:
-    """Roll the working tree back to ``v<tag>`` while keeping HEAD on ``main``.
+async def _rollback_code_to(commit_sha: str) -> tuple[bool, str]:
+    """Reset ``main`` to the exact pre-update commit and verify ``HEAD``.
 
-    Previously the rollback path was ``git checkout v<tag>``, which
-    leaves HEAD detached at the tag. From that state every subsequent
-    ``git pull --ff-only`` aborts with "You are not currently on a
-    branch", so the install would get stuck until a human intervened.
-
-    This helper instead re-attaches to ``main`` (if not already there)
-    and then does a hard reset to the tag. The end state is identical
-    content-wise, but HEAD is a named branch, so the next update cycle
-    can fast-forward cleanly.
-
-    Best-effort: every step uses ``check=False``. Rollback should never
-    raise — the caller is already in an error path.
+    Rollback is deliberately commit-anchored rather than version/tag-anchored:
+    a tag can be missing, moved, or point somewhere other than the commit that
+    was actually running before the update.  Every command is inspected and a
+    failed verification is returned to the caller so it can *avoid* restoring
+    data written for a different code/schema version.
     """
-    await _git("checkout", "main", check=False)
-    await _git("reset", "--hard", "v" + tag, check=False)
+    checkout = await _git("checkout", "main", check=False)
+    if checkout.returncode != 0:
+        return False, "could not attach HEAD to main: %s" % (
+            checkout.stderr.strip() or checkout.stdout.strip() or "unknown git error"
+        )
+
+    reset = await _git("reset", "--hard", commit_sha, check=False)
+    if reset.returncode != 0:
+        return False, "git reset --hard %s failed: %s" % (
+            commit_sha,
+            reset.stderr.strip() or reset.stdout.strip() or "unknown git error",
+        )
+
+    head = await _git("rev-parse", "HEAD", check=False)
+    actual = head.stdout.strip() if head.returncode == 0 else ""
+    if head.returncode != 0 or actual != commit_sha:
+        return False, "rollback HEAD verification failed: expected %s, got %s" % (
+            commit_sha, actual or "(unavailable)",
+        )
+    return True, ""
+
+
+@dataclass(frozen=True)
+class UpdateTarget:
+    """A target tag resolved and verified against the configured ``origin``."""
+
+    version: str
+    tag: str
+    object_sha: str
+    commit_sha: str
+    notes: dict | None
+
+
+def _validate_update_version(version: str) -> str:
+    """Validate a version before using it in git refs and release paths."""
+    candidate = version.strip()
+    if not candidate or candidate.startswith("v"):
+        raise ValueError("version must not be empty or include the 'v' tag prefix")
+    if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+-]*", candidate):
+        raise ValueError("version contains characters not allowed in a release tag")
+    try:
+        Version(candidate)
+    except Exception as exc:
+        raise ValueError("invalid release version %r: %s" % (candidate, exc)) from exc
+    return candidate
+
+
+async def _resolve_exact_target(version: str) -> UpdateTarget:
+    """Fetch and resolve exactly ``origin``'s ``v<version>`` tag.
+
+    The tag is fetched into an updater-owned ref instead of the local tag
+    namespace.  This avoids installing an old/stale local tag and lets us
+    compare the fetched object with the object SHA advertised by ``origin``.
+    Annotated tags are then peeled to the exact commit that will be installed.
+    Before touching the working tree we also prove that that commit's VERSION
+    file and release-note metadata agree with the requested version.
+    """
+    version = _validate_update_version(version)
+    tag = "v" + version
+    remote_ref = "refs/tags/" + tag
+    candidate_ref = "refs/robyx/updates/" + tag
+
+    advertised = await _git(
+        "ls-remote", "--tags", "--refs", "origin", remote_ref,
+        check=False,
+    )
+    if advertised.returncode != 0:
+        raise RuntimeError("could not query origin for %s: %s" % (
+            tag,
+            advertised.stderr.strip() or advertised.stdout.strip() or "unknown git error",
+        ))
+    matches = []
+    for line in advertised.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == remote_ref:
+            matches.append(parts[0].lower())
+    if len(matches) != 1 or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", matches[0]):
+        raise RuntimeError("origin does not advertise exactly one valid %s tag" % tag)
+    advertised_object = matches[0]
+
+    fetched = await _git(
+        "fetch", "--no-tags", "origin",
+        "+%s:%s" % (remote_ref, candidate_ref),
+        check=False,
+    )
+    if fetched.returncode != 0:
+        raise RuntimeError("fetch of exact tag %s failed: %s" % (
+            tag,
+            fetched.stderr.strip() or fetched.stdout.strip() or "unknown git error",
+        ))
+
+    fetched_object = await _git("rev-parse", candidate_ref, check=False)
+    actual_object = fetched_object.stdout.strip().lower()
+    if fetched_object.returncode != 0 or actual_object != advertised_object:
+        raise RuntimeError(
+            "fetched tag object verification failed for %s: expected %s, got %s"
+            % (tag, advertised_object, actual_object or "(unavailable)")
+        )
+
+    peeled = await _git("rev-parse", candidate_ref + "^{commit}", check=False)
+    commit_sha = peeled.stdout.strip().lower()
+    if peeled.returncode != 0 or not re.fullmatch(
+        r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit_sha,
+    ):
+        raise RuntimeError("could not peel %s to a commit" % tag)
+
+    tagged_version = await _git("show", "%s:VERSION" % commit_sha, check=False)
+    if tagged_version.returncode != 0:
+        raise RuntimeError("%s commit has no readable VERSION file" % tag)
+    version_in_commit = tagged_version.stdout.strip()
+    if version_in_commit != version:
+        raise RuntimeError(
+            "%s VERSION mismatch: requested %s, commit declares %s"
+            % (tag, version, version_in_commit or "(empty)")
+        )
+
+    notes = None
+    release_path = "releases/%s.md" % version
+    tagged_notes = await _git("show", "%s:%s" % (commit_sha, release_path), check=False)
+    if tagged_notes.returncode == 0:
+        notes = _parse_release_notes(tagged_notes.stdout)
+        if notes.get("version") and notes["version"] != version:
+            raise RuntimeError(
+                "%s metadata mismatch: requested %s, release notes declare %s"
+                % (release_path, version, notes["version"])
+            )
+
+    return UpdateTarget(version, tag, advertised_object, commit_sha, notes)
+
+
+async def _verify_installed_target(target: UpdateTarget) -> tuple[bool, str]:
+    """Verify that the worktree is still at *target* and declares its version."""
+    head = await _git("rev-parse", "HEAD", check=False)
+    actual_head = head.stdout.strip().lower() if head.returncode == 0 else ""
+    if actual_head != target.commit_sha.lower():
+        return False, "HEAD mismatch: expected %s, got %s" % (
+            target.commit_sha, actual_head or "(unavailable)",
+        )
+    try:
+        installed_version = get_current_version()
+    except OSError as exc:
+        return False, "could not read installed VERSION: %s" % exc
+    if installed_version != target.version:
+        return False, "installed VERSION mismatch: expected %s, got %s" % (
+            target.version, installed_version or "(empty)",
+        )
+    return True, ""
+
+
+async def _checkout_exact_target(target: UpdateTarget) -> tuple[bool, str]:
+    """Move attached ``main`` to the resolved target commit and verify it."""
+    reset = await _git("reset", "--hard", target.commit_sha, check=False)
+    if reset.returncode != 0:
+        return False, "git reset to %s failed: %s" % (
+            target.tag,
+            reset.stderr.strip() or reset.stdout.strip() or "unknown git error",
+        )
+    return await _verify_installed_target(target)
 
 
 async def fetch_remote_tags() -> list[str]:
@@ -601,6 +1265,12 @@ async def _get_release_notes_for(version: str, tags: list[str]) -> dict | None:
 
 
 async def check_for_updates() -> dict | None:
+    """Check and persist notification state under a shared runtime lease."""
+    async with get_maintenance_gate().shared():
+        return await _check_for_updates()
+
+
+async def _check_for_updates() -> dict | None:
     """Check if a new version is available.
 
     Returns a dict with update info, or None if up to date.
@@ -652,6 +1322,12 @@ async def check_for_updates() -> dict | None:
 
 
 async def get_pending_update() -> dict | None:
+    """Resolve a pending release under a shared runtime lease."""
+    async with get_maintenance_gate().shared():
+        return await _get_pending_update()
+
+
+async def _get_pending_update() -> dict | None:
     """Check if there is an update that can be applied (already notified, not yet applied).
 
     Unlike :func:`check_for_updates`, this doesn't re-notify — it just
@@ -683,19 +1359,19 @@ async def get_pending_update() -> dict | None:
     }
 
 
-# ── v0.16 personal-data migration (pre-pull) ──
+# ── v0.16 personal-data migration (pre-update) ──
 
 
 def migrate_personal_data_to_data_dir() -> list[str]:
-    """v0.16 pre-pull migration: copy tracked runtime files to ``data/``.
+    """v0.16 pre-update migration: copy tracked runtime files to ``data/``.
 
     Before v0.16, Robyx shipped personal runtime files committed at the
     repo root (``tasks.md``, ``specialists.md``, ``agents/<name>.md``,
     ``specialists/<name>.md``). v0.16 moves these under ``data/`` which is
     gitignored. On the user's live runtime install, the updater must copy
-    these files into ``data/`` **before** the ``git pull`` removes them
-    from the working tree — otherwise the pull drops them and the fleet
-    boots with an empty state.
+    these files into ``data/`` **before** the target checkout/reset removes
+    them from the working tree — otherwise the update drops them and the
+    fleet boots with an empty state.
 
     Idempotency guarantee: files that already exist under ``data/`` are
     never overwritten. Safe to run repeatedly, safe on fresh clones (no-op).
@@ -740,28 +1416,92 @@ def migrate_personal_data_to_data_dir() -> list[str]:
 # ── Apply update ──
 
 
-async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool, str]:
-    """Apply an update to the given version.
+async def apply_update(
+    version: str,
+    notify_fn=None,
+    manager=None,
+    *,
+    force: bool = False,
+) -> tuple[bool, str]:
+    """Acquire the one process-wide maintenance transaction and update.
 
-    Safety structure:
+    Normal updates fail closed while runtime work is active. ``force=True``
+    first blocks new shared leases, drains all supervised process groups, and
+    waits for their delivery/state writers before the snapshot is allowed.
+    """
+    try:
+        version = _validate_update_version(version)
+    except ValueError as exc:
+        return False, str(exc)
 
-    0. Pre-flight: refuse to proceed if the repo has unmerged index
-       entries or an in-progress merge/rebase/cherry-pick. Prevents the
-       "previous failed stash pop wedged auto-update forever" class of
-       bugs (see :func:`_preflight_git_state`).
-    1. Stash any local working-tree changes so the pull can fast-forward.
-    2. Snapshot ``data/`` into ``data/backups/pre-update-*.tar.gz`` so a
-       failed migration / smoke test can restore mutated state. Snapshot
-       failure is logged but does not block the update (we prefer an
-       unprotected attempt to refusing to update at all).
-    3. Fast-forward pull on ``main``. If pull fails, pop the stash and
-       return with the git error.
-    4. Run any release-note migration steps. A non-zero exit rolls back
-       the code (git reset to the prior tag) AND restores ``data/`` from
-       the snapshot, then pops the stash.
-    5. ``pip install`` requirements. Same rollback chain on failure.
-    6. Import smoke test in a fresh subprocess. Same rollback chain.
-    7. Pop the stash so the user's local edits (if any) are back.
+    supervisor = get_runtime_supervisor()
+
+    async def _quiesce_runtime() -> None:
+        if supervisor.process_count == 0:
+            return
+        if not force:
+            raise MaintenanceBusyError(
+                "runtime agents or scheduled tasks are still active",
+            )
+        drained = await supervisor.drain_processes(grace_seconds=5.0)
+        if not drained:
+            raise MaintenanceBusyError(
+                "one or more runtime process groups could not be drained",
+            )
+        # Give supervised delivery watchers an event-loop turn to reconcile
+        # locks/state and release their shared maintenance leases.
+        await asyncio.sleep(0)
+
+    gate = get_maintenance_gate()
+    update_succeeded = False
+
+    async def _finalize_transaction_marker() -> None:
+        if update_succeeded and _update_transaction_marker_path().exists():
+            _clear_update_transaction_marker()
+
+    try:
+        async with gate.exclusive(
+            quiesce=_quiesce_runtime,
+            finalize=_finalize_transaction_marker,
+            wait_timeout=30.0 if force else 0.05,
+        ):
+            result = await _apply_update_transaction(
+                version,
+                notify_fn=notify_fn,
+                manager=manager,
+            )
+            update_succeeded = result[0]
+        if result[0]:
+            return result
+        return False, _safe_diagnostic_tail(result[1], max_chars=4000)
+    except MaintenanceBusyError as exc:
+        return False, "Update blocked: %s" % _safe_diagnostic_tail(exc)
+    except OSError as exc:
+        return False, (
+            "Update installed and verified, but could not finalize the "
+            "recovery marker: %s; refusing restart."
+            % _safe_diagnostic_tail(exc)
+        )
+    except Exception as exc:
+        return False, "Update failed before commit: %s" % _safe_diagnostic_tail(
+            exc,
+            max_chars=4000,
+        )
+
+
+async def _apply_update_transaction(
+    version: str,
+    notify_fn=None,
+    manager=None,
+) -> tuple[bool, str]:
+    """Install and verify the exact ``origin`` tag for *version*.
+
+    The update is a small transaction: preserve local work, capture the exact
+    pre-update commit, resolve/fetch the requested remote tag, require a
+    verified runtime-data snapshot when data exists, install the peeled target
+    commit, migrate/install/smoke-test, restore the stash, verify HEAD+VERSION,
+    and only then record success.  Any post-checkout failure rolls code back to
+    the captured commit.  Data is restored only after that rollback succeeds.
 
     Args:
         version: Target version string (e.g. "0.2.0")
@@ -777,12 +1517,218 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
     Returns:
         (success, message) tuple
     """
+    try:
+        version = _validate_update_version(version)
+    except ValueError as exc:
+        return False, str(exc)
+
     current = get_current_version()
+    pre_pull_sha: str | None = None
+    snapshot: Path | None = None
+    has_stash = False
+    stash_pending = False
+    code_mutated = False
+    data_mutated = False
+    transaction_marker_active = False
+    pre_update_branch = ""
+    initial_pre_update_sha = ""
+    branch_switched = False
 
     async def notify(msg):
+        msg = _safe_diagnostic_tail(msg, max_chars=4000)
         if notify_fn:
             await notify_fn(msg)
         log.info(msg)
+
+    def record_failure(error: str) -> None:
+        """Best-effort audit entry; never obscure the primary failure."""
+        error = _safe_diagnostic_tail(error, max_chars=4000)
+        try:
+            state = _load_state()
+            state.setdefault("update_history", []).append({
+                "version": version,
+                "from_version": current,
+                "date": datetime.now(timezone.utc).isoformat(),
+                "status": "failed",
+                "error": error,
+            })
+            _save_state(state)
+        except Exception:
+            log.exception("Could not record failed update attempt")
+
+    def mark_transaction(phase: str, *, target_commit: str | None = None) -> None:
+        nonlocal transaction_marker_active
+        if pre_pull_sha is None:
+            raise RuntimeError("cannot mark update without a rollback commit")
+        _write_update_transaction_marker({
+            "schema": 1,
+            "phase": phase,
+            "target_version": version,
+            "target_commit": target_commit,
+            "pre_update_commit": pre_pull_sha,
+            "initial_commit": initial_pre_update_sha or pre_pull_sha,
+            "pre_update_branch": pre_update_branch or None,
+            "pre_update_version": current,
+            "snapshot": str(snapshot) if snapshot is not None else None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        transaction_marker_active = True
+
+    def clear_transaction_marker() -> str:
+        nonlocal transaction_marker_active
+        if not transaction_marker_active:
+            return ""
+        try:
+            _clear_update_transaction_marker()
+        except OSError as exc:
+            return " could not clear recovery marker: %s" % exc
+        transaction_marker_active = False
+        return ""
+
+    async def abort_before_install(reason: str) -> tuple[bool, str]:
+        nonlocal branch_switched
+        reason = _safe_diagnostic_tail(reason, max_chars=4000)
+        if branch_switched:
+            if pre_update_branch:
+                restore_branch = await _git(
+                    "checkout", pre_update_branch, check=False,
+                )
+            else:
+                restore_branch = await _git(
+                    "checkout", "--detach", initial_pre_update_sha, check=False,
+                )
+            if restore_branch.returncode != 0:
+                critical = (
+                    "%s\nCRITICAL: could not restore the pre-update branch; "
+                    "the recovery marker and stash were preserved."
+                    % reason
+                )
+                get_maintenance_gate().poison(critical)
+                record_failure(critical)
+                return False, critical
+            branch_switched = False
+        if stash_pending:
+            await _safe_stash_pop()
+        reason += clear_transaction_marker()
+        record_failure(reason)
+        return False, reason
+
+    async def rollback_failure(
+        reason: str,
+        *,
+        restore_stash: bool = True,
+    ) -> tuple[bool, str]:
+        """Rollback code first; restore data only once code is proven safe."""
+        nonlocal branch_switched
+        reason = _safe_diagnostic_tail(reason, max_chars=4000)
+        if pre_pull_sha is None or (not code_mutated and not data_mutated):
+            return await abort_before_install(reason)
+
+        if code_mutated:
+            rollback_ok, rollback_error = await _rollback_code_to(pre_pull_sha)
+        else:
+            rollback_ok, rollback_error = True, ""
+
+        if not rollback_ok:
+            critical = (
+                "%s\nCRITICAL: code rollback to %s failed: %s. "
+                "The data snapshot was NOT restored and the local-change "
+                "stash was preserved to avoid mixing unknown code, data, and WIP. "
+                "Manual recovery is required."
+                % (reason, pre_pull_sha, rollback_error)
+            )
+            log.critical(critical)
+            get_maintenance_gate().poison(critical)
+            record_failure(critical)
+            return False, critical
+
+        restore_error = ""
+        restore_ok = True
+        if snapshot is not None and not _restore_data_dir(snapshot):
+            restore_ok = False
+            restore_error = (
+                " Code rollback succeeded, but restoring data from %s failed; "
+                "the snapshot was preserved for manual recovery."
+                % snapshot
+            )
+            log.critical(restore_error.strip())
+
+        if restore_ok and snapshot is not None and manager is not None:
+            reload_method = getattr(
+                manager,
+                "reload_state_after_maintenance_restore",
+                None,
+            )
+            if not callable(reload_method):
+                restore_ok = False
+                restore_error += (
+                    " Data was restored, but the live agent state has no "
+                    "authoritative maintenance reload API. Runtime writes "
+                    "were disabled to prevent the restored files from being "
+                    "clobbered."
+                )
+            else:
+                try:
+                    reload_result = reload_method()
+                    if asyncio.iscoroutine(reload_result):
+                        await reload_result
+                except BaseException as exc:
+                    restore_ok = False
+                    restore_error += (
+                        " Data was restored, but reloading live agent state "
+                        "failed: %s. Runtime writes were disabled."
+                        % _safe_diagnostic_tail(exc)
+                    )
+            if not restore_ok:
+                get_maintenance_gate().poison(restore_error.strip())
+                log.critical(restore_error.strip())
+
+        if branch_switched:
+            if pre_update_branch:
+                restore_branch = await _git(
+                    "checkout", pre_update_branch, check=False,
+                )
+            else:
+                restore_branch = await _git(
+                    "checkout", "--detach", initial_pre_update_sha, check=False,
+                )
+            if restore_branch.returncode != 0:
+                restore_ok = False
+                restore_error += (
+                    " Code/data rollback succeeded, but restoring the original "
+                    "branch or detached HEAD failed; the recovery marker and "
+                    "stash were preserved for manual recovery."
+                )
+            else:
+                branch_switched = False
+
+        if restore_ok:
+            try:
+                rollback_version = get_current_version()
+            except OSError as exc:
+                restore_ok = False
+                restore_error += " Could not read VERSION after rollback: %s" % exc
+            else:
+                if rollback_version != current:
+                    restore_ok = False
+                    restore_error += (
+                        " Rollback VERSION verification failed: expected %s, got %s."
+                        % (current, rollback_version or "(empty)")
+                    )
+
+        if not restore_ok:
+            get_maintenance_gate().poison(restore_error.strip() or reason)
+            log.critical(restore_error.strip() or reason)
+
+        if restore_stash and stash_pending and restore_ok:
+            await _safe_stash_pop()
+
+        marker_error = ""
+        if restore_ok:
+            marker_error = clear_transaction_marker()
+        result = reason + restore_error + marker_error
+        record_failure(result)
+        return False, result
 
     # 0. Pre-flight: refuse to run if the repo is in a pre-existing
     # broken-merge state. Without this gate, a prior failed stash pop
@@ -795,65 +1741,80 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         await notify("Pre-flight check failed: %s" % preflight_msg)
         return False, "Pre-flight check failed: %s" % preflight_msg
 
-    # 1. Stash local changes
-    stash_result = await _git("stash", "--include-untracked", check=False)
-    has_stash = "No local changes" not in stash_result.stdout
+    # Capture a read-only recovery anchor and snapshot before the very first
+    # mutation (stash / branch switch / personal-data relocation). A hard
+    # process death anywhere after the marker commit therefore makes the next
+    # bootstrap fail closed instead of starting an unverified half-update.
+    head_check = await _git(
+        "symbolic-ref", "--quiet", "--short", "HEAD", check=False,
+    )
+    pre_update_branch = (
+        head_check.stdout.strip() if head_check.returncode == 0 else ""
+    )
+    initial_head = await _git("rev-parse", "HEAD", check=False)
+    if initial_head.returncode != 0 or not initial_head.stdout.strip():
+        error = initial_head.stderr.strip() or initial_head.stdout.strip()
+        return False, (
+            "could not capture pre-update HEAD before mutation: %s"
+            % (error or "unknown git error")
+        )
+    pre_pull_sha = initial_head.stdout.strip().lower()
+    initial_pre_update_sha = pre_pull_sha
+    current = get_current_version()
 
-    # 1.5 Snapshot data/ so a failed migration / smoke test can be rolled
-    # back. Snapshot failure is logged but never blocks the update.
-    snapshot = _snapshot_data_dir(current, version)
-    if snapshot is not None:
-        await notify("Created data snapshot: %s" % snapshot.name)
-
-    # Capture the pre-pull commit so we can compute, after the pull, which
-    # files this update actually changed. The diff drives the per-agent
-    # session invalidation in step 7 — without it, agents whose AI-CLI
-    # sessions pre-existed a prompt/brief change would keep running under
-    # the stale system prompt indefinitely (Claude Code CLI bakes the
-    # system prompt at session creation and ignores --append-system-prompt
-    # on --resume). Failure to capture is not fatal: we just skip the
-    # invalidation step and log it.
-    pre_pull_sha: str | None = None
-    try:
-        pre_pull = await _git("rev-parse", "HEAD", check=False)
-        if pre_pull.returncode == 0:
-            pre_pull_sha = pre_pull.stdout.strip() or None
-    except Exception as e:
-        log.warning("Could not capture pre-pull HEAD: %s", e)
-
-    # v0.16+: migrate personal runtime files (tasks.md, specialists.md,
-    # agents/*.md, specialists/*.md) into data/ BEFORE the pull. Starting
-    # with v0.16 these files are no longer tracked; a naive pull would
-    # delete them from the working tree and take the user's fleet down.
-    # The helper is idempotent, so running it on every apply_update is
-    # safe — it only copies files that still exist at the repo root and
-    # are not yet present under data/.
-    try:
-        moved = migrate_personal_data_to_data_dir()
-        if moved:
-            await notify(
-                "Migrated %d file(s) to data/: %s"
-                % (len(moved), ", ".join(moved))
+    if _data_snapshot_required():
+        sqlite_ok, sqlite_error = _checkpoint_sqlite_databases()
+        if not sqlite_ok:
+            return False, "Data snapshot preflight failed: %s" % sqlite_error
+        snapshot = _snapshot_data_dir(current, version)
+        if snapshot is None:
+            return False, "Data snapshot failed; update aborted before changing code"
+        snapshot_ok, snapshot_error = _verify_snapshot(snapshot)
+        if not snapshot_ok:
+            try:
+                snapshot.unlink(missing_ok=True)
+            except OSError:
+                pass
+            snapshot = None
+            return False, (
+                "Data snapshot verification failed; update aborted: %s"
+                % snapshot_error
             )
-    except Exception as e:
-        log.warning("Personal-data migration raised — continuing: %s", e, exc_info=True)
+        _prune_old_snapshots(
+            DATA_DIR / BACKUPS_DIR_NAME,
+            preserve=snapshot,
+        )
+        await notify("Created and verified data snapshot: %s" % snapshot.name)
 
     try:
-        # 2. Ensure we're on main before pulling. Two failure modes are
-        # handled here: (a) a previous rollback left HEAD detached at a
-        # tag (pre-v0.20.22 rollbacks used ``git checkout v<old>``, and
-        # a detached HEAD makes ``git pull --ff-only`` abort with "not on
-        # a branch"); (b) the operator manually checked out a feature
-        # branch or an older tag — the update must still target ``main``,
-        # not whatever the working tree happens to be on. In both cases
-        # we re-attach to main before the pull. Local work was already
-        # stashed at step 1.
-        head_check = await _git(
-            "symbolic-ref", "--quiet", "--short", "HEAD", check=False,
+        mark_transaction("stash")
+    except OSError as exc:
+        return False, "Could not create durable update recovery marker: %s" % exc
+
+    # 1. Stash local changes. A failed stash is itself a hard stop: moving
+    # main after that could overwrite WIP that was never preserved.
+    stash_result = await _git("stash", "--include-untracked", check=False)
+    if stash_result.returncode != 0:
+        error = _safe_diagnostic_tail(
+            stash_result.stderr.strip() or stash_result.stdout.strip(),
         )
-        current_branch = (
-            head_check.stdout.strip() if head_check.returncode == 0 else ""
+        reason = "git stash failed and may have partially mutated the workspace: %s" % (
+            error or "unknown git error",
         )
+        reason += (
+            " The recovery marker was preserved and runtime writes were "
+            "disabled until the repository is inspected."
+        )
+        get_maintenance_gate().poison(reason)
+        record_failure(reason)
+        return False, reason
+    has_stash = "No local changes" not in stash_result.stdout
+    stash_pending = has_stash
+
+    try:
+        # 2. Keep HEAD attached to main for service compatibility, then
+        # capture the exact commit/version that rollback must restore.
+        current_branch = pre_update_branch
         if current_branch != "main":
             if not current_branch:
                 await notify("Detached HEAD detected — reattaching to main")
@@ -862,33 +1823,70 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                     "On branch '%s', update targets 'main' — switching"
                     % current_branch,
                 )
+            # A non-zero checkout can still have touched the index/worktree;
+            # mark the compensating branch restore before invoking git.
+            branch_switched = True
             attach = await _git("checkout", "main", check=False)
             if attach.returncode != 0:
                 error = attach.stderr.strip() or attach.stdout.strip()
-                if has_stash:
-                    await _safe_stash_pop()
-                return False, "could not switch to main: %s" % error
+                return await abort_before_install("could not switch to main: %s" % error)
 
-        # 3. Fast-forward pull only
-        await notify("Pulling latest changes...")
-        pull = await _git("pull", "--ff-only", check=False)
-        if pull.returncode != 0:
-            error = pull.stderr.strip() or pull.stdout.strip()
-            if has_stash:
-                await _safe_stash_pop()
-            return False, "git pull --ff-only failed: %s" % error
+        pre_pull = await _git("rev-parse", "HEAD", check=False)
+        if pre_pull.returncode != 0 or not pre_pull.stdout.strip():
+            error = pre_pull.stderr.strip() or pre_pull.stdout.strip()
+            return await abort_before_install(
+                "could not capture pre-update HEAD; refusing an update without "
+                "a rollback anchor: %s" % (error or "unknown git error")
+            )
+        pre_pull_sha = pre_pull.stdout.strip().lower()
+        mark_transaction("workspace-prepare")
 
-        # 3. Read release notes from the now-available local file
-        notes_file = RELEASES_DIR / ("%s.md" % version)
-        notes = None
-        if notes_file.exists():
-            notes = _parse_release_notes(notes_file.read_text())
+        # 3. Resolve the requested remote tag, not current main.  This is
+        # read-only with respect to the working tree and therefore happens
+        # before snapshot/install.
+        await notify("Resolving exact release tag v%s..." % version)
+        try:
+            target = await _resolve_exact_target(version)
+        except Exception as exc:
+            return await abort_before_install("Exact tag verification failed: %s" % exc)
 
-        # 4. Run migration steps if needed
+        # v0.16 personal-data relocation still runs before code changes.
+        try:
+            # Set before invoking the synchronous copier: cancellation-like
+            # BaseExceptions or I/O faults can arrive after a partial copy.
+            data_mutated = True
+            moved = migrate_personal_data_to_data_dir()
+            if moved:
+                await notify(
+                    "Migrated %d file(s) to data/: %s"
+                    % (len(moved), ", ".join(moved))
+                )
+        except Exception as exc:
+            log.warning(
+                "Personal-data migration raised — continuing: %s",
+                _safe_diagnostic_tail(exc),
+            )
+
+        # 4. Install exactly the peeled tag commit. Set the mutation flag
+        # before reset because even a failing reset may partially touch files.
+        await notify("Installing %s at commit %s..." % (target.tag, target.commit_sha[:12]))
+        mark_transaction("checkout", target_commit=target.commit_sha)
+        code_mutated = True
+        installed, install_error = await _checkout_exact_target(target)
+        if not installed:
+            return await rollback_failure("Exact target install failed: %s" % install_error)
+
+        # 5. Run migration steps from release notes read out of the verified
+        # target commit, never from an ambiguous main/worktree revision.
+        notes = target.notes
         if notes and notes["requires_migration"] and notes["migration_steps"]:
+            mark_transaction("migration", target_commit=target.commit_sha)
             await notify("Running %d migration step(s)..." % len(notes["migration_steps"]))
-            for step in notes["migration_steps"]:
-                await notify("  $ %s" % step)
+            steps = notes["migration_steps"]
+            for step_number, step in enumerate(steps, start=1):
+                await notify(
+                    "Running migration step %d/%d..." % (step_number, len(steps))
+                )
                 try:
                     # Use shlex.split so commands with quoted arguments or
                     # multi-word flags (e.g. `python -m pip install foo`,
@@ -896,128 +1894,116 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                     # str.split would have broken the quoting.
                     try:
                         argv = shlex.split(step)
-                    except ValueError as exc:
-                        # Unbalanced quotes etc. — fail the migration loud.
-                        await _rollback_code_to(current)
-                        if snapshot is not None:
-                            _restore_data_dir(snapshot)
-                        if has_stash:
-                            await _safe_stash_pop()
-                        return False, "Unparseable migration step `%s`: %s" % (
-                            step, exc,
+                    except ValueError:
+                        return await rollback_failure(
+                            "Unparseable migration step %d (command withheld)"
+                            % step_number
                         )
                     if not argv:
                         continue
-                    proc = await asyncio.create_subprocess_exec(
+                    proc, tracked = await _spawn_update_child(
                         *argv,
+                        owner="migration",
                         cwd=str(PROJECT_ROOT),
-                        env=_scrubbed_child_env(),
+                        env=_migration_child_env(),
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        start_new_session=sys.platform != "win32",
                     )
-                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+                    stdout, stderr = await _communicate_update_child(
+                        proc,
+                        timeout=120,
+                        owner="migration",
+                        already_tracked=tracked,
+                    )
                     if proc.returncode != 0:
                         error = stderr.decode().strip() or stdout.decode().strip()
-                        # Rollback: previous version tag + restore data/.
-                        await _rollback_code_to(current)
-                        if snapshot is not None:
-                            _restore_data_dir(snapshot)
-                        if has_stash:
-                            await _safe_stash_pop()
-                        return False, "Migration step failed: `%s`\n%s" % (step, error)
+                        return await rollback_failure(
+                            "Migration step failed (step %d):\n%s" % (
+                                step_number,
+                                _safe_diagnostic_tail(error),
+                            )
+                        )
                 except asyncio.TimeoutError:
-                    await _rollback_code_to(current)
-                    if snapshot is not None:
-                        _restore_data_dir(snapshot)
-                    if has_stash:
-                        await _safe_stash_pop()
-                    return False, "Migration step timed out: `%s`" % step
+                    return await rollback_failure(
+                        "Migration step %d timed out" % step_number
+                    )
 
-        # 5. Always reinstall deps. A silently-failed install was the root
+        # 6. Always reinstall deps. A silently-failed install was the root
         # cause of the v0.12.0 "No module named 'PIL'" boot crash, so we
-        # now (a) keep pip verbose, (b) check the return code, (c) log the
-        # output, (d) roll back and fail the update if pip exits non-zero,
-        # (e) use a longer timeout to accommodate wheel builds.
+        # now check the return code, preserve only a bounded/redacted failure
+        # tail, roll back on non-zero, and allow time for wheel builds.
         await notify("Installing dependencies...")
+        mark_transaction("dependencies", target_commit=target.commit_sha)
         venv_bin = "Scripts" if sys.platform == "win32" else "bin"
         pip_name = "pip.exe" if sys.platform == "win32" else "pip"
         pip_path = PROJECT_ROOT / ".venv" / venv_bin / pip_name
         if not pip_path.exists():
-            await _rollback_code_to(current)
-            if snapshot is not None:
-                _restore_data_dir(snapshot)
-            if has_stash:
-                await _safe_stash_pop()
-            return False, "venv pip not found at %s" % pip_path
+            return await rollback_failure("venv pip not found at %s" % pip_path)
+        try:
+            runtime_lock = dependency_lock_path(PROJECT_ROOT, kind="runtime")
+        except DependencyLockError as exc:
+            return await rollback_failure(
+                "runtime dependency lock unavailable: %s" % exc
+            )
 
-        deps_proc = await asyncio.create_subprocess_exec(
+        deps_proc, deps_tracked = await _spawn_update_child(
             str(pip_path),
-            "install", "-r", str(PROJECT_ROOT / "bot" / "requirements.txt"),
+            "install", "--require-hashes", "-r", str(runtime_lock),
+            owner="pip",
             cwd=str(PROJECT_ROOT),
             env=_scrubbed_child_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=sys.platform != "win32",
         )
         try:
-            pip_stdout, pip_stderr = await asyncio.wait_for(
-                deps_proc.communicate(), timeout=600,
+            pip_stdout, pip_stderr = await _communicate_update_child(
+                deps_proc,
+                timeout=600,
+                owner="pip",
+                already_tracked=deps_tracked,
             )
         except asyncio.TimeoutError:
-            deps_proc.kill()
-            await _rollback_code_to(current)
-            if snapshot is not None:
-                _restore_data_dir(snapshot)
-            if has_stash:
-                await _safe_stash_pop()
-            return False, "pip install timed out after 600s"
+            return await rollback_failure("pip install timed out after 600s")
 
         pip_out_text = pip_stdout.decode(errors="replace")
         pip_err_text = pip_stderr.decode(errors="replace")
-        if pip_out_text.strip():
-            log.info("pip install stdout:\n%s", pip_out_text.strip())
-        if pip_err_text.strip():
-            log.info("pip install stderr:\n%s", pip_err_text.strip())
-
         if deps_proc.returncode != 0:
-            await _rollback_code_to(current)
-            if snapshot is not None:
-                _restore_data_dir(snapshot)
-            if has_stash:
-                await _safe_stash_pop()
             tail_lines = (pip_err_text or pip_out_text).strip().splitlines()[-8:]
-            tail_str = "\n".join(tail_lines)
-            return False, "pip install returned %d:\n%s" % (deps_proc.returncode, tail_str)
+            tail_str = _safe_diagnostic_tail("\n".join(tail_lines))
+            return await rollback_failure(
+                "pip install returned %d:\n%s" % (deps_proc.returncode, tail_str)
+            )
 
         # Refresh the bootstrap marker so the next start-up does not
         # redundantly re-run pip for the same requirements.txt.
         try:
-            import hashlib
             req_file = PROJECT_ROOT / "bot" / "requirements.txt"
             marker = PROJECT_ROOT / ".venv" / ".robyx_deps_hash"
-            marker.write_text(hashlib.sha1(req_file.read_bytes()).hexdigest())
+            _write_dependency_marker(
+                marker,
+                dependency_fingerprint(req_file, runtime_lock),
+            )
         except Exception as e:
             log.warning("Could not refresh bootstrap marker: %s", e)
 
-        # 5.5 Smoke test: import the new code in a fresh subprocess to
+        # 6.5 Smoke test: import the new code in a fresh subprocess to
         # catch import-time errors (e.g. broken pip-resolved dependency
         # graph, syntax error from a partial commit, missing migration
         # constant). pip exit 0 isn't enough — a successful resolve can
         # still leave the runtime broken. On failure we roll back the
-        # code (checkout previous tag) AND restore data/ from the
+        # code (reset to the pre-update commit) AND restore data/ from the
         # snapshot so a partially-applied migration doesn't leave the
         # next boot reading half-mutated state.
         await notify("Smoke-testing imports...")
+        mark_transaction("smoke-test", target_commit=target.commit_sha)
         smoke_ok, smoke_err = await _post_update_smoke_test()
         if not smoke_ok:
             await notify("Smoke test failed; rolling back: %s" % smoke_err)
-            await _rollback_code_to(current)
-            if snapshot is not None:
-                _restore_data_dir(snapshot)
-            if has_stash:
-                await _safe_stash_pop()
-            return False, "Smoke test failed: %s" % smoke_err
+            return await rollback_failure("Smoke test failed: %s" % smoke_err)
 
-        # 6. Pop stash if we had one. v0.28.2 hotfix: on conflict the
+        # 7. Pop stash if we had one. v0.28.2 hotfix: on conflict the
         # stash pop leaves raw ``<<<<<<<`` markers in the working tree —
         # restarting the bot at that point produces a SyntaxError
         # crashloop (the v0.28.0 Linux incident). Catch the conflict
@@ -1033,25 +2019,21 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                     "Stash-pop conflict on %s; rolling back: %s"
                     % (", ".join(exc.unmerged_paths) or "(unknown)", exc),
                 )
-                await _rollback_code_to(current)
-                if snapshot is not None:
-                    _restore_data_dir(snapshot)
                 # NOTE: do NOT re-pop the stash here. Git preserved it
                 # automatically on conflict; the operator resolves
                 # manually when they reach the machine.
-                return False, (
-                    "Stash-pop conflict on %s — code rolled back to %s. "
+                return await rollback_failure(
+                    "Stash-pop conflict on %s. "
                     "Stash preserved at stash@{0}. Resolve manually: "
                     "edit the conflicted files to remove "
                     "<<<<<<</=======/>>>>>>> markers, `git add` them, "
                     "then `git stash drop` and re-trigger the update."
-                    % (
-                        ", ".join(exc.unmerged_paths) or "(unknown)",
-                        current,
-                    )
+                    % (", ".join(exc.unmerged_paths) or "(unknown)"),
+                    restore_stash=False,
                 )
+            stash_pending = False
 
-            # 6.1 Belt-and-braces — verify every Python file in the
+            # 7.1 Belt-and-braces — verify every Python file in the
             # working tree parses cleanly after the stash pop. The
             # post-update smoke test at step 5.5 ran BEFORE the pop, so
             # a pop that mutated a file without producing unmerged
@@ -1073,24 +2055,55 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                     "robyx auto-update rollback (post-pop syntax failure)",
                     check=False,
                 )
-                await _rollback_code_to(current)
-                if snapshot is not None:
-                    _restore_data_dir(snapshot)
-                if restash.returncode == 0:
-                    log.info(
-                        "Re-stashed user changes into stash@{0} before rollback",
+                if restash.returncode != 0:
+                    critical = (
+                        "Python syntax check failed after stash pop (%s), and "
+                        "the updater could not re-stash local changes. Code/data "
+                        "were left untouched to avoid losing WIP; manual recovery "
+                        "is required." % syntax_err
                     )
-                return False, (
-                    "Python syntax check failed after stash pop: %s"
-                    % syntax_err
+                    log.critical(critical)
+                    record_failure(critical)
+                    return False, critical
+                stash_pending = True
+                log.info("Re-stashed user changes into stash@{0} before rollback")
+                return await rollback_failure(
+                    "Python syntax check failed after stash pop: %s" % syntax_err,
+                    restore_stash=False,
                 )
 
-        # 6.5 Invalidate AI-CLI sessions for any agent whose system prompt
+        # The restored stash may have changed VERSION without creating a merge
+        # conflict. Re-check target consistency before recording success. If it
+        # fails, preserve the now-restored WIP before rolling back.
+        final_ok, final_error = await _verify_installed_target(target)
+        if not final_ok:
+            if has_stash and not stash_pending:
+                restash = await _git(
+                    "stash", "push", "-m",
+                    "robyx auto-update rollback (post-pop target mismatch)",
+                    check=False,
+                )
+                if restash.returncode != 0:
+                    critical = (
+                        "Final target verification failed (%s), and local changes "
+                        "could not be re-stashed. Code/data were left untouched to "
+                        "avoid losing WIP; manual recovery is required." % final_error
+                    )
+                    log.critical(critical)
+                    record_failure(critical)
+                    return False, critical
+                stash_pending = True
+            return await rollback_failure(
+                "Final target verification failed: %s" % final_error,
+                restore_stash=False,
+            )
+
+        # 7.5 Invalidate AI-CLI sessions for any agent whose system prompt
         # or per-agent brief was changed by this update. See the module
         # docstring of session_lifecycle for the rationale; the short
         # version is that --resume sessions ignore the new system prompt,
         # so we must force a fresh session for affected agents. We
-        # compute the diff between the pre-pull commit captured above
+        # compute the diff between the pre-update commit captured above
         # and the new HEAD, then hand the changed paths to the
         # AgentManager-aware helper. Routing through manager.reset_sessions
         # (instead of mutating state.json directly) is critical: the
@@ -1098,7 +2111,7 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
         # would silently overwrite a direct file mutation on its next
         # save_state() call. Failures here are logged but never block
         # the update — the restart still happens.
-        if pre_pull_sha and manager is not None:
+        if manager is not None:
             try:
                 diff = await _git(
                     "diff", "--name-only", pre_pull_sha, "HEAD",
@@ -1129,22 +2142,21 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
                     "Session invalidation step raised — continuing: %s", e,
                     exc_info=True,
                 )
-        elif pre_pull_sha is None:
-            log.info(
-                "No pre-pull SHA captured — skipping session invalidation"
-            )
-        elif manager is None:
+        else:
             log.warning(
                 "apply_update called without manager — skipping session invalidation"
             )
 
-        # 7. Record success
+        # 8. Record success only after HEAD and VERSION have both been proven
+        # consistent with the requested tag. Include the commit for auditability.
         state = _load_state()
         now = datetime.now(timezone.utc).isoformat()
         state["last_update"] = now
         state["update_history"].append({
             "version": version,
             "from_version": current,
+            "tag": target.tag,
+            "commit": target.commit_sha,
             "date": now,
             "status": "ok",
         })
@@ -1152,26 +2164,16 @@ async def apply_update(version: str, notify_fn=None, manager=None) -> tuple[bool
 
         return True, version
 
-    except Exception as e:
-        # Catastrophic rollback: code + data.
-        log.error("Update failed with exception: %s", e, exc_info=True)
-        await _rollback_code_to(current)
-        if snapshot is not None:
-            _restore_data_dir(snapshot)
-        if has_stash:
-            await _safe_stash_pop()
-
-        state = _load_state()
-        state["update_history"].append({
-            "version": version,
-            "from_version": current,
-            "date": datetime.now(timezone.utc).isoformat(),
-            "status": "failed",
-            "error": str(e),
-        })
-        _save_state(state)
-
-        return False, str(e)
+    except BaseException as e:
+        safe_error = _safe_diagnostic_tail(e, max_chars=4000)
+        log.error("Update failed with exception: %s", safe_error)
+        rollback_task = asyncio.create_task(rollback_failure(safe_error))
+        rollback_result = await _await_cleanup_uninterruptibly(rollback_task)
+        if not isinstance(e, Exception):
+            # Cancellation/SystemExit semantics remain visible to the caller,
+            # but only after code, data, and child cleanup has completed.
+            raise
+        return rollback_result
 
 
 def restart_service():

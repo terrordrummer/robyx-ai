@@ -28,7 +28,9 @@ When the user asks to switch platform (e.g. "passa a Discord", "switch to Slack"
    - `ROBYX_PLATFORM=<discord|slack|telegram>`
    - Every required key for that platform, not just a single token
    - For Slack/Discord, keep the Telegram compatibility keys present too
-3. Reassure the user: all workspaces, agents, memory, and scheduled tasks are preserved — only the messaging transport changes.
+3. Explain the boundary honestly: agent briefs and memory remain on disk, but
+   workspace channels and scheduled delivery scopes are platform-specific and
+   must be recreated or explicitly rebound on the destination platform.
 4. Send a farewell message: "Migrazione completata. Mi troverai su [platform]. A tra poco!"
 5. Emit [RESTART] to restart on the new platform.
 
@@ -194,9 +196,11 @@ queue scoped to this chat and substitutes them with a rendered response.
 
 - `[LIST_TASKS]` — "lista task", "che task ci sono".
 - `[TASK_STATUS name="<slug>"]` — "stato <slug>".
-- `[STOP_TASK name="<slug>"]` — "ferma <slug>" (terminal).
+- `[STOP_TASK name="<slug>"]` — "ferma <slug>" (stops execution; resumable).
 - `[PAUSE_TASK name="<slug>"]` — "pausa <slug>" (continuous tasks only).
 - `[RESUME_TASK name="<slug>"]` — "ripristina <slug>".
+- `[COMPLETE_TASK name="<slug>"]` — "completa <slug>" (terminal success).
+- `[DELETE_TASK name="<slug>"]` — "elimina <slug>" (terminal archive/delete).
 - `[GET_PLAN name="<slug>"]` — "dimmi il piano di <slug>".
 
 Ambiguous substrings are resolved by the system with a disambiguation
@@ -204,9 +208,11 @@ prompt — never guess a name on the user's behalf.
 
 ## External Collaborative Groups
 
-External groups are non-HQ chats (today: Telegram groups) where the user
-collaborates with a dedicated Robyx agent together with other people. A
-live registry of them is injected into your prompt as:
+External groups are non-HQ Telegram chats or Discord guild channels where the
+user collaborates with a dedicated Robyx agent together with other people.
+Slack collaborative groups are not supported yet. Robyx runs one messaging
+adapter at a time, so the target must use the currently active adapter. A live
+registry of groups is injected into your prompt as:
 
 ```
 [AVAILABLE_EXTERNAL_GROUPS]
@@ -219,11 +225,11 @@ groups currently exist — do not assume anything beyond what is listed.
 
 ### Pre-announcing a new external group
 
-When the user tells you they are going to create a new external group
-(e.g. "I'm creating a Telegram group with Alice and Bob for X"), emit:
+When the user tells you they are going to create a new external group or
+Discord channel, emit:
 
 ```
-[COLLAB_ANNOUNCE name="<slug>" display="<text>" purpose="<short purpose>" inherit="<workspace-name or empty>" inherit_memory="true|false"]
+[COLLAB_ANNOUNCE name="<slug>" display="<text>" purpose="<short purpose>" inherit="<workspace-name or empty>" inherit_memory="true|false" platform="<telegram|discord>" creator_id="<native user id>"]
 ```
 
 - `name`: 3-32 lowercase chars, `[a-z0-9-]+`, stable. This becomes the
@@ -233,6 +239,9 @@ When the user tells you they are going to create a new external group
 - `inherit`: slug of an existing workspace to inherit behaviour from,
   or empty string to start fresh.
 - `inherit_memory`: `"true"` or `"false"`.
+- `platform`: the currently active adapter, `"telegram"` or `"discord"`.
+- `creator_id`: the native Telegram user ID or Discord user ID of the person
+  who will add Robyx. Never use a guild, group, or channel ID here.
 
 Only emit this when the user is actively about to create the group.
 The handler replies with `[COLLAB_ANNOUNCE ok: name=<name>]` on success

@@ -60,7 +60,7 @@ The control room is a group chat with topics. Each topic is an agent. You talk, 
 2. **Robyx creates it on the fly.** A new topic appears, Robyx writes the agent's brief from your description, registers it in the scheduler, and spawns it. Zero config files.
 3. **You talk to the new agent in its topic.** It owns the work. Every message is contextually its own. If it needs a cross-functional skill, it asks a specialist via `[REQUEST @name: …]`.
 4. **You can delegate, focus, or jump topics.** `[FOCUS @agent]` routes your next messages straight to it; `[FOCUS off]` returns to Robyx.
-5. **Long-running work stays in the workspace chat.** Ask any workspace for an iterative research or optimization loop and it spins up a **continuous task**: git branch, state file, per-task `plan.md`, automatic step-by-step execution. Every step report comes back here with a `🔄 [<task-name>]` prefix — no separate channel to watch. Talk to the primary workspace agent to list, stop, pause, resume, ask about the plan, or **update the scope / checkpoint policy of a running task in place** (the agent is always aware of the tasks it owns and edits them instead of creating duplicates).
+5. **Long-running work gets a dedicated task topic.** Ask any workspace for an iterative research or optimization loop and it spins up a **continuous task**: git branch, revisioned program, state file, and automatic step-by-step execution. Step reports, pinned questions, incidents, and terminal notices land in that task topic; talk to the primary workspace agent to list, stop, pause, resume, inspect the plan, or **update the scope / checkpoint policy in place**.
 6. **Reminders and timers are native.** Any agent can emit `[REMIND in="1h" text="…"]` or `[REMIND at="…" agent="…" text="…"]` to schedule a message or an autonomous run. No code, no external cron.
 7. **Everything survives restarts.** State, queue, continuous task progress, scheduled jobs — all persisted under `data/`. Late-firing on recovery means no event is lost if the bot was offline.
 
@@ -69,12 +69,12 @@ The control room is a group chat with topics. Each topic is an agent. You talk, 
 ## Main Features
 
 - **Build your team by talking** — workspaces, specialists, and agent briefs created from chat. No YAML, no dashboards.
-- **Three messaging platforms** — Telegram, Discord, Slack. Switch at any time; all workspaces and memory are preserved.
+- **Three messaging platforms** — Telegram, Discord, Slack. Agent definitions and memory are portable; workspace channels and scheduled delivery scopes must be recreated or explicitly rebound when changing platform.
 - **Three AI backends** — Claude Code, Codex, OpenCode. Pick per-agent via semantic aliases (`fast`, `balanced`, `powerful`) or explicit model IDs in `models.yaml`.
 - **Unified 60 s scheduler** — reminders, one-shot, periodic, and continuous tasks in a single queue (`data/queue.json`) with atomic claims and late-firing on recovery.
-- **Continuous autonomous tasks** — step-by-step research/optimization loops with per-task git branch, structured state, per-task `plan.md`, and four configurable checkpoint policies (`on-demand`, `on-uncertainty`, `on-milestone`, `every-N-steps`). Lifecycle (list, status, stop, pause, resume, read plan, update scope/policy in place) is controlled from the parent workspace chat — no dedicated control channel.
+- **Continuous autonomous tasks** — step-by-step research/optimization loops with per-task git branch, structured state, revisioned `program.json`, a human-readable `plan.md`, and four configurable checkpoint policies (`on-demand`, `on-uncertainty`, `on-milestone`, `every-N-steps`). Each task has a dedicated delivery topic; lifecycle control stays in the parent workspace chat or the shared slash commands.
 - **Agent interruption** — any message to a busy agent immediately (SIGTERM → 5 s grace → SIGKILL) stops the current step and processes your new request.
-- **Collaborative workspaces** — invite external collaborators into a separate Telegram group with a role-based authorization model (Owner / Operator / Participant) and two interaction modes (intelligent or passive). Telegram-only today; Discord and Slack fall back to owner-only workspaces.
+- **Collaborative workspaces** — invite external collaborators into a separate Telegram group or Discord channel with a role-based authorization model (Owner / Operator / Participant) and two interaction modes (intelligent or passive). Slack remains owner-only until the spec-008 collaborative bridge ships.
 - **Memory system** — per-agent active + archive tiers, integrated with Claude Code memory files.
 - **Voice + images** — voice transcription via Whisper, agent-initiated image delivery (explicit `[SEND_IMAGE …]` only, never proactive).
 - **Safe auto-updates** — tag-based releases, pre-update snapshot, smoke test, atomic rollback on failure; migration chain runs once per version.
@@ -97,6 +97,7 @@ The control room is a group chat with topics. Each topic is an agent. You talk, 
 | [Voice + Images](docs/media.md) | Voice transcription via Whisper, agent-initiated image delivery |
 | [Auto-Updates + Migrations + Service Management](docs/updates.md) | Update flow with snapshots & smoke tests, migration framework, service installers |
 | [Data Directory Contract](docs/data-directory.md) | What lives under `data/`, who writes it, what is safe to delete, backup & recovery |
+| [Quality Gates](docs/quality.md) | Python support matrix, reproducible locks, lint/type/coverage ratchets, incremental decomposition roadmap |
 
 Two more useful refs at the repo root:
 - [`ORCHESTRATOR.md`](ORCHESTRATOR.md) — Robyx's behaviour reference (`[REMIND]`, `[DELEGATE]`, etc.)
@@ -113,7 +114,9 @@ Two more useful refs at the repo root:
 - One CLI-based AI tool: [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [Codex CLI](https://github.com/openai/codex) | [OpenCode](https://github.com/opencode-ai/opencode)
 - A messaging platform: **Telegram**, **Discord**, or **Slack**
 
-The setup wizard guides you through everything. You can switch platforms at any time by telling Robyx — all your workspaces, agents, and memory are preserved.
+The setup wizard guides you through everything. Agent briefs and memory remain
+on disk when switching platform, but platform-specific workspace channels and
+scheduled destinations must be recreated or explicitly rebound.
 
 ### Step 1: Clone and run the setup wizard
 
@@ -136,7 +139,7 @@ The setup validates tokens and IDs against platform APIs automatically.
 Run `python3 setup.py --help` for the full flag reference with "how to obtain" instructions.
 
 TELEGRAM — required flags:
-  --bot-token    Telegram bot token (from @BotFather → /newbot)
+  --bot-token-file  Owner-only file containing the Telegram bot token
   --chat-id      Chat ID (negative number; add bot to supergroup with Topics, then check
                  https://api.telegram.org/bot<TOKEN>/getUpdates for "chat":{"id":-100...})
   --owner-id     User ID (message @userinfobot on Telegram)
@@ -145,8 +148,8 @@ DISCORD — required flags:
   PREREQUISITE: user must enable Developer Mode in Discord first
   (Settings → App Settings → Advanced → Developer Mode ON) to see "Copy ID" options.
 
-  --discord-bot-token   Bot token (discord.com/developers/applications → app → Bot → Reset Token;
-                        also enable Message Content Intent on the same page)
+  --discord-bot-token-file  Owner-only file containing the bot token
+                            (also enable Message Content Intent on the bot page)
   --discord-guild-id    Server ID (right-click server name → Copy Server ID)
   --discord-owner-id    User ID (right-click own username → Copy User ID)
   --discord-channel-id  Control-room channel ID (pass it explicitly in non-interactive setup;
@@ -161,23 +164,29 @@ DISCORD — required flags:
     - Send Messages in Threads
 
 SLACK — required flags:
-  --slack-bot-token   Bot Token (xoxb-...; api.slack.com/apps → app → OAuth & Permissions)
-  --slack-app-token   App-Level Token (xapp-...; Basic Information → App-Level Tokens →
-                      generate with connections:write scope; also enable Socket Mode)
+  --slack-bot-token-file  Owner-only file containing the Bot Token (xoxb-...)
+  --slack-app-token-file  Owner-only file containing the App-Level Token (xapp-...)
   --slack-channel-id  Channel ID (right-click channel → View details → scroll to bottom)
   --slack-owner-id    User ID (click profile → Profile → ⋯ → Copy member ID)
   Required OAuth scopes: chat:write, channels:manage, channels:read, files:read
 
 COMMON optional flags:
-  --openai-key KEY           OpenAI API key for voice transcription
+  --openai-key-file FILE     Owner-only file containing the OpenAI API key
   --scheduler-interval SEC   Scheduler check interval (default: 600)
   --skip-test                Skip sending test message (Telegram only)
   --yes / -y                 Overwrite existing .env without asking
 
 Example (Discord):
   python3 setup.py --backend claude --platform discord \
-      --discord-bot-token "TOKEN" --discord-guild-id "123" \
+      --discord-bot-token-file "/private/discord-token" --discord-guild-id "123" \
       --discord-channel-id "789" --discord-owner-id "456" -y
+
+Secret files must be regular, owned by the current user, and mode `0600` (or
+stricter) on POSIX. Setup also accepts `ROBYX_SETUP_BOT_TOKEN`,
+`ROBYX_SETUP_SLACK_BOT_TOKEN`, `ROBYX_SETUP_SLACK_APP_TOKEN`,
+`ROBYX_SETUP_DISCORD_BOT_TOKEN`, and `ROBYX_SETUP_OPENAI_KEY`. The older
+value-bearing token flags still work with a deprecation warning, but can expose
+credentials through shell history and process listings and should not be used.
 
 UNINSTALLING ROBYX
 ====================
@@ -343,7 +352,7 @@ robyx-ai/
     ├── specialists.md         # (legacy pre-0.20 — read-only migration source)
     ├── agents/                # Workspace agent briefs (.md)
     ├── specialists/           # Specialist briefs (.md)
-    ├── continuous/            # Per-task state.json + plan.md
+    ├── continuous/            # Per-task state.json + program.json + plan.md
     ├── migrations.json        # Applied migrations tracker
     ├── collaborative_workspaces.json  # Collaborative-workspace registry
     ├── backups/               # Pre-update tar snapshots (retention: 3)

@@ -214,8 +214,9 @@ class TestRunPending:
         assert again == []
 
     @pytest.mark.asyncio
-    async def test_corrupt_tracker_treated_as_empty(self, fake_platform, fake_manager):
+    async def test_corrupt_tracker_blocks_migrations(self, fake_platform, fake_manager):
         import migrations as mig
+        from persistence_recovery import PersistenceUnavailableError
 
         mig.MIGRATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
         mig.MIGRATIONS_FILE.write_text("{not valid json")
@@ -224,13 +225,10 @@ class TestRunPending:
         async def a(platform, manager):
             return True
 
-        executed = await mig.run_pending(fake_platform, fake_manager)
-        # A corrupt tracker is treated as empty by *both* layers — the
-        # chain runner reseeds from SEED_VERSION and runs the bootstrap
-        # migration too. That's the desired recovery behaviour: rebuild
-        # the tracker from scratch instead of refusing to boot.
-        assert ("a", "success") in executed
-        assert ("0.20.11→0.20.12", "ok") in executed
+        with pytest.raises(PersistenceUnavailableError):
+            await mig.run_pending(fake_platform, fake_manager)
+        assert not mig.MIGRATIONS_FILE.exists()
+        assert list(mig.MIGRATIONS_FILE.parent.glob("migrations.json.corrupt-*"))
 
     @pytest.mark.asyncio
     async def test_runs_in_registration_order(self, fake_platform, fake_manager):

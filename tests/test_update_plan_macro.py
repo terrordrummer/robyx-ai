@@ -15,6 +15,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,6 +33,7 @@ from update_plan_macro import (  # noqa: E402
     extract_update_plan_macros,
     strip_update_plan_macros,
 )
+from task_scope import TaskScope
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -318,6 +320,55 @@ class TestApply:
         # Original state untouched.
         assert store.states["zeus"]["program"]["objective"] == "old obj"
 
+    def test_canonical_scope_blocks_same_thread_in_other_chat(self):
+        state = self._state()
+        state["workspace_scope"] = TaskScope(
+            "telegram", "-1001", 42,
+        ).to_dict()
+        store = _FakeStateStore({"zeus": state})
+        ctx = UpdatePlanContext(
+            thread_id=42,
+            chat_id=-1002,
+            task_scope=TaskScope("telegram", "-1002", 42),
+            state_reader=store.reader,
+            state_writer=store.writer,
+            plan_writer=store.plan_writer,
+        )
+        text = (
+            '[UPDATE_PLAN name="zeus"]\n'
+            '[CONTINUOUS_PROGRAM]\n{"objective": "hijack"}\n'
+            '[/CONTINUOUS_PROGRAM]\n'
+        )
+
+        _, outcomes = _run(apply_update_plan_macros(text, ctx))
+
+        assert outcomes[0].reason == "not_found"
+        assert store.states["zeus"]["program"]["objective"] == "old obj"
+
+    def test_canonical_none_thread_does_not_cross_chats(self):
+        state = self._state(thread_id=None)
+        state["workspace_scope"] = TaskScope(
+            "telegram", "-1001", None,
+        ).to_dict()
+        store = _FakeStateStore({"zeus": state})
+        ctx = UpdatePlanContext(
+            thread_id=None,
+            chat_id=-1002,
+            task_scope=TaskScope("telegram", "-1002", None),
+            state_reader=store.reader,
+            state_writer=store.writer,
+            plan_writer=store.plan_writer,
+        )
+        text = (
+            '[UPDATE_PLAN name="zeus"]\n'
+            '[CONTINUOUS_PROGRAM]\n{"objective": "hijack"}\n'
+            '[/CONTINUOUS_PROGRAM]\n'
+        )
+
+        _, outcomes = _run(apply_update_plan_macros(text, ctx))
+
+        assert outcomes[0].reason == "not_found"
+
     def test_bad_json_is_rejected(self):
         store = _FakeStateStore({"zeus": self._state()})
         ctx = UpdatePlanContext(
@@ -436,6 +487,141 @@ class TestApply:
         _, outcomes = _run(apply_update_plan_macros(text, ctx))
         assert outcomes[0].outcome == "applied"
         assert store.states["zeus"]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_stale_step_write_after_update_plan_cannot_rollback_program(
+    tmp_path, monkeypatch,
+):
+    import continuous as cont
+
+    monkeypatch.setattr(cont, "CONTINUOUS_DIR", tmp_path / "continuous")
+    state = cont.create_continuous_task(
+        name="race",
+        parent_workspace="ops",
+        program={"objective": "S0"},
+        thread_id=42,
+        branch="continuous/race",
+        work_dir=str(tmp_path),
+    )
+    path = cont.state_file_path("race")
+    stale_step_snapshot = json.loads(path.read_text())
+    ctx = UpdatePlanContext(thread_id=42)
+    text = (
+        '[UPDATE_PLAN name="race"]\n'
+        '[CONTINUOUS_PROGRAM]\n{"objective": "S1"}\n'
+        '[/CONTINUOUS_PROGRAM]\n'
+    )
+
+    _, outcomes = await apply_update_plan_macros(text, ctx)
+    assert outcomes[0].outcome == "applied"
+
+    stale_step_snapshot["status"] = "pending"
+    child_tmp = path.with_suffix(".child.tmp")
+    child_tmp.write_text(json.dumps(stale_step_snapshot))
+    child_tmp.replace(path)
+
+    reconciled = cont.load_state(path)
+    assert reconciled["program"]["objective"] == "S1"
+    assert reconciled["program_revision"] == state["program_revision"] + 1
+
+
+@pytest.mark.asyncio
+async def test_update_plan_serializes_with_lifecycle_transaction(
+    tmp_path, monkeypatch,
+):
+    import continuous as cont
+    import lifecycle_macros as lifecycle
+
+    monkeypatch.setattr(cont, "CONTINUOUS_DIR", tmp_path / "continuous")
+    cont.create_continuous_task(
+        name="serialized",
+        parent_workspace="ops",
+        program={"objective": "S0"},
+        thread_id=42,
+        branch="continuous/serialized",
+        work_dir=str(tmp_path),
+    )
+    lifecycle_entered = asyncio.Event()
+    release_lifecycle = asyncio.Event()
+
+    async def lifecycle_writer():
+        async with lifecycle._lifecycle_task_lock("serialized"):
+            state = cont.load_state(cont.state_file_path("serialized"))
+            cont.pause_task(state)
+            cont.save_state(cont.state_file_path("serialized"), state)
+            lifecycle_entered.set()
+            await release_lifecycle.wait()
+
+    lifecycle_task = asyncio.create_task(lifecycle_writer())
+    await lifecycle_entered.wait()
+    update_task = asyncio.create_task(apply_update_plan_macros(
+        '[UPDATE_PLAN name="serialized"]\n'
+        '[CONTINUOUS_PROGRAM]\n{"objective": "S1"}\n'
+        '[/CONTINUOUS_PROGRAM]',
+        UpdatePlanContext(thread_id=42),
+    ))
+    await asyncio.sleep(0)
+    assert not update_task.done()
+
+    release_lifecycle.set()
+    await asyncio.gather(lifecycle_task, update_task)
+
+    final = cont.load_state(cont.state_file_path("serialized"))
+    assert final["status"] == "stopped"
+    assert final["program"]["objective"] == "S1"
+
+
+@pytest.mark.asyncio
+async def test_update_plan_migrates_unambiguous_legacy_state_and_queue(
+    tmp_path, monkeypatch,
+):
+    import config
+    import continuous as cont
+    import scheduler as sched
+
+    monkeypatch.setattr(cont, "CONTINUOUS_DIR", tmp_path / "continuous")
+    monkeypatch.setattr(sched, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(sched, "QUEUE_FILE", tmp_path / "queue.json")
+    monkeypatch.setattr(config, "PLATFORM", "telegram")
+    monkeypatch.setattr(config, "CHAT_ID", -1001)
+    cont.create_continuous_task(
+        name="legacy-update",
+        parent_workspace="ops",
+        program={"objective": "S0"},
+        thread_id=42,
+        branch="continuous/legacy-update",
+        work_dir=str(tmp_path),
+    )
+    sched.add_task({
+        "name": "legacy-update",
+        "type": "continuous",
+        "agent_file": "agents/legacy-update.md",
+        "thread_id": "99",
+        "state_file": str(cont.state_file_path("legacy-update")),
+    }, allow_legacy_unscoped=True)
+    scope = TaskScope("telegram", "-1001", 42)
+    manager = SimpleNamespace(
+        list_active=lambda: [SimpleNamespace(name="ops", thread_id=42)],
+    )
+
+    _, outcomes = await apply_update_plan_macros(
+        '[UPDATE_PLAN name="legacy-update"]\n'
+        '[CONTINUOUS_PROGRAM]\n{"objective": "S1"}\n'
+        '[/CONTINUOUS_PROGRAM]',
+        UpdatePlanContext(
+            thread_id=42,
+            chat_id=-1001,
+            task_scope=scope,
+            manager=manager,
+        ),
+    )
+
+    assert outcomes[0].outcome == "applied"
+    assert cont.load_state(
+        cont.state_file_path("legacy-update")
+    )["workspace_scope"] == scope.to_dict()
+    assert sched.load_queue()[0]["workspace_scope"] == scope.to_dict()
 
 
 # ─────────────────────────────────────────────────────────────────────────

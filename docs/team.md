@@ -84,36 +84,57 @@ Pre-built agent platforms give you 500 skills you didn't ask for and charge you 
 
 Since v0.28.0 (spec 007), Robyx can host collaborative workspaces on Discord guilds at functional parity with Telegram. Two flows are supported, mirroring Telegram's behaviour:
 
-**Flow A — pre-announce from HQ.** In your Telegram HQ session, tell the orchestrator to spin up a workspace and say it should live on Discord:
+**Flow A — pre-announce from Discord HQ.** While Robyx is running with `ROBYX_PLATFORM=discord`, tell the orchestrator in its configured Discord control channel to prepare another Discord collaborative workspace:
 
 ```
 "Create a collaborative workspace called atlas for the Atlas project.
 It should live on Discord — my Discord user id is 456789012345678901."
 ```
 
-The orchestrator emits `[COLLAB_ANNOUNCE name="atlas" platform="discord" ...]`. The workspace is persisted as `status="pending"` with `expected_platform="discord"`. When you add Robyx to your Discord guild (via the OAuth bot-invite URL), the bot consults the guild's audit log to confirm you were the inviter, binds the workspace to the first writable channel, generates an invite link, and notifies HQ on Telegram that the workspace is configured.
+The orchestrator emits `[COLLAB_ANNOUNCE name="atlas" platform="discord" ...]`. The workspace is persisted as `status="pending"` with `expected_platform="discord"`. When you add the same running Robyx bot to the target guild (via the OAuth bot-invite URL), it consults the guild's audit log to confirm the inviter, binds the workspace to the first writable channel, generates an invite link, and notifies the configured Discord control channel. Robyx runs one messaging adapter at a time; a Telegram process cannot simultaneously receive the Discord join event.
 
-**Flow B — ad-hoc add.** If you (or any OWNER/OPERATOR of an existing workspace) add Robyx to a Discord guild *without* pre-announcing, the bot creates a provisional workspace and starts a setup conversation in the channel — same pattern as Telegram. The setup agent emits `[COLLAB_SETUP_COMPLETE …]` when configuration is captured.
+**Flow B — ad-hoc add.** If you (or any OWNER/OPERATOR of an existing workspace) add Robyx to a Discord guild *without* pre-announcing, the bot creates a provisional workspace and starts a setup conversation in the channel — same pattern as Telegram. The setup agent emits `[COLLAB_SETUP_COMPLETE …]` when configuration is captured. This ad-hoc flow requires `View Audit Log`, because Robyx must prove who added it before creating anything.
 
 **Required Discord permissions** (granted via the bot invite URL):
 
-- `View Audit Log` — needed to resolve "who added me" when `on_guild_join` fires. Without it the audit-log lookup fails and the bot falls back to manual claim (see below).
+- `View Audit Log` — needed to resolve "who added me" when `on_guild_join`
+  fires. Without it Robyx fails closed before ad-hoc Flow B. The manual claim
+  below remains available only for an already pre-announced pending workspace.
 - `Create Instant Invite` — needed to generate the invite URL that Robyx attaches to the HQ notification.
 - `Send Messages`, `Manage Channels` — standard message and topic-op permissions.
 
-**`/im-the-owner <workspace-name>` — manual claim.** If the audit-log lookup fails (you didn't grant `View Audit Log`, or Discord's audit log was empty when the bot polled), Robyx posts an advisory in the channel asking you to type:
+**`/im-the-owner <workspace-name>` — pending-workspace manual claim.** If the
+audit-log lookup fails and a matching Flow A workspace was already announced,
+Robyx posts an advisory in the channel asking you to type:
 
 ```
 /im-the-owner atlas
 ```
 
-The bot validates that you match the workspace's `expected_creator_id` and that the workspace is targeted at Discord, then binds it to the channel where you typed the command. Same downstream flow as the audit-log success path.
+The bot validates that the named workspace is still pending, you match its
+`expected_creator_id`, and it targets Discord, then binds it to the channel
+where you typed the command. It does not create an ad-hoc workspace when no
+pending record exists.
 
 **Invite-link defaults.** Robyx generates invite URLs with `max_age=DISCORD_INVITE_TTL_DAYS * 86400` and `max_uses=DISCORD_INVITE_MAX_USES`. The defaults are 7 days and 10 uses; both knobs are operator-configurable via env vars (see [Configuration](configuration.md)). A value of `0` is Discord's "no limit" sentinel and is accepted verbatim.
 
 **Shared-guild safety.** A single Discord guild can legitimately host multiple collaborative workspaces — each mapped to a different channel (`chat_id = "<guild>:<channel>"`). When an unauthorized user tries to add Robyx to a channel of a guild where you *already* have a legitimate workspace, the refusal flow is contained: the refusal message lands in the offending channel, but the bot does **not** leave the entire guild (which would orphan the legitimate workspace). The bot stays a member of the guild for the channels you control.
 
-**Slack note.** As of spec 007 Slack is still documented as "not yet supported" for collaborative workspaces. Spec 008 closes that gap using the same `ChatRef` and lifecycle abstractions — the user-visible flow on Slack will be identical to Discord, with `member_joined_channel` standing in for the audit-log lookup (Slack provides the inviter directly).
+**Role enforcement.** Owners and operators keep the configured autonomous
+backend permissions. Participant and unknown-user AI turns are disabled by
+default. An operator may explicitly set `COLLAB_PARTICIPANT_POLICY=read-only`
+for a workspace where every participant is allowed to inspect all readable
+content. Those opt-in turns use a separate stateless profile selected by
+application code; prompt text cannot promote a turn. Participants cannot write,
+run mutating shell commands, use network/browser/MCP/subagents, dispatch system
+macros, or interrupt an executive task already in progress. Read-only protects
+integrity, not secrecy, so it is inappropriate for workspaces containing data a
+participant must not see.
+
+**Slack note.** Slack collaborative workspaces remain a documented product
+limitation. A future spec 008 is expected to close that gap using the existing
+`ChatRef` and lifecycle abstractions; until then, use Telegram or Discord for
+external collaborative workspaces.
 
 ---
 

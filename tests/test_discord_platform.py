@@ -547,6 +547,16 @@ class TestSendToChannel:
         result = await platform_with_client.send_to_channel(100, "fail")
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_deleted_channel_raises_topic_unreachable(self, platform_with_client):
+        from messaging.base import TopicUnreachable
+
+        platform_with_client._fetch_channel = AsyncMock(
+            side_effect=TopicUnreachable(404, reason="deleted"),
+        )
+        with pytest.raises(TopicUnreachable):
+            await platform_with_client.send_to_channel(404, "fail")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # set_bot

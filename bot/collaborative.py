@@ -13,12 +13,13 @@ lives here:
     collab.archive             -- bot removed; workspace closed
     collab.migrate             -- supergroup migration; chat_id rebound
     collab.unauthorised        -- non-authorised user tried to provision
-    collab.unsupported_platform-- Discord/Slack add event (not yet supported)
+    collab.unsupported_platform-- Slack add event (not yet supported)
 """
 
 from __future__ import annotations
 
 import contextlib
+import copy
 import enum
 import json
 import logging
@@ -42,6 +43,7 @@ except ImportError:  # pragma: no cover
 
 from config import DATA_DIR
 from messaging.base import ChatRef
+from persistence_recovery import guard_json_write, load_json_with_recovery
 
 log = logging.getLogger("robyx.collaborative")
 
@@ -262,6 +264,52 @@ class CollabWorkspace:
 _ROUTABLE_STATUSES = ("active", "setup")
 
 
+def _valid_collab_registry(value: Any) -> bool:
+    """Reject a partially malformed registry instead of loading a subset."""
+    if not isinstance(value, dict):
+        return False
+    for ws_id, payload in value.items():
+        if not isinstance(ws_id, str) or not ws_id or not isinstance(payload, dict):
+            return False
+        if payload.get("id") != ws_id:
+            return False
+        for key in ("name", "agent_name"):
+            if not isinstance(payload.get(key), str) or not payload[key]:
+                return False
+        for key in ("display_name", "platform", "expected_platform", "interaction_mode",
+                    "parent_workspace", "invite_link", "status"):
+            item = payload.get(key)
+            if item is not None and not isinstance(item, str):
+                return False
+        if payload.get("status", "active") not in {"pending", "setup", "active", "closed"}:
+            return False
+        if payload.get("interaction_mode", "intelligent") not in {"intelligent", "passive"}:
+            return False
+        inherit_memory = payload.get("inherit_memory", True)
+        if not isinstance(inherit_memory, bool):
+            return False
+        chat_id = payload.get("chat_id", "0")
+        if chat_id is not None and not isinstance(chat_id, (str, int)):
+            return False
+        roles = payload.get("roles", {})
+        if not isinstance(roles, dict):
+            return False
+        if any(
+            not isinstance(uid, str) or role not in {item.value for item in Role}
+            for uid, role in roles.items()
+        ):
+            return False
+        for key in ("created_by", "expected_creator_id"):
+            item = payload.get(key)
+            if item is not None and not isinstance(item, (str, int)):
+                return False
+        try:
+            CollabWorkspace.from_dict(payload)
+        except (KeyError, TypeError, ValueError):
+            return False
+    return True
+
+
 class CollabStore:
     """Persistence layer for collaborative workspaces."""
 
@@ -320,55 +368,42 @@ class CollabStore:
                 finally:
                     os.close(fd)
 
-    def _load(self) -> None:
-        if not self._path.exists():
-            return
-
-        from agents import _quarantine_corrupt_file, _recover_from_snapshot
-
-        # Two attempts: the original file, then whatever recovery was
-        # able to install (if anything). See AgentManager._load_state for
-        # the same pattern.
-        for attempt in range(2):
-            try:
-                raw = self._path.read_text()
-            except (OSError, UnicodeDecodeError) as e:
-                if attempt == 0:
-                    _quarantine_corrupt_file(self._path, reason="Decode error: %s" % e)
-                    if _recover_from_snapshot(self._path, reason="Decode error: %s" % e):
-                        continue
-                log.error(
-                    "Failed to read collaborative workspaces from %s: %s — "
-                    "file quarantined, starting with empty registry",
-                    self._path, e,
-                )
-                return
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError as e:
-                if attempt == 0:
-                    _quarantine_corrupt_file(self._path, reason="JSONDecodeError: %s" % e)
-                    if _recover_from_snapshot(self._path, reason="JSONDecodeError: %s" % e):
-                        continue
-                log.error(
-                    "Collaborative workspaces file %s is corrupt — quarantined. "
-                    "Re-add the bot to each collaborative group to rebuild state.",
-                    self._path,
-                )
-                return
-            break  # parse succeeded
-        try:
-            for ws_id, ws_data in data.items():
-                ws = CollabWorkspace.from_dict(ws_data)
-                self._workspaces[ws.id] = ws
-            self._rebuild_chat_map()
-            log.info("Loaded %d collaborative workspaces", len(self._workspaces))
-        except Exception as e:
-            log.error(
-                "Failed to parse collaborative workspaces from %s: %s — "
-                "collaborative routing is DEGRADED until this is fixed",
-                self._path, e,
+    @contextlib.contextmanager
+    def _mutation(self):
+        """Guard live bytes and roll back memory if persistence fails."""
+        with self._mutex():
+            guard_json_write(
+                self._path,
+                data_dir=self._path.parent,
+                validator=_valid_collab_registry,
+                kind="collaborative workspace registry",
+                logger=log,
             )
+            before = copy.deepcopy(self._workspaces)
+            try:
+                yield
+            except BaseException:
+                self._workspaces = before
+                self._rebuild_chat_map()
+                raise
+
+    def _load(self) -> None:
+        result = load_json_with_recovery(
+            self._path,
+            data_dir=self._path.parent,
+            validator=_valid_collab_registry,
+            kind="collaborative workspace registry",
+            logger=log,
+        )
+        if result.status == "missing":
+            return
+        parsed = {
+            ws_id: CollabWorkspace.from_dict(ws_data)
+            for ws_id, ws_data in result.value.items()
+        }
+        self._workspaces = parsed
+        self._rebuild_chat_map()
+        log.info("Loaded %d collaborative workspaces", len(self._workspaces))
 
     def _rebuild_chat_map(self) -> None:
         self._chat_map = {}
@@ -377,10 +412,22 @@ class CollabStore:
                 self._chat_map[(ws.platform, ws.chat_id)] = ws.id
 
     def _write_unlocked(self) -> None:
+        guard_json_write(
+            self._path,
+            data_dir=self._path.parent,
+            validator=_valid_collab_registry,
+            kind="collaborative workspace registry",
+            logger=log,
+        )
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = {ws_id: ws.to_dict() for ws_id, ws in self._workspaces.items()}
+        if not _valid_collab_registry(data):
+            raise ValueError("refusing to persist malformed collaborative registry")
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
+        with open(tmp, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(data, indent=2))
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(tmp, self._path)
 
     def _save(self) -> None:
@@ -388,13 +435,13 @@ class CollabStore:
             self._write_unlocked()
 
     def add(self, ws: CollabWorkspace) -> None:
-        with self._mutex():
+        with self._mutation():
             self._workspaces[ws.id] = ws
             self._rebuild_chat_map()
             self._write_unlocked()
 
     def remove(self, ws_id: str) -> bool:
-        with self._mutex():
+        with self._mutation():
             if ws_id not in self._workspaces:
                 return False
             del self._workspaces[ws_id]
@@ -403,7 +450,7 @@ class CollabStore:
             return True
 
     def close(self, ws_id: str) -> bool:
-        with self._mutex():
+        with self._mutation():
             ws = self._workspaces.get(ws_id)
             if not ws:
                 return False
@@ -419,7 +466,7 @@ class CollabStore:
         audit history; call this from a maintenance command when the
         backlog gets too large. Returns the number of entries removed.
         """
-        with self._mutex():
+        with self._mutation():
             closed_ids = [
                 ws_id for ws_id, ws in self._workspaces.items()
                 if ws.status == "closed"
@@ -532,7 +579,7 @@ class CollabStore:
         name = validate_collab_name(name)
         if creator_id == 0:
             raise ValueError("creator_id must not be zero")
-        with self._mutex():
+        with self._mutation():
             for existing in self._workspaces.values():
                 if existing.name == name:
                     raise ValueError("name collision: %s" % name)
@@ -579,7 +626,7 @@ class CollabStore:
         responsible for rewriting ``data/agents/<name>.md`` *before*
         calling this (ordering matches ``create_pending``).
         """
-        with self._mutex():
+        with self._mutation():
             ws = self._workspaces.get(ws_id)
             if not ws:
                 return False
@@ -615,7 +662,7 @@ class CollabStore:
             return False
         if not new_ref.chat_id or new_ref.chat_id == "0":
             return False
-        with self._mutex():
+        with self._mutation():
             ws_id = self._chat_map.get((old_ref.platform, old_ref.chat_id))
             ws = self._workspaces.get(ws_id) if ws_id else None
             if not ws:
@@ -687,7 +734,7 @@ class CollabStore:
         Refuses creator mismatches in the same conditions as pre-007.
         """
         new_ref = _normalise_chat_ref(chat_ref_or_id)
-        with self._mutex():
+        with self._mutation():
             ws = self._workspaces.get(ws_id)
             if not ws:
                 return False
@@ -726,7 +773,7 @@ class CollabStore:
             return True
 
     def update_roles(self, ws_id: str, user_id: int | str, role: Role) -> bool:
-        with self._mutex():
+        with self._mutation():
             ws = self._workspaces.get(ws_id)
             if not ws:
                 return False
@@ -735,7 +782,7 @@ class CollabStore:
             return True
 
     def update_interaction_mode(self, ws_id: str, mode: str) -> bool:
-        with self._mutex():
+        with self._mutation():
             ws = self._workspaces.get(ws_id)
             if not ws:
                 return False
@@ -746,7 +793,7 @@ class CollabStore:
             return True
 
     def update_invite_link(self, ws_id: str, link: str) -> bool:
-        with self._mutex():
+        with self._mutation():
             ws = self._workspaces.get(ws_id)
             if not ws:
                 return False

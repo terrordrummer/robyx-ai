@@ -353,20 +353,32 @@ class DiscordPlatform(Platform):
             return False
 
     async def send_to_channel(self, channel_id: int, text: str, parse_mode: str | None = None) -> bool:
+        return bool(
+            await self.send_to_channel_with_ref(channel_id, text, parse_mode=parse_mode)
+        )
+
+    async def send_to_channel_with_ref(
+        self,
+        channel_id: int,
+        text: str,
+        parse_mode: str | None = None,
+    ) -> Any:
         """Send a message to a specific channel or thread by ID."""
-        channel = self._client.get_channel(channel_id)
-        if channel is None:
-            try:
-                channel = await self._client.fetch_channel(channel_id)
-            except Exception:
-                log.error("Could not find channel %d", channel_id)
-                return False
+        import discord
+        from .base import TopicUnreachable
         try:
-            await channel.send(text)
-            return True
+            channel = await self._fetch_channel(channel_id)
+        except TopicUnreachable:
+            raise
+        if channel is None:
+            return None
+        try:
+            return await channel.send(text)
+        except discord.NotFound as exc:
+            raise TopicUnreachable(channel_id, reason=str(exc))
         except Exception as e:
             log.error("Error sending to channel %d: %s", channel_id, e)
-            return False
+            return None
 
     async def leave_chat(self, chat_id: Any) -> None:
         """Spec 007: leave a Discord guild. ``chat_id`` is the canonical
@@ -500,6 +512,7 @@ class DiscordPlatform(Platform):
 
     async def edit_topic_title(self, channel_id: int, new_title: str) -> bool:
         """Rename a thread or channel to ``new_title``."""
+        import discord
         from .base import TopicUnreachable
         try:
             channel = await self._fetch_channel(channel_id)
@@ -514,6 +527,8 @@ class DiscordPlatform(Platform):
             await channel.edit(name=new_title)
             log.info("Renamed Discord channel %d → %r", channel_id, new_title)
             return True
+        except discord.NotFound as exc:
+            raise TopicUnreachable(channel_id, reason=str(exc))
         except Exception as exc:
             log.error(
                 "Failed to rename Discord channel %d: %s", channel_id, exc,
@@ -615,6 +630,8 @@ class DiscordPlatform(Platform):
             # Regular channels cannot be "closed" without deleting — fall
             # back to existing close_channel semantics for compatibility.
             return await self.close_channel(channel_id)
+        except discord.NotFound as exc:
+            raise TopicUnreachable(channel_id, reason=str(exc))
         except Exception as exc:
             log.error("Failed to close Discord channel %d: %s", channel_id, exc)
             return False
@@ -702,9 +719,8 @@ class DiscordPlatform(Platform):
         """Return the first text channel in ``guild`` where the bot can
         post, or ``None`` if no such channel exists.
 
-        Preference order (matches the existing Telegram-only Discord
-        unsupported-platform notice path in ``bot/bot.py`` so the
-        behaviour is familiar):
+        Preference order (also used by the Discord audit-log advisory
+        path in ``bot/bot.py``):
 
         1. ``guild.system_channel`` if writable.
         2. The first entry of ``guild.text_channels`` that is writable.

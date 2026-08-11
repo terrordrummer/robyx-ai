@@ -10,6 +10,7 @@ fresh session for the new instructions to actually take effect:
   ``FOCUSED_AGENT_SYSTEM_PROMPT``)
 - the per-agent brief loader in :mod:`bot.ai_invoke`
   (``_load_agent_instructions``)
+- any runtime system prompt loaded from ``templates/prompt_*.md``
 - an individual agent's brief at ``agents/<name>.md``
 - a specialist's brief at ``specialists/<name>.md``
 
@@ -59,6 +60,11 @@ log = logging.getLogger("robyx.session_lifecycle")
 GLOBAL_INVALIDATION_FILES: frozenset[str] = frozenset({
     "bot/config.py",       # ROBYX_/WORKSPACE_/FOCUSED_AGENT_SYSTEM_PROMPT live here
     "bot/ai_invoke.py",    # _load_agent_instructions lives here
+    "templates/prompt_orchestrator.md",
+    "templates/prompt_workspace_agent.md",
+    "templates/prompt_focused_agent.md",
+    "templates/prompt_collaborative_agent.md",
+    "templates/CONTINUOUS_SETUP.md",
 })
 
 # Path patterns that map to a single agent / specialist by name. Anchored

@@ -12,6 +12,12 @@ description: "Task list for feature 005-unified-workspace-chat"
 
 **Organization**: Grouped by user story. US1 is the MVP slice. US1 and US2 are both P1 and are expected to land together before public release, but each can be implemented independently.
 
+**Reconciled 2026-08-12**: 71/72 tasks have repository evidence. T071 remains
+open because it is a live-credential smoke test. Spec 006 subsequently restored
+dedicated continuous-task delivery topics, so historical 005 descriptions of
+parent-topic delivery are release-boundary evidence, not the current runtime
+contract.
+
 ## Format: `[ID] [P?] [Story] Description`
 
 - **[P]**: Parallelizable (distinct files, no incomplete dependencies)
@@ -193,8 +199,11 @@ Single-project layout. `bot/` at repo root (NOT `src/bot/`). Tests under `tests/
 - [X] T066 [P] `releases/0.23.0.md` documents the user-visible change, the migration behaviour, the schema delta, test counts, and manual rollback steps.
 - [X] T067 [P] No legacy alias was ever introduced — `create_continuous_workspace` kept its name throughout (runtime behaviour changed but the symbol is stable). Rename to `create_continuous_task` can happen in a future patch release without affecting callers.
 - [X] T068 Full suite: **1611 passed, 1 skipped** on Python 3.12.2 at branch `005-unified-workspace-chat`. Zero regressions vs. main.
-- [ ] T069 **Deferred** — `ruff` is not installed in the local env (`command not found`). The project's `CLAUDE.md` references `ruff check .` but the venv doesn't ship it. Operator task: `pip install ruff && ruff check .` before tagging the release. No code-style smells introduced that would fail a clean ruff run — PEP 8-conformant throughout.
-- [X] T070 `specs/spec-status.md` now lists feature 005 as Complete (72/72) with the branch and version reference.
+- [X] T069 Ruff is now a pinned quality dependency and the repository's critical
+  `ruff check bot tests setup.py` gate passes on every Python 3.10–3.14 CI job.
+- [X] T070 `specs/spec-status.md` now lists feature 005 honestly as 71/72,
+  with the shipped version and the remaining live-credential smoke test called
+  out explicitly.
 - [ ] T071 **Deferred** — live smoke test (`quickstart.md` §4–§8) requires a running bot instance with real platform credentials; can only be validated on the operator's machine. All automated paths are covered by the 91 new tests.
 - [X] T072 Superseded the 5-day-old memory entry `project_continuous_tasks_design.md` with the new architecture (parent-chat delivery, lifecycle macros, knowledge parity, migration). The old sub-topic design notes are gone — the memory now reflects v0.23.0 reality.
 

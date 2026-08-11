@@ -11,25 +11,30 @@ Pass all required parameters as CLI flags to skip interactive prompts.
 This lets AI agents collect parameters first, then run setup in one shot.
 
   python3 setup.py --backend claude --platform telegram \
-      --bot-token 123:ABC --chat-id -100123 --owner-id 456 \
+      --bot-token-file /private/token --chat-id -100123 --owner-id 456 \
       --workspace ~/Workspace --scheduler-interval 600
 
 Platform-specific flags:
-  Telegram: --bot-token, --chat-id, --owner-id
-  Slack:    --slack-bot-token, --slack-app-token, --slack-channel-id, --slack-owner-id
-  Discord:  --discord-bot-token, --discord-guild-id, --discord-channel-id, --discord-owner-id
+  Telegram: --bot-token-file, --chat-id, --owner-id
+  Slack:    --slack-bot-token-file, --slack-app-token-file, --slack-channel-id, --slack-owner-id
+  Discord:  --discord-bot-token-file, --discord-guild-id, --discord-channel-id, --discord-owner-id
             NOTE: Discord requires Developer Mode enabled to copy IDs
             (Discord Settings > Advanced > Developer Mode ON)
 
-Optional: --openai-key, --scheduler-interval, --skip-test, --yes (overwrite .env)
+Optional: --openai-key-file, --scheduler-interval, --skip-test, --yes (overwrite .env)
+
+Each secret also accepts a ``ROBYX_SETUP_*`` environment variable. Legacy
+value-bearing flags remain compatible but are deprecated because process
+arguments can be retained in shell history and process monitors.
 """
 
 import argparse
+import getpass
 import json
 import os
 import platform
 import shutil
-import subprocess
+import stat
 import sys
 import time
 import urllib.request
@@ -38,6 +43,17 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent
 ENV_FILE = PROJECT_ROOT / ".env"
+BOT_DIR = PROJECT_ROOT / "bot"
+if str(BOT_DIR) not in sys.path:
+    sys.path.insert(0, str(BOT_DIR))
+
+from config_schema import (  # noqa: E402 - bot/ is added above for script mode
+    CHAT_ENV_FIELDS,
+    EnvValidationError,
+    validate_env_updates,
+)
+from config_updates import write_private_env_file  # noqa: E402
+from local_security import ensure_private_directory  # noqa: E402
 
 # AI backends and their CLI binary names
 BACKENDS = {
@@ -53,6 +69,140 @@ PLATFORMS = {
 }
 
 POLL_TIMEOUT = 30  # seconds per long-poll request
+MAX_SECRET_FILE_BYTES = 1024 * 1024
+
+
+class SecretInputError(ValueError):
+    """A setup secret source was ambiguous or unsafe to read."""
+
+
+_SECRET_INPUTS = (
+    ("bot_token", "bot_token_file", "ROBYX_SETUP_BOT_TOKEN", "--bot-token"),
+    (
+        "slack_bot_token",
+        "slack_bot_token_file",
+        "ROBYX_SETUP_SLACK_BOT_TOKEN",
+        "--slack-bot-token",
+    ),
+    (
+        "slack_app_token",
+        "slack_app_token_file",
+        "ROBYX_SETUP_SLACK_APP_TOKEN",
+        "--slack-app-token",
+    ),
+    (
+        "discord_bot_token",
+        "discord_bot_token_file",
+        "ROBYX_SETUP_DISCORD_BOT_TOKEN",
+        "--discord-bot-token",
+    ),
+    ("openai_key", "openai_key_file", "ROBYX_SETUP_OPENAI_KEY", "--openai-key"),
+)
+
+
+def ask_secret(prompt):
+    """Read an interactive secret without terminal echo."""
+    return getpass.getpass("%s: " % prompt).strip()
+
+
+def _read_secret_file(path_value):
+    """Read one owner-only regular file without following POSIX symlinks."""
+    path = Path(path_value)
+    if path.is_symlink():
+        raise SecretInputError("secret input files must not be symlinks")
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise SecretInputError("could not safely open secret input file") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SecretInputError("secret input must be a regular file")
+        if info.st_size > MAX_SECRET_FILE_BYTES:
+            raise SecretInputError("secret input file is unexpectedly large")
+        if os.name == "posix":
+            if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+                raise SecretInputError("secret input file must be owned by the current user")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise SecretInputError("secret input file must not be readable by group or others")
+        payload = bytearray()
+        while len(payload) <= MAX_SECRET_FILE_BYTES:
+            chunk = os.read(fd, min(65536, MAX_SECRET_FILE_BYTES + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > MAX_SECRET_FILE_BYTES:
+            raise SecretInputError("secret input file is unexpectedly large")
+    finally:
+        os.close(fd)
+
+    try:
+        value = bytes(payload).decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise SecretInputError("secret input file must be UTF-8") from exc
+    if not value or any(character in value for character in ("\x00", "\r", "\n")):
+        raise SecretInputError("secret input must contain exactly one non-empty line")
+    return value
+
+
+def prepare_secret_inputs(args, *, environ=None, warn=None):
+    """Resolve setup secrets from a private file, setup env, or legacy argv.
+
+    Existing value-bearing flags remain compatible but are deprecated because
+    shells and process monitors can retain their arguments.  No diagnostic
+    contains a secret value.
+    """
+    environment = os.environ if environ is None else environ
+    warning = warn or (lambda message: print(message, file=sys.stderr))
+    for value_attr, file_attr, env_name, legacy_flag in _SECRET_INPUTS:
+        argv_value = getattr(args, value_attr, None)
+        file_value = getattr(args, file_attr, None)
+        env_value = environment.get(env_name)
+        supplied = sum(value not in (None, "") for value in (argv_value, file_value, env_value))
+        if supplied > 1:
+            raise SecretInputError(
+                "use only one source for %s (private file, setup env, or legacy flag)"
+                % legacy_flag
+            )
+        if argv_value not in (None, ""):
+            warning(
+                "Warning: %s is deprecated because argv can be exposed; use %s-file "
+                "or %s instead."
+                % (legacy_flag, legacy_flag, env_name)
+            )
+            resolved = argv_value
+        elif file_value not in (None, ""):
+            resolved = _read_secret_file(file_value)
+        elif env_value not in (None, ""):
+            resolved = env_value
+        else:
+            resolved = ""
+        if any(character in resolved for character in ("\x00", "\r", "\n")):
+            raise SecretInputError("secret input must contain exactly one non-empty line")
+        setattr(args, value_attr, resolved)
+    return args
+
+
+def _write_validated_config(config):
+    """Validate the shared settings and atomically write a private .env."""
+    shared = {
+        key: value
+        for key, value in config.items()
+        if key in CHAT_ENV_FIELDS
+    }
+    config.update(validate_env_updates(shared))
+
+    lines = []
+    for key, value in config.items():
+        value = str(value)
+        if any(character in value for character in ("\x00", "\r", "\n")):
+            raise EnvValidationError(key, "must be a single-line value")
+        lines.append("%s=%s" % (key, value))
+    write_private_env_file(ENV_FILE, ("\n".join(lines) + "\n").encode("utf-8"))
 
 
 def banner():
@@ -105,11 +255,11 @@ def validate_telegram_token(token):
                 return True
             print("  Token rejected by Telegram.")
             return False
-    except urllib.error.URLError as e:
-        print("  Cannot reach Telegram API: %s" % e)
+    except urllib.error.URLError:
+        print("  Cannot reach Telegram API.")
         return False
-    except Exception as e:
-        print("  Validation error: %s" % e)
+    except Exception:
+        print("  Telegram token validation failed.")
         return False
 
 
@@ -147,11 +297,11 @@ def validate_chat_id(token, chat_id):
 
             print("  Valid! Supergroup: %s (topics enabled)" % title)
             return True
-    except urllib.error.URLError as e:
-        print("  Cannot reach Telegram API: %s" % e)
+    except urllib.error.URLError:
+        print("  Cannot reach Telegram API.")
         return False
-    except Exception as e:
-        print("  Validation error: %s" % e)
+    except Exception:
+        print("  Telegram chat validation failed.")
         return False
 
 
@@ -295,7 +445,7 @@ def _setup_telegram(config):
     print("\n--- Telegram Bot Token ---\n")
     print("Get a token from @BotFather on Telegram.")
     while True:
-        token = ask("Bot token")
+        token = ask_secret("Bot token")
         if validate_telegram_token(token):
             config["ROBYX_BOT_TOKEN"] = token
             break
@@ -319,7 +469,7 @@ def _setup_telegram(config):
         print()
         print("  Add the bot to your supergroup (with topics enabled),")
         print("  send a message, then check:")
-        print("  https://api.telegram.org/bot%s/getUpdates" % config["ROBYX_BOT_TOKEN"])
+        print("  https://api.telegram.org/bot<TOKEN>/getUpdates")
         print()
         while True:
             chat_id = ask("Chat ID (negative number for groups)")
@@ -345,8 +495,8 @@ def _setup_slack(config):
     print("Enable Socket Mode and generate an App-Level Token (xapp-...).")
     print()
 
-    config["SLACK_BOT_TOKEN"] = ask("Slack Bot Token (xoxb-...)")
-    config["SLACK_APP_TOKEN"] = ask("Slack App-Level Token (xapp-...)")
+    config["SLACK_BOT_TOKEN"] = ask_secret("Slack Bot Token (xoxb-...)")
+    config["SLACK_APP_TOKEN"] = ask_secret("Slack App-Level Token (xapp-...)")
 
     print()
     print("Enter the channel ID for the control room (#control-room).")
@@ -488,7 +638,7 @@ def _setup_discord(config):
     print()
 
     while True:
-        token = ask("Paste the bot token here")
+        token = ask_secret("Paste the bot token here")
         info = _discord_validate_token(token)
         if info:
             bot_id, bot_name = info
@@ -605,7 +755,7 @@ def setup():
     print("Voice messages are transcribed using OpenAI Whisper.")
     print("You can also add the API key later by telling Robyx in chat.")
     print()
-    voice = ask("Enter OpenAI API key (or press Enter to skip)", required=False)
+    voice = ask_secret("Enter OpenAI API key (or press Enter to skip)")
     config["OPENAI_API_KEY"] = voice or ""
 
     # Step 6: Scheduler interval
@@ -613,18 +763,20 @@ def setup():
     config["SCHEDULER_INTERVAL"] = ask("Unified scheduler tick interval in seconds", default="60")
     config["UPDATE_CHECK_INTERVAL"] = "3600"
     config["CLAUDE_PERMISSION_MODE"] = ""
+    config["COLLAB_PARTICIPANT_POLICY"] = "disabled"
 
     # Write .env
     print("\n--- Writing configuration ---\n")
-    lines = []
-    for key, value in config.items():
-        lines.append('%s=%s' % (key, value))
-
-    ENV_FILE.write_text("\n".join(lines) + "\n")
+    try:
+        _write_validated_config(config)
+    except EnvValidationError as e:
+        print("  Error: %s" % e)
+        print("  Configuration was not written. Correct the value and run setup again.")
+        return
     print("  Configuration written to %s" % ENV_FILE)
 
     # Create data directory
-    (PROJECT_ROOT / "data").mkdir(exist_ok=True)
+    ensure_private_directory(PROJECT_ROOT / "data")
     print("  Data directory created.")
 
     # Send test message (Telegram only — Slack requires async runtime)
@@ -655,7 +807,7 @@ def setup():
     print()
 
 
-def parse_args():
+def parse_args(argv=None):
     """Parse CLI arguments for non-interactive setup."""
     p = argparse.ArgumentParser(
         description="Robyx setup — interactive or non-interactive",
@@ -669,7 +821,9 @@ def parse_args():
 
     # Telegram
     p.add_argument("--bot-token",
-                    help="Telegram bot token (from @BotFather → /newbot)")
+                    help="DEPRECATED: Telegram token value in argv; use --bot-token-file")
+    p.add_argument("--bot-token-file",
+                    help="owner-only file containing the Telegram bot token")
     p.add_argument("--chat-id",
                     help="Telegram chat ID (negative number, e.g. -100123456789; "
                          "find via https://api.telegram.org/bot<TOKEN>/getUpdates "
@@ -679,10 +833,13 @@ def parse_args():
 
     # Slack
     p.add_argument("--slack-bot-token",
-                    help="Slack Bot Token (xoxb-...; from api.slack.com/apps → OAuth)")
+                    help="DEPRECATED: Slack bot token value; use --slack-bot-token-file")
+    p.add_argument("--slack-bot-token-file",
+                    help="owner-only file containing the Slack bot token")
     p.add_argument("--slack-app-token",
-                    help="Slack App-Level Token (xapp-...; Basic Information → App-Level "
-                         "Tokens → generate with connections:write scope; also enable Socket Mode)")
+                    help="DEPRECATED: Slack app token value; use --slack-app-token-file")
+    p.add_argument("--slack-app-token-file",
+                    help="owner-only file containing the Slack app token")
     p.add_argument("--slack-channel-id",
                     help="Slack control channel ID (right-click channel → View details → "
                          "scroll to bottom, e.g. C01234ABCDE)")
@@ -693,8 +850,9 @@ def parse_args():
     # Discord — IMPORTANT: Developer Mode must be enabled in Discord
     # (Settings → Advanced → Developer Mode) to see "Copy ID" options.
     p.add_argument("--discord-bot-token",
-                    help="Discord bot token (discord.com/developers/applications → your app "
-                         "→ Bot → Reset Token; also enable Message Content Intent)")
+                    help="DEPRECATED: Discord token value; use --discord-bot-token-file")
+    p.add_argument("--discord-bot-token-file",
+                    help="owner-only file containing the Discord bot token")
     p.add_argument("--discord-guild-id",
                     help="Discord server ID (enable Developer Mode first: Discord Settings → "
                          "Advanced → Developer Mode ON; then right-click server → Copy Server ID)")
@@ -708,12 +866,14 @@ def parse_args():
 
     # Common
     p.add_argument("--workspace", help="Workspace root directory")
-    p.add_argument("--openai-key", default="", help="OpenAI API key for voice transcription")
+    p.add_argument("--openai-key", help="DEPRECATED: OpenAI key value; use --openai-key-file")
+    p.add_argument("--openai-key-file",
+                    help="owner-only file containing the OpenAI API key")
     p.add_argument("--scheduler-interval", default="600", help="Scheduler interval in seconds")
     p.add_argument("--skip-test", action="store_true", help="Skip sending test message")
     p.add_argument("--yes", "-y", action="store_true", help="Overwrite existing .env without asking")
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def _backend_info(name):
@@ -791,15 +951,20 @@ def setup_noninteractive(args):
     config["SCHEDULER_INTERVAL"] = args.scheduler_interval
     config["UPDATE_CHECK_INTERVAL"] = "3600"
     config["CLAUDE_PERMISSION_MODE"] = ""
+    config["COLLAB_PARTICIPANT_POLICY"] = "disabled"
 
     # Write .env
     print("\n--- Writing configuration ---\n")
-    lines = ['%s=%s' % (k, v) for k, v in config.items()]
-    ENV_FILE.write_text("\n".join(lines) + "\n")
+    try:
+        _write_validated_config(config)
+    except EnvValidationError as e:
+        print("  Error: %s" % e)
+        print("  Configuration was not written.")
+        sys.exit(2)
     print("  Configuration written to %s" % ENV_FILE)
 
     # Create data directory
-    (PROJECT_ROOT / "data").mkdir(exist_ok=True)
+    ensure_private_directory(PROJECT_ROOT / "data")
     print("  Data directory created.")
 
     # Test message (Telegram only)
@@ -849,18 +1014,23 @@ def _looks_like_noninteractive_request(args):
         args.backend,
         args.platform,
         args.bot_token,
+        args.bot_token_file,
         args.chat_id,
         args.owner_id,
         args.slack_bot_token,
+        args.slack_bot_token_file,
         args.slack_app_token,
+        args.slack_app_token_file,
         args.slack_channel_id,
         args.slack_owner_id,
         args.discord_bot_token,
+        args.discord_bot_token_file,
         args.discord_guild_id,
         args.discord_channel_id,
         args.discord_owner_id,
         args.workspace,
         args.openai_key,
+        args.openai_key_file,
         args.scheduler_interval != "600",
         args.skip_test,
         args.yes,
@@ -877,23 +1047,23 @@ def _missing_required_args(args):
 
     if args.platform == "telegram":
         if not args.bot_token:
-            missing.append("--bot-token")
+            missing.append("--bot-token-file or ROBYX_SETUP_BOT_TOKEN")
         if not args.chat_id:
             missing.append("--chat-id")
         if not args.owner_id:
             missing.append("--owner-id")
     elif args.platform == "slack":
         if not args.slack_bot_token:
-            missing.append("--slack-bot-token")
+            missing.append("--slack-bot-token-file or ROBYX_SETUP_SLACK_BOT_TOKEN")
         if not args.slack_app_token:
-            missing.append("--slack-app-token")
+            missing.append("--slack-app-token-file or ROBYX_SETUP_SLACK_APP_TOKEN")
         if not args.slack_channel_id:
             missing.append("--slack-channel-id")
         if not args.slack_owner_id:
             missing.append("--slack-owner-id")
     elif args.platform == "discord":
         if not args.discord_bot_token:
-            missing.append("--discord-bot-token")
+            missing.append("--discord-bot-token-file or ROBYX_SETUP_DISCORD_BOT_TOKEN")
         if not args.discord_guild_id:
             missing.append("--discord-guild-id")
         if not args.discord_channel_id:
@@ -906,6 +1076,11 @@ def _missing_required_args(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    try:
+        prepare_secret_inputs(args)
+    except SecretInputError as error:
+        print("Error: %s" % error, file=sys.stderr)
+        sys.exit(2)
     if _has_required_args(args):
         setup_noninteractive(args)
     elif _looks_like_noninteractive_request(args):

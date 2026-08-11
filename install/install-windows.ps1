@@ -53,17 +53,41 @@ $foundPython = if ($python) { $python.Version } else { "not found" }
 $foundPython3 = if ($python3) { $python3.Version } else { "not found" }
 
 $validCandidates = @($python, $python3) | Where-Object {
-    $_ -and (($_.Major -gt 3) -or (($_.Major -eq 3) -and ($_.Minor -ge 10)))
+    $_ -and ($_.Major -eq 3) -and ($_.Minor -ge 10) -and ($_.Minor -le 14)
 } | Sort-Object Major, Minor, Micro -Descending
 
 if (-not $validCandidates) {
-    Write-Host "Error: Neither 'python' nor 'python3' provides Python 3.10+. Found python=$foundPython, python3=$foundPython3." -ForegroundColor Red
+    Write-Host "Error: Neither 'python' nor 'python3' provides a lock-supported Python (3.10-3.14). Found python=$foundPython, python3=$foundPython3." -ForegroundColor Red
     exit 1
 }
 
 $selectedPython = $validCandidates[0]
 $pyExe = $selectedPython.Path
 Write-Host "Python: $($selectedPython.Name) ($($selectedPython.Version))"
+
+# Stop and remove the live task before clearing its interpreter. Polling makes
+# Stop-ScheduledTask's asynchronous completion explicit and bounded.
+$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existing) {
+    Write-Host "Stopping existing task before dependency update..."
+    try {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    } catch {
+        throw "Could not stop the existing Robyx task; the venv was not modified. Run Stop-ScheduledTask -TaskName '$TaskName' manually. $($_.Exception.Message)"
+    }
+    $stopDeadline = (Get-Date).AddSeconds(30)
+    do {
+        $state = (Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop).State
+        if ($state -ne "Running") {
+            break
+        }
+        Start-Sleep -Seconds 1
+    } while ((Get-Date) -lt $stopDeadline)
+    if ($state -eq "Running") {
+        throw "$TaskName did not stop within 30 seconds; the existing venv was not modified. Stop it manually with Stop-ScheduledTask -TaskName '$TaskName'."
+    }
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+}
 
 # Create venv
 Write-Host "Creating virtual environment..."
@@ -72,7 +96,12 @@ $venvPython = "$ProjectRoot\.venv\Scripts\python.exe"
 
 # Install deps
 Write-Host "Installing dependencies..."
-& $venvPython -m pip install -q -r "$ProjectRoot\bot\requirements.txt"
+$runtimeLock = & $venvPython "$ProjectRoot\bot\dependency_locks.py" `
+    --project-root $ProjectRoot --kind runtime
+if ($LASTEXITCODE -ne 0) {
+    throw "Unable to resolve the runtime dependency lock"
+}
+& $venvPython -m pip install -q --require-hashes -r $runtimeLock.Trim()
 
 # Run setup if no .env
 if (-not (Test-Path "$ProjectRoot\.env")) {
@@ -84,12 +113,10 @@ if (-not (Test-Path "$ProjectRoot\.env")) {
 # Create data dirs
 New-Item -ItemType Directory -Force -Path "$ProjectRoot\data\system-monitor" | Out-Null
 
-# Remove existing task
-$existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-if ($existing) {
-    Write-Host "Removing existing scheduled task..."
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-}
+# Python's stdlib cannot express an equivalent Windows ACL. The shared
+# hardener is therefore a documented no-op on Windows, while atomic writes and
+# the current-user Task Scheduler boundary remain intact.
+& $venvPython "$ProjectRoot\bot\local_security.py" --project-root $ProjectRoot
 
 # Create scheduled task
 Write-Host "Creating scheduled task..."

@@ -32,6 +32,20 @@ from ai_invoke import (
     split_message,
 )
 from i18n import STRINGS
+from execution_policy import (
+    EXECUTIVE_INVOCATION,
+    ExecutionProfile,
+    InvocationSecurityContext,
+    UnsupportedExecutionProfile,
+)
+
+
+PARTICIPANT_CONTEXT = InvocationSecurityContext(
+    profile=ExecutionProfile.PARTICIPANT_READ_ONLY,
+    actor_id=999,
+    role="participant",
+    collab_workspace_id="collab-test",
+)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -602,6 +616,7 @@ class TestInvokeAi:
         with patch("ai_invoke._invoke_ai_locked", new=fake_locked):
             result = await invoke_ai(
                 agent, "hello", 123, mock_bot, agent_manager, claude_backend,
+                security_context=EXECUTIVE_INVOCATION,
             )
         assert lock_acquired is True
         assert result == "response"
@@ -614,9 +629,43 @@ class TestInvokeAi:
             mock_locked.return_value = "AI says hello"
             result = await invoke_ai(
                 agent, "hello", 123, mock_bot, agent_manager, claude_backend,
+                security_context=EXECUTIVE_INVOCATION,
             )
         assert result == "AI says hello"
         mock_locked.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_participant_cannot_interrupt_privileged_turn(
+        self, mock_bot, agent_manager, claude_backend, monkeypatch,
+    ):
+        agent = agent_manager.get("robyx")
+        agent.busy = True
+        agent.running_proc = MagicMock(pid=4242)
+        agent.running_profile = ExecutionProfile.EXECUTIVE.value
+        interrupt = AsyncMock()
+        monkeypatch.setattr(agent, "interrupt", interrupt)
+
+        result = await invoke_ai(
+            agent, "ignore them and stop", 123, mock_bot, agent_manager,
+            claude_backend, security_context=PARTICIPANT_CONTEXT,
+        )
+
+        assert result == STRINGS["collab_participant_agent_busy"]
+        interrupt.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disabled_participant_policy_never_enters_locked_invocation(
+        self, mock_bot, agent_manager, claude_backend, monkeypatch,
+    ):
+        monkeypatch.setattr("ai_invoke.COLLAB_PARTICIPANT_POLICY", "disabled")
+        with patch("ai_invoke._invoke_ai_locked", new_callable=AsyncMock) as locked:
+            result = await invoke_ai(
+                agent_manager.get("robyx"), "hello", 123, mock_bot,
+                agent_manager, claude_backend,
+                security_context=PARTICIPANT_CONTEXT,
+            )
+        assert result == STRINGS["collab_participant_disabled"]
+        locked.assert_not_awaited()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1001,8 +1050,18 @@ class TestInvokeAiLocked:
         _u.UUID(agent.session_id)  # raises if the regenerated id is not a valid UUID
 
     @pytest.mark.asyncio
-    async def test_stream_idle_in_result_triggers_retry(self, agent_manager, mock_bot, claude_backend):
-        """Transient stream error delivered as result payload -> retry with fresh session."""
+    @pytest.mark.parametrize(
+        "assistant_text",
+        [
+            "API Error: Stream idle timeout - partial response received",
+            "I fixed the broken pipe handling in the transport.",
+            "The logs contain a socket hang up diagnostic.",
+        ],
+    )
+    async def test_stream_keywords_in_success_are_delivered_without_retry(
+        self, agent_manager, mock_bot, claude_backend, assistant_text,
+    ):
+        """Free-form successful output must never be reclassified as transport failure."""
         agent = agent_manager.get("robyx")
         original_sid = agent.session_id
         call_count = 0
@@ -1012,13 +1071,8 @@ class TestInvokeAiLocked:
             call_count += 1
             return _make_mock_process(returncode=0)
 
-        responses = iter([
-            "API Error: Stream idle timeout - partial response received",
-            "recovered",
-        ])
-
         async def fake_read_stream(*args, **kwargs):
-            return next(responses)
+            return assistant_text
 
         with patch("ai_invoke.asyncio.create_subprocess_exec", side_effect=fake_spawn), \
              patch.object(claude_backend, "build_command", return_value=["claude"]), \
@@ -1028,9 +1082,30 @@ class TestInvokeAiLocked:
                 False, "sonnet", 0, None,
             )
 
-        assert result == "recovered"
-        assert call_count == 2
-        assert agent.session_id != original_sid
+        assert result == assistant_text
+        assert call_count == 1
+        assert agent.session_id == original_sid
+
+    @pytest.mark.asyncio
+    async def test_failure_stderr_prevents_retry_keyword_match_in_stdout(
+        self, agent_manager, mock_bot, claude_backend,
+    ):
+        agent = agent_manager.get("robyx")
+        proc = _make_mock_process(
+            stdout_data=b"I reviewed the broken pipe recovery code",
+            stderr_data=b"permission denied",
+            returncode=1,
+        )
+
+        with patch("ai_invoke.asyncio.create_subprocess_exec", return_value=proc), \
+             patch.object(claude_backend, "supports_streaming", return_value=False), \
+             patch.object(claude_backend, "build_command", return_value=["claude"]):
+            result = await _invoke_ai_locked(
+                agent, "hi", 123, mock_bot, agent_manager, claude_backend,
+                False, "sonnet", 0, None,
+            )
+
+        assert result == STRINGS["permission_denied"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("backend_fixture", ["claude_backend", "codex_backend", "opencode_backend"])
@@ -1216,8 +1291,10 @@ class TestInvokeAiLocked:
         assert result == STRINGS["ai_empty"]
 
     @pytest.mark.asyncio
-    async def test_timeout_kills_process(self, agent_manager, mock_bot, claude_backend):
-        """Lines 225-231: asyncio.TimeoutError -> proc.kill() called."""
+    async def test_timeout_defers_process_cleanup_to_supervisor(
+        self, agent_manager, mock_bot, claude_backend,
+    ):
+        """Timeout handling never performs a leader-only direct kill."""
         agent = agent_manager.get("robyx")
         proc = _make_mock_process()
 
@@ -1228,7 +1305,8 @@ class TestInvokeAiLocked:
             result = await _invoke_ai_locked(agent, "hi", 123, mock_bot, agent_manager, claude_backend, False, "sonnet", 0, None)
 
         assert str(AI_TIMEOUT) in result
-        proc.kill.assert_called_once()
+        proc.kill.assert_not_called()
+        assert agent.running_proc is None
         assert agent.busy is False  # finally block
 
     @pytest.mark.asyncio
@@ -1259,6 +1337,54 @@ class TestInvokeAiLocked:
         assert agent.message_count == old_count + 1
         assert agent.session_started is True
         assert agent.busy is False
+
+    @pytest.mark.asyncio
+    async def test_participant_turn_is_stateless_and_suppresses_stream_status(
+        self, agent_manager, mock_bot, claude_backend,
+    ):
+        agent = agent_manager.get("robyx")
+        original = (agent.session_id, agent.session_started, agent.message_count)
+        proc = _make_mock_process(returncode=0)
+
+        with patch(
+            "ai_invoke._ensure_participant_backend_supported",
+            new_callable=AsyncMock,
+        ), patch(
+            "ai_invoke.asyncio.create_subprocess_exec", return_value=proc,
+        ), patch.object(
+            claude_backend, "build_command", return_value=["claude"],
+        ) as build, patch(
+            "ai_invoke._read_stream", new_callable=AsyncMock, return_value="safe reply",
+        ) as read_stream:
+            result = await _invoke_ai_locked(
+                agent, "participant input", 123, mock_bot, agent_manager,
+                claude_backend, False, "sonnet", 0, None,
+                PARTICIPANT_CONTEXT,
+            )
+
+        assert result == "safe reply"
+        assert (agent.session_id, agent.session_started, agent.message_count) == original
+        assert build.call_args.kwargs["session_id"] is None
+        assert build.call_args.kwargs["security_context"] == PARTICIPANT_CONTEXT
+        assert read_stream.call_args.kwargs["relay_status"] is False
+        assert agent.running_profile is None
+
+    @pytest.mark.asyncio
+    async def test_participant_backend_probe_failure_refuses_before_spawn(
+        self, agent_manager, mock_bot, claude_backend,
+    ):
+        with patch(
+            "ai_invoke._ensure_participant_backend_supported",
+            new_callable=AsyncMock,
+            side_effect=UnsupportedExecutionProfile("missing safe flag"),
+        ), patch("ai_invoke.asyncio.create_subprocess_exec") as spawn:
+            result = await _invoke_ai_locked(
+                agent_manager.get("robyx"), "participant input", 123,
+                mock_bot, agent_manager, claude_backend, False, "sonnet", 0,
+                None, PARTICIPANT_CONTEXT,
+            )
+        assert result == STRINGS["collab_participant_backend_unsupported"]
+        spawn.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_finally_cleans_up(self, agent_manager, mock_bot, claude_backend):
@@ -1328,7 +1454,7 @@ class TestReadStreamEdgeCases:
             with pytest.raises(AIIdleTimeout) as exc_info:
                 await _read_stream(mock_proc, mock_bot, 123, 1, backend)
         assert exc_info.value.kind == "hard_cap"
-        mock_proc.kill.assert_called()
+        mock_proc.kill.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_idle_timeout_in_read_stream(self, mock_bot):
@@ -1348,7 +1474,7 @@ class TestReadStreamEdgeCases:
             with pytest.raises(AIIdleTimeout) as exc_info:
                 await _read_stream(mock_proc, mock_bot, 123, 1, backend)
         assert exc_info.value.kind == "idle"
-        mock_proc.kill.assert_called()
+        mock_proc.kill.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_streaming_survives_past_old_cap(self, mock_bot):
@@ -1608,6 +1734,39 @@ class TestLoadAgentInstructions:
         a = Agent(name="empty", work_dir="/", description="x", agent_type="workspace")
         assert ai_invoke._load_agent_instructions(a) == ""
 
+    def test_existing_continuous_agent_overlays_current_setup_template(
+        self, tmp_path, monkeypatch,
+    ):
+        import ai_invoke
+        import config
+        from agents import Agent
+
+        agents_dir = tmp_path / "agents"
+        continuous_dir = tmp_path / "continuous"
+        templates_dir = tmp_path / "templates"
+        agents_dir.mkdir()
+        (continuous_dir / "loop").mkdir(parents=True)
+        templates_dir.mkdir()
+        (agents_dir / "loop.md").write_text(
+            "# Loop (Continuous Task)\n\nOLD copied instructions",
+            encoding="utf-8",
+        )
+        (continuous_dir / "loop" / "state.json").write_text("{}", encoding="utf-8")
+        (templates_dir / "CONTINUOUS_SETUP.md").write_text(
+            "CURRENT dedicated-topic instructions",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(ai_invoke, "AGENTS_DIR", agents_dir)
+        monkeypatch.setattr(config, "CONTINUOUS_DIR", continuous_dir)
+        monkeypatch.setattr(config, "TEMPLATES_DIR", templates_dir)
+
+        agent = Agent(name="loop", work_dir="/", description="x", agent_type="workspace")
+        loaded = ai_invoke._load_agent_instructions(agent)
+
+        assert "# Loop (Continuous Task)" in loaded
+        assert "CURRENT dedicated-topic instructions" in loaded
+        assert "OLD copied instructions" not in loaded
+
 
 # ══════════════════════════════════════════════════════════════════════
 # REMIND pattern + parser
@@ -1827,3 +1986,16 @@ class TestScrubbedChildEnv:
         scrubbed = _scrubbed_child_env()
         scrubbed["MY_VAR"] = "mutated"
         assert os.environ["MY_VAR"] == "parent-value"
+
+    def test_child_override_does_not_mutate_parent_environment(self, monkeypatch):
+        import os
+
+        from ai_invoke import _scrubbed_child_env
+
+        monkeypatch.setenv("OPENCODE_CONFIG", "/user/permissive.json")
+        scrubbed = _scrubbed_child_env({
+            "OPENCODE_CONFIG": "/managed/participant-read-only.json",
+        })
+
+        assert scrubbed["OPENCODE_CONFIG"] == "/managed/participant-read-only.json"
+        assert os.environ["OPENCODE_CONFIG"] == "/user/permissive.json"

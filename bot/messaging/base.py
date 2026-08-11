@@ -321,6 +321,20 @@ class Platform(abc.ABC):
         to force plain text on Telegram topics.
         """
 
+    async def send_to_channel_with_ref(
+        self,
+        channel_id: Any,
+        text: str,
+        parse_mode: str | None = None,
+    ) -> Any:
+        """Send to a topic and return its message reference when supported.
+
+        The compatibility default preserves adapters that only implement the
+        historical boolean API.  Telegram/Slack/Discord override this so the
+        awaiting-input transition can pin the exact delivered message.
+        """
+        return True if await self.send_to_channel(channel_id, text, parse_mode) else None
+
     async def get_invite_link(self, chat_id: Any) -> str | None:
         """Generate or retrieve an invite link for a chat/group.
 
@@ -335,8 +349,9 @@ class Platform(abc.ABC):
 
         Default: not supported — adapters that cannot implement this
         MUST override and raise ``NotImplementedError``. Telegram
-        implements it via the bot API; Discord/Slack raise for now
-        (external groups are Telegram-only in this iteration).
+        implements it via the bot API and Discord implements the
+        guild-aware equivalent; Slack raises until its collaborative
+        workspace lifecycle is implemented.
         """
         raise NotImplementedError(
             "leave_chat is not supported on this platform",

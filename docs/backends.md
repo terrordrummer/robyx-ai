@@ -20,9 +20,36 @@ Robyx ships every backend with the most permissive, non-interactive execution po
 
 - **Claude Code** — `--permission-mode bypassPermissions`. Override with `CLAUDE_PERMISSION_MODE`.
 - **Codex** — invoked as `codex exec` (Codex CLI 0.124+) with `-c approval_policy="never" --sandbox danger-full-access`. Override with `CODEX_APPROVAL_POLICY` / `CODEX_SANDBOX`.
-- **OpenCode** — managed `opencode-managed.json` config with `"permission": "allow"`, wired via `OPENCODE_CONFIG`. Override with `OPENCODE_PERMISSION` (or set `OPENCODE_CONFIG` explicitly to point at your own config).
+- **OpenCode** — a managed `opencode-managed.json` with `"permission": "allow"` is created lazily for executive/system/scheduler work and passed via the AI child process's `OPENCODE_CONFIG`. Robyx never exports that path process-wide. Override with `OPENCODE_PERMISSION` (or set `OPENCODE_CONFIG` explicitly to point at your own config).
 
 This is **intentionally unsafe**: agents can read/write anywhere on the disk and run any shell command. If you need stricter isolation, flip the relevant env var. On Linux systems with enterprise MDM that sets `permissions.disableBypassPermissionsMode: disable`, Claude will enforce the restriction regardless of what Robyx asks for.
+
+### Collaborative participant boundary
+
+The autonomous defaults above apply to owner/operator, system, scheduled, and
+continuous work. Collaborative `participant` turns are different: Robyx derives
+a typed execution profile from the persisted role before starting a CLI and
+forces a stateless, backend-native read-only policy. Participant responses never
+enter the state-changing macro dispatch path.
+
+- Claude receives only `Read`, `Glob`, and `Grep`; safe mode and an empty strict
+  MCP configuration disable hooks, plugins, shell, edit, web, and subagents.
+- Codex ignores user config/rules, disables integration features and web search,
+  uses an empty tool environment, and runs in the `read-only` sandbox. Its
+  offline feature inventory is allowlisted: an unknown default-enabled feature
+  makes the participant lane unavailable until it is explicitly reviewed.
+- OpenCode receives a child-specific deny-by-default config; only built-in
+  read/navigation permissions are enabled. Executive and scheduler invocations
+  also receive their selected config through their own child environment.
+
+Robyx checks required CLI flags offline and refuses a participant turn if the
+installed backend cannot prove the profile. It never falls back to autonomous
+execution. Participant AI is disabled by default; set
+`COLLAB_PARTICIPANT_POLICY=read-only` explicitly to opt in.
+
+This is an integrity boundary, not a confidentiality boundary: a read-only
+participant may see files readable in the workspace. Do not enable it for a
+user who must not see that content.
 
 OpenCode runs with `--format json` and resumes its native session via `--session ses_…` so multi-turn conversations stay coherent across messages and bot restarts. Robyx captures the session id from the CLI output on the first turn and replays it automatically on every subsequent turn.
 

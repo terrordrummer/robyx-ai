@@ -11,8 +11,46 @@ from typing import Any, Optional
 
 from config import STATE_FILE, WORKSPACE
 from i18n import STRINGS
+from persistence_recovery import guard_json_write, load_json_with_recovery
 
 log = logging.getLogger("robyx.agents")
+
+
+def _valid_agent_state(value: Any) -> bool:
+    """Validate the whole registry before committing any entry in memory."""
+    if not isinstance(value, dict) or not isinstance(value.get("agents"), dict):
+        return False
+    focused = value.get("focused_agent")
+    if focused is not None and not isinstance(focused, str):
+        return False
+    for name, payload in value["agents"].items():
+        if not isinstance(name, str) or not name or not isinstance(payload, dict):
+            return False
+        # The orchestrator's historical record only contained session fields.
+        if name != "robyx":
+            if payload.get("name") != name:
+                return False
+            if not isinstance(payload.get("work_dir"), str):
+                return False
+            if not isinstance(payload.get("description"), str):
+                return False
+        for key in ("session_id", "agent_type", "model", "backend", "collab_workspace_id"):
+            item = payload.get(key)
+            if item is not None and not isinstance(item, str):
+                return False
+        for key in ("created_at", "last_used"):
+            item = payload.get(key)
+            if item is not None and (
+                not isinstance(item, (int, float)) or isinstance(item, bool)
+            ):
+                return False
+        count = payload.get("message_count")
+        if count is not None and (not isinstance(count, int) or isinstance(count, bool)):
+            return False
+        started = payload.get("session_started")
+        if started is not None and not isinstance(started, bool):
+            return False
+    return True
 
 
 def _is_placeholder_session_id(sid: str) -> bool:
@@ -56,57 +94,30 @@ class Agent:
     interrupted: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     running_proc: Any = field(default=None, repr=False, compare=False)
+    running_profile: str | None = field(default=None, repr=False, compare=False)
 
     async def interrupt(self) -> bool:
-        """Interrupt the running subprocess. SIGTERM with 5s grace, then SIGKILL.
+        """Interrupt and reap the supervised process tree.
 
-        On POSIX, signals are sent to the whole process group (because the
-        subprocess was spawned with ``start_new_session=True``), so a CLI
-        that spawned node/python workers takes its grandchildren with it
-        instead of leaving them as re-parented orphans.
-
-        Returns True if a process was actually interrupted.
+        State is cleared only after the supervisor confirms that the complete
+        tree stopped.  A failed termination keeps the process/busy evidence so
+        callers cannot mistake a surviving child for an idle agent.
         """
-        import os
-        import signal as _signal
-        import sys as _sys
         proc = self.running_proc
         if proc is None:
             return False
         self.interrupted = True
 
-        def _signal_group_or_proc(sig) -> None:
-            if _sys.platform == "win32":
-                if sig == _signal.SIGTERM:
-                    proc.terminate()
-                else:
-                    proc.kill()
-                return
-            try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, sig)
-            except (ProcessLookupError, OSError):
-                try:
-                    os.kill(proc.pid, sig)
-                except ProcessLookupError:
-                    pass
-
-        try:
-            _signal_group_or_proc(_signal.SIGTERM)
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                _signal_group_or_proc(_signal.SIGKILL)
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
-                    pass
-            return True
-        except ProcessLookupError:
-            return False
-        finally:
+        from runtime_supervisor import get_runtime_supervisor
+        stopped = await get_runtime_supervisor().terminate_process(
+            proc,
+            grace_seconds=5.0,
+        )
+        if stopped:
             self.running_proc = None
             self.busy = False
+            self.running_profile = None
+        return stopped
 
     def to_dict(self) -> dict:
         return {
@@ -127,7 +138,9 @@ class Agent:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Agent":
-        known = {f for f in cls.__dataclass_fields__} - {"lock", "busy", "running_proc"}
+        known = {f for f in cls.__dataclass_fields__} - {
+            "lock", "busy", "running_proc", "running_profile",
+        }
         filtered = {k: v for k, v in d.items() if k in known}
         return cls(**filtered)
 
@@ -159,75 +172,53 @@ class AgentManager:
         mid-run from another call site without adding explicit file
         locking around the load.
         """
-        if not STATE_FILE.exists():
+        result = load_json_with_recovery(
+            STATE_FILE,
+            data_dir=STATE_FILE.parent,
+            validator=_valid_agent_state,
+            kind="agent state",
+            logger=log,
+        )
+        if result.status == "missing":
             return
 
-        # Two attempts: the original file, and (if quarantined) whatever
-        # _recover_from_snapshot was able to install. Recovery happens
-        # at most once per call, so an unrecoverable corruption falls
-        # straight through to the empty-state path.
-        for attempt in range(2):
-            try:
-                raw = STATE_FILE.read_text()
-            except (OSError, UnicodeDecodeError) as e:
-                if attempt == 0:
-                    _quarantine_corrupt_file(STATE_FILE, reason="Decode error: %s" % e)
-                    if _recover_from_snapshot(STATE_FILE, reason="Decode error: %s" % e):
-                        continue
-                log.error(
-                    "State file %s is unreadable (%s) — quarantined. "
-                    "Starting with empty agent registry.",
-                    STATE_FILE, e,
-                )
-                return
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError as e:
-                if attempt == 0:
-                    _quarantine_corrupt_file(STATE_FILE, reason="JSONDecodeError: %s" % e)
-                    if _recover_from_snapshot(STATE_FILE, reason="JSONDecodeError: %s" % e):
-                        continue
-                log.error(
-                    "State file %s is corrupt — quarantined. "
-                    "Starting with empty agent registry; recreate workspaces via chat.",
-                    STATE_FILE,
-                )
-                return
-            break  # parse succeeded; continue with the rest of the load
-        try:
-            dirty = False
-            for name, agent_data in data.get("agents", {}).items():
-                if name == "robyx":
-                    sid = agent_data.get("session_id", self.agents[name].session_id)
-                    if _is_placeholder_session_id(sid):
-                        log.warning(
-                            "Sanitising placeholder session_id for [%s]: %s", name, sid,
-                        )
-                        sid = str(uuid.uuid4())
-                        dirty = True
-                    self.agents[name].session_id = sid
-                    self.agents[name].message_count = agent_data.get("message_count", 0)
-                    self.agents[name].session_started = agent_data.get("session_started", False)
-                else:
-                    agent = Agent.from_dict(agent_data)
-                    if _is_placeholder_session_id(agent.session_id):
-                        log.warning(
-                            "Sanitising placeholder session_id for [%s]: %s",
-                            name, agent.session_id,
-                        )
-                        agent.session_id = str(uuid.uuid4())
-                        agent.session_started = False
-                        agent.message_count = 0
-                        dirty = True
-                    self.agents[name] = agent
-            self.focused_agent = data.get("focused_agent")
-            self._rebuild_topic_map()
-            log.info("Loaded state: %s (focus: %s)", list(self.agents.keys()), self.focused_agent)
-            if dirty:
-                # Persist the sanitised IDs so the next run doesn't re-sanitise.
-                self.save_state()
-        except Exception as e:
-            log.warning("Failed to load state: %s", e)
+        data = result.value
+        loaded_agents = {
+            "robyx": Agent.from_dict(self.agents["robyx"].to_dict()),
+        }
+        dirty = False
+        for name, agent_data in data["agents"].items():
+            if name == "robyx":
+                sid = agent_data.get("session_id", loaded_agents[name].session_id)
+                if _is_placeholder_session_id(sid):
+                    log.warning(
+                        "Sanitising placeholder session_id for [%s]: %s", name, sid,
+                    )
+                    sid = str(uuid.uuid4())
+                    dirty = True
+                loaded_agents[name].session_id = sid
+                loaded_agents[name].message_count = agent_data.get("message_count", 0)
+                loaded_agents[name].session_started = agent_data.get("session_started", False)
+            else:
+                agent = Agent.from_dict(agent_data)
+                if _is_placeholder_session_id(agent.session_id):
+                    log.warning(
+                        "Sanitising placeholder session_id for [%s]: %s",
+                        name, agent.session_id,
+                    )
+                    agent.session_id = str(uuid.uuid4())
+                    agent.session_started = False
+                    agent.message_count = 0
+                    dirty = True
+                loaded_agents[name] = agent
+
+        # Commit only after the complete document has validated and parsed.
+        self.agents = loaded_agents
+        self.focused_agent = data.get("focused_agent")
+        self._rebuild_topic_map()
+        log.info("Loaded state: %s (focus: %s)", list(self.agents.keys()), self.focused_agent)
+        if dirty:
+            self.save_state()
 
     def _rebuild_topic_map(self):
         """Rebuild thread_id → agent name mapping from current agents."""
@@ -236,20 +227,50 @@ class AgentManager:
             if agent.thread_id and agent.name != "robyx":
                 self._topic_map[agent.thread_id] = agent.name
 
+    def _guard_state_write(self) -> None:
+        guard_json_write(
+            STATE_FILE,
+            data_dir=STATE_FILE.parent,
+            validator=_valid_agent_state,
+            kind="agent state",
+            logger=log,
+        )
+
     def save_state(self):
+        self._guard_state_write()
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "agents": {n: a.to_dict() for n, a in self.agents.items()},
             "focused_agent": self.focused_agent,
         }
+        if not _valid_agent_state(data):
+            raise ValueError("refusing to persist malformed agent state")
         tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
+        with open(tmp, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(data, indent=2))
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(tmp, STATE_FILE)
 
     async def async_save_state(self):
         """Save state under the agents lock for concurrent-safe writes."""
         async with self._agents_lock:
             self.save_state()
+
+    async def reload_state_after_maintenance_restore(self) -> None:
+        """Replace live state with the authoritative restored data tree.
+
+        The updater calls this while holding the process-wide exclusive
+        maintenance lease, after restoring a pre-update snapshot.  Replacing
+        the complete in-memory graph prevents a later ``save_state()`` from
+        reintroducing state written by a failed target migration.
+        """
+        async with self._agents_lock:
+            self.agents = {}
+            self.focused_agent = None
+            self._topic_map = {}
+            self._setup_orchestrator()
+            self._load_state()
 
     def reset_sessions(self, agent_names: set[str] | None = None) -> list[str]:
         """Regenerate AI-CLI sessions for the given agents (or all if ``None``).
@@ -289,12 +310,27 @@ class AgentManager:
         if not target_names:
             return []
 
+        self._guard_state_write()
+        before = {
+            name: (
+                self.agents[name].session_id,
+                self.agents[name].session_started,
+                self.agents[name].message_count,
+            )
+            for name in target_names
+        }
         for name in target_names:
             agent = self.agents[name]
             agent.session_id = str(uuid.uuid4())
             agent.session_started = False
             agent.message_count = 0
-        self.save_state()
+        try:
+            self.save_state()
+        except BaseException:
+            for name, values in before.items():
+                agent = self.agents[name]
+                agent.session_id, agent.session_started, agent.message_count = values
+            raise
         log.info(
             "AgentManager.reset_sessions: regenerated AI-CLI sessions for %d agent(s): %s",
             len(target_names), ", ".join(sorted(target_names)),
@@ -343,6 +379,17 @@ class AgentManager:
 
         For concurrent-safe usage from async code, prefer :meth:`async_add_agent`.
         """
+        self._guard_state_write()
+        existing = self.agents.get(name)
+        before = None
+        if existing is not None:
+            before = (
+                existing.work_dir,
+                existing.thread_id,
+                existing.description,
+                existing.model,
+                existing.backend,
+            )
         if name in self.agents:
             agent = self.agents[name]
             if work_dir:
@@ -365,7 +412,21 @@ class AgentManager:
             )
             self.agents[name] = agent
         self._rebuild_topic_map()
-        self.save_state()
+        try:
+            self.save_state()
+        except BaseException:
+            if existing is None:
+                self.agents.pop(name, None)
+            else:
+                (
+                    existing.work_dir,
+                    existing.thread_id,
+                    existing.description,
+                    existing.model,
+                    existing.backend,
+                ) = before
+            self._rebuild_topic_map()
+            raise
         return agent
 
     async def async_remove_agent(self, name: str) -> bool:
@@ -375,11 +436,20 @@ class AgentManager:
 
     def remove_agent(self, name: str) -> bool:
         if name in self.agents and name != "robyx":
+            self._guard_state_write()
+            removed = self.agents[name]
+            previous_focus = self.focused_agent
             if self.focused_agent == name:
                 self.focused_agent = None
             del self.agents[name]
             self._rebuild_topic_map()
-            self.save_state()
+            try:
+                self.save_state()
+            except BaseException:
+                self.agents[name] = removed
+                self.focused_agent = previous_focus
+                self._rebuild_topic_map()
+                raise
             return True
         return False
 
@@ -410,14 +480,26 @@ class AgentManager:
 
     def set_focus(self, name: str) -> bool:
         if name in self.agents:
+            self._guard_state_write()
+            previous = self.focused_agent
             self.focused_agent = name
-            self.save_state()
+            try:
+                self.save_state()
+            except BaseException:
+                self.focused_agent = previous
+                raise
             return True
         return False
 
     def clear_focus(self):
+        self._guard_state_write()
+        previous = self.focused_agent
         self.focused_agent = None
-        self.save_state()
+        try:
+            self.save_state()
+        except BaseException:
+            self.focused_agent = previous
+            raise
 
     def resolve_agent(self, text: str) -> tuple[Agent, str]:
         """Determine target agent: explicit @mention > focus > robyx."""
@@ -452,156 +534,6 @@ class AgentManager:
         if not lines:
             return STRINGS["no_agents"]
         return "\n".join(lines)
-
-
-def _quarantine_corrupt_file(path, reason: str) -> None:
-    """Rename ``path`` to ``path.corrupt-<UTC-timestamp>`` so a subsequent
-    write can create a fresh file without destroying forensic evidence.
-
-    Called from load paths in :class:`AgentManager` and
-    :class:`bot.collaborative.CollabStore` (where the same risk exists).
-    Best-effort: if the rename itself fails we leave the file in place
-    rather than raise — losing visibility of the corruption is a worse
-    outcome than a second-chance load that still fails.
-    """
-    from datetime import datetime, timezone
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    quarantine = path.with_suffix(path.suffix + ".corrupt-" + ts)
-    try:
-        os.replace(path, quarantine)
-        log.warning(
-            "Quarantined corrupt file %s → %s (reason: %s)",
-            path, quarantine, reason,
-        )
-    except OSError as e:
-        log.error(
-            "Failed to quarantine corrupt file %s: %s — leaving in place",
-            path, e,
-        )
-
-
-def _recover_from_snapshot(target, reason: str) -> bool:
-    """Try to restore *target* from the most recent updater data/ snapshot.
-
-    Called after :func:`_quarantine_corrupt_file` has set the corrupt file
-    aside. Walks ``DATA_DIR/backups/pre-update-*.tar.gz`` newest → oldest,
-    extracts the file at the same relative path inside ``DATA_DIR``,
-    validates the bytes parse as JSON, and atomically installs them as
-    the new *target*. Returns True on success.
-
-    Failures (no backups dir, no snapshots, none with a parseable copy,
-    extraction error) return False — the caller falls back to its
-    empty-state path. Because the snapshot is taken by the updater
-    *before* applying a release, the recovered copy is at least as fresh
-    as the last successful update; writes since then are LOST. The
-    log message is CRITICAL to make this visible.
-    """
-    import tarfile
-    from pathlib import Path
-
-    from config import DATA_DIR
-
-    try:
-        from updater import BACKUPS_DIR_NAME, SNAPSHOT_PREFIX
-    except Exception:
-        # updater is normally available; fall back to literals if its
-        # import side-effects ever fail (we don't want recovery itself to
-        # raise inside an already-degraded load path).
-        BACKUPS_DIR_NAME, SNAPSHOT_PREFIX = "backups", "pre-update-"
-
-    target = Path(target)
-    backups_dir = Path(DATA_DIR) / BACKUPS_DIR_NAME
-    if not backups_dir.exists():
-        log.critical(
-            "Cannot recover %s from snapshot: no backups dir at %s. "
-            "File quarantined; starting with empty state. Reason: %s",
-            target, backups_dir, reason,
-        )
-        return False
-
-    try:
-        rel_path = target.resolve().relative_to(Path(DATA_DIR).resolve())
-    except ValueError:
-        log.critical(
-            "Cannot recover %s: target is outside DATA_DIR=%s. Reason: %s",
-            target, DATA_DIR, reason,
-        )
-        return False
-
-    # Snapshots are tarred with arcname=".", so members are
-    # "./<rel>" (older tar) or "<rel>" (newer). Try both.
-    candidates = ["./" + rel_path.as_posix(), rel_path.as_posix()]
-
-    try:
-        snapshots = sorted(
-            backups_dir.glob(SNAPSHOT_PREFIX + "*.tar.gz"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError as e:
-        log.critical(
-            "Cannot list snapshots in %s: %s. Reason: %s",
-            backups_dir, e, reason,
-        )
-        return False
-
-    for snap in snapshots:
-        try:
-            with tarfile.open(str(snap), "r:gz") as tf:
-                member = None
-                for c in candidates:
-                    try:
-                        member = tf.getmember(c)
-                        break
-                    except KeyError:
-                        continue
-                if member is None or not member.isfile():
-                    continue
-                fobj = tf.extractfile(member)
-                if fobj is None:
-                    continue
-                content = fobj.read()
-        except (OSError, tarfile.TarError) as e:
-            log.warning(
-                "Snapshot %s unreadable (%s) — trying older snapshot",
-                snap.name, e,
-            )
-            continue
-
-        try:
-            json.loads(content.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError) as e:
-            log.warning(
-                "Snapshot %s has an unusable copy of %s (%s) — trying older",
-                snap.name, rel_path, e,
-            )
-            continue
-
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_suffix(target.suffix + ".recover-tmp")
-            tmp.write_bytes(content)
-            os.replace(tmp, target)
-        except OSError as e:
-            log.critical(
-                "Recovered bytes from %s but install to %s failed: %s. "
-                "Falling back to empty state. Reason: %s",
-                snap.name, target, e, reason,
-            )
-            return False
-
-        log.critical(
-            "Recovered corrupt %s from snapshot %s (reason: %s). "
-            "Writes since the snapshot are LOST — review and reconcile.",
-            target, snap.name, reason,
-        )
-        return True
-
-    log.critical(
-        "No usable snapshot found for %s — starting with empty state. "
-        "Reason: %s", target, reason,
-    )
-    return False
 
 
 def format_age(timestamp: float) -> str:

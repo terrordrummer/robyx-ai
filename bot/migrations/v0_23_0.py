@@ -248,6 +248,7 @@ async def upgrade(ctx: MigrationContext) -> None:
     # Import the state helpers lazily so unit tests that stub CONTINUOUS_DIR
     # see the patched value.
     from continuous import load_state, save_state, state_file_path
+    from persistence_recovery import PersistenceUnavailableError
 
     for task_dir in sorted(continuous_dir.iterdir()):
         if not task_dir.is_dir():
@@ -258,7 +259,17 @@ async def upgrade(ctx: MigrationContext) -> None:
 
         # Per-task idempotency guard — must come first so partial re-runs
         # never double-migrate a task.
-        state = load_state(state_path)
+        try:
+            state = load_state(state_path)
+        except PersistenceUnavailableError as exc:
+            skipped_errors.append((task_dir.name, "unrecoverable state.json"))
+            log.error(
+                "migration v0_23_0: state.json for '%s' failed closed after "
+                "recovery attempt: %s",
+                task_dir.name,
+                exc,
+            )
+            continue
         if state is None:
             skipped_errors.append((task_dir.name, "unreadable state.json"))
             log.error(

@@ -13,6 +13,7 @@ import pytest
 import httpx
 
 from messaging.telegram import TelegramPlatform
+from messaging.base import TopicUnreachable
 
 
 @pytest.fixture
@@ -31,6 +32,9 @@ def telegram_platform():
 class TestIsMainThread:
     def test_none_is_main(self, telegram_platform):
         assert telegram_platform.is_main_thread(-100999, None) is True
+
+    def test_foreign_chat_without_thread_is_not_main(self, telegram_platform):
+        assert telegram_platform.is_main_thread(-200888, None) is False
 
     def test_any_thread_is_not_main(self, telegram_platform):
         assert telegram_platform.is_main_thread(-100999, 42) is False
@@ -67,6 +71,11 @@ class TestControlRoomId:
 
     def test_returns_zero_not_one(self, telegram_platform):
         assert telegram_platform.control_room_id == 0
+
+    def test_basic_adapter_limits_and_owner_identity(self, telegram_platform):
+        assert telegram_platform.max_message_length == 4000
+        assert telegram_platform.is_owner(42) is True
+        assert telegram_platform.is_owner(43) is False
 
 
 class TestSendMessageRawHttpx:
@@ -217,6 +226,20 @@ class TestSendToChannelParseMode:
     ):
         await telegram_platform.send_to_channel(42, "x", parse_mode="HTML")
         assert captured["data"]["parse_mode"] == "HTML"
+
+    @pytest.mark.asyncio
+    async def test_deleted_topic_raises_topic_unreachable(self, telegram_platform):
+        class _FakeResponse:
+            def json(self):
+                return {"ok": False, "description": "Bad Request: TOPIC_ID_INVALID"}
+
+        client = AsyncMock()
+        client.post.return_value = _FakeResponse()
+        telegram_platform._client = client
+
+        with pytest.raises(TopicUnreachable) as exc:
+            await telegram_platform.send_to_channel(404, "hello")
+        assert exc.value.channel_id == 404
 
 
 # ─────────────────────────────────────────────────────────────────────

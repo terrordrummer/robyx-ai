@@ -11,10 +11,18 @@ API; it delegates to functions here instead of raw file I/O.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Optional
+
+from local_security import (
+    PRIVATE_DIRECTORY_MODE,
+    PRIVATE_FILE_MODE,
+    supports_posix_permissions,
+)
 
 log = logging.getLogger("robyx.memory_store")
 
@@ -74,18 +82,63 @@ END;
 # ── Connection management ──
 
 
+def _ensure_private_memory_directory(path: Path) -> None:
+    """Create/repair a memory directory without accepting a symlink."""
+    if path.is_symlink():
+        raise OSError("memory directory must not be a symlink: %s" % path)
+    path.mkdir(mode=PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError("memory parent is not a directory: %s" % path)
+    if supports_posix_permissions():
+        os.chmod(path, PRIVATE_DIRECTORY_MODE, follow_symlinks=False)
+
+
+def _harden_memory_file(path: Path, *, create: bool = False) -> None:
+    """Precreate or repair one SQLite file without following symlinks."""
+    if create and not path.exists() and not path.is_symlink():
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags, PRIVATE_FILE_MODE)
+        except FileExistsError:
+            # Another connection in this process may have created it between
+            # the existence check and O_EXCL. Validate the winner below.
+            pass
+        else:
+            os.close(fd)
+
+    if not path.exists() and not path.is_symlink():
+        return
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        raise OSError("memory database files must not be symlinks: %s" % path)
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError("memory database path must be a regular file: %s" % path)
+    if supports_posix_permissions():
+        os.chmod(path, PRIVATE_FILE_MODE, follow_symlinks=False)
+
+
 def get_connection(db_path: Path) -> sqlite3.Connection:
     """Open (or create) a SQLite database at *db_path* with WAL mode.
 
     Creates the parent directory and schema on first access.
     """
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path = Path(db_path)
+    _ensure_private_memory_directory(db_path.parent)
+    _harden_memory_file(db_path, create=True)
     conn = sqlite3.connect(str(db_path))
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(_SCHEMA_SQL)
+        # WAL/SHM are created by SQLite after the database is opened. The
+        # enclosing 0700 directory prevents exposure during creation; exact
+        # file modes are then repaired before the connection is returned.
+        _harden_memory_file(Path(str(db_path) + "-wal"))
+        _harden_memory_file(Path(str(db_path) + "-shm"))
     except Exception:
         # Don't leak the file descriptor if PRAGMA/schema setup fails
         # (disk full, read-only FS, corrupt DB, etc.).

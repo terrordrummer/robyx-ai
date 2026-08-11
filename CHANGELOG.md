@@ -1,5 +1,130 @@
 # Changelog
 
+## Unreleased
+
+## 0.29.0
+
+**Repository-wide security, resilience, and release-engineering hardening.**
+Closes the RR-00–RR-11 remediation program with fail-closed collaborative
+execution, durable continuous-task ownership, supervised runtime/update
+processes, recoverable persistence, and a locked Python 3.10–3.14 quality
+matrix. No breaking user workflow or manual data migration is required.
+
+### Added
+
+- Added typed, fail-closed participant execution profiles for Claude, Codex,
+  and OpenCode collaborative turns. Participant AI is disabled by default;
+  operators may explicitly opt in to stateless, backend-restricted read-only
+  inspection only where readable workspace content is safe to disclose.
+  Executive/system behaviour is preserved.
+- Added crash-resumable corruption recovery for the unified queue and
+  continuous-task state. Corrupt bytes are quarantined, verified updater
+  snapshots are tried newest-first, and mutations fail closed when recovery is
+  impossible.
+- Added one typed schema for the complete chat-editable configuration surface,
+  reused by setup and runtime. Direct updates now validate values, atomically
+  replace `.env`, import the candidate in a fresh isolated process, and restore
+  the previous bytes and mode when preflight fails.
+- Added a reconnect regression harness for the Discord runner and streaming,
+  redirect, size-limit, cancellation, and retry coverage for Slack media.
+- Added central runtime supervision for retained asyncio tasks and AI child
+  process groups. Shutdown rejects new spawn, performs bounded TERM/KILL/reap,
+  drains delivery watchers, and preserves unreaped PID/lock evidence for boot
+  recovery.
+- Added idempotent POSIX permission hardening at setup, install, and pre-config
+  boot: private runtime directories use `0700`, files use `0600`, services run
+  with umask `0077`, and insecure symlink/non-regular paths fail closed.
+- Added no-echo/file/environment secret inputs to setup. Value-bearing argv
+  flags remain compatible but warn as deprecated; sensitive/local-only chat
+  assignments are rejected before they can reach an AI backend.
+- Added a Python 3.10–3.14 CI matrix with hash-verified runtime/development
+  locks, critical Ruff and gradual mypy gates, warning policy, and per-module
+  coverage ratchets for high-risk runtime boundaries.
+- Added canonical scheduled-task ownership scope `(platform, chat, parent
+  thread)` and a revisioned `program.json` authority so stale step-state writes
+  cannot roll back an accepted continuous-task plan.
+- Added an exclusive maintenance gate and durable `active-update.json`
+  transaction marker. Updates quiesce writers, checkpoint SQLite WAL files,
+  supervise every child process, and finish verified rollback/recovery before
+  normal work can resume.
+
+### Changed
+
+- Added `REVIEW_REMEDIATION.md` as the durable source of truth for the August
+  2026 repository-hardening program, including prioritized tickets, completion
+  gates, decision records, evidence, and a resume protocol for new agent
+  contexts. The completed April backlog now points to the active register.
+- Discord collaborative messages now use canonical guild/channel identity and
+  route Owner, Operator, and Participant roles through the shared authorization
+  layer. Reconnects retain one boot, scheduler, and update-loop generation.
+- Continuous stop, pause, complete, and delete now cancel future dispatch
+  before terminating a live step; same-name mutations are serialized and a
+  stale/spawning child cannot overwrite the authoritative terminal state.
+- Self-update now installs the exact advertised release tag, verifies tag,
+  commit, `VERSION`, metadata, and the mandatory runtime snapshot, and rolls
+  code/data back transactionally to the captured pre-update revision.
+- Slack voice downloads are streamed with a 25 MB cumulative cap, at most five
+  allowlisted redirects, guaranteed partial-file cleanup, and the shared send
+  retry policy for replies and edits.
+- OpenCode executive, scheduler, and participant configuration is now passed
+  only to the target child process; runtime no longer exports a permissive
+  process-global `OPENCODE_CONFIG`.
+- Queue, agent, collaborative-workspace, migration, continuous, and orphan-PID
+  registries now validate complete semantic identities, recover only verified
+  snapshots, and fail closed instead of reseeding or overwriting corruption.
+- Continuous tasks use dedicated state-aware topics with persisted recovery,
+  pinned awaiting-input messages, process-tree drain, exact lifecycle
+  serialization, and bounded last-resort HQ alerts for actionable failures.
+- Telegram, Slack, and Discord share lifecycle slash commands; Telegram routes
+  other collaborative commands through the common handler and Discord `/clear`
+  no longer falls through as an AI prompt.
+- Dedicated-topic operations now expose a uniform permanent-unreachable signal;
+  Telegram retries transient mutations with bounded backoff and Slack emits its
+  documented UX caveat once per operation.
+
+### Fixed
+
+- Successful assistant replies that mention transport diagnostics such as
+  `broken pipe`, `socket hang up`, or `stream idle timeout` are now delivered
+  once instead of being silently retried. Retry classification is restricted
+  to failed-process diagnostics, preferring stderr when present.
+- Deleting and recreating a continuous task name now removes only its canceled
+  continuous tombstone, avoiding ambiguous duplicate queue generations while
+  preserving idempotent repeated delete before recreation.
+- Updater data restore now stages and validates the archive before same-filesystem
+  directory swaps, with compensating renames if any commit step fails; the
+  current tree and its snapshot remain recoverable under injected failures.
+- Workspace-local SQLite memory now repairs `.robyx`, database, WAL, and SHM
+  permissions on every open, including memories stored outside repository
+  `data/`.
+- Collaborative voice transcripts now re-enter the ordinary message
+  authorization boundary. Participants remain disabled by default; when an
+  operator explicitly enables the read-only policy, voice receives the same
+  stateless restricted profile as text and can never inherit executive
+  authority.
+- Foreign Telegram chats and failed collaborative-registry lookups now fail at
+  one destination guard before any HQ command, voice, or executive AI route;
+  collaborative agents cannot emit HQ/continuous/lifecycle control markers.
+- Runtime shutdown and lifecycle recovery now identify the exact child process
+  generation, terminate isolated process trees, reap descendants, and preserve
+  durable evidence when cleanup cannot be verified.
+- Updater cancellation now completes rollback on the original branch or
+  detached commit, restores data plus in-memory agent state, redacts bounded
+  child diagnostics, and poisons the maintenance gate if recovery cannot be
+  proven.
+- Existing continuous agents overlay the current setup template at invocation,
+  and changes to every runtime prompt invalidate affected CLI sessions.
+- Orphan recovery is committed only after both running state and process lock
+  are durable. Deleting during an in-flight workspace drain records only the
+  bounded, control-token-free final body and orders one journal reference before
+  topic archival; an already archived topic remains journal-only.
+- Continuous creation accepts bounded `drain_timeout="1h|3600s|120"` values,
+  while preserving compatible numeric program data in the same 60–7,200 second
+  range.
+- Startup dependency bootstrap now mutates `.venv` only when that directory is
+  the running interpreter's environment; CI and developer environments can no
+  longer rewrite an unrelated checkout-local venv.
+
 ## 0.28.3
 
 **Rate-limit false-positive fix.** Working inside the robyx-ai workspace

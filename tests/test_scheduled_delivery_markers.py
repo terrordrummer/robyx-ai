@@ -143,7 +143,7 @@ class TestReminderDispatchMarker:
         import scheduler as sched
         # Point queue writes at a tmp path so _reconcile doesn't touch real state.
         monkeypatch.setattr(sched, "QUEUE_FILE", tmp_path / "queue.json")
-        (tmp_path / "queue.json").write_text('{"entries": []}')
+        (tmp_path / "queue.json").write_text('[]')
 
         reminder = {
             "id": "r-abc",
@@ -167,7 +167,7 @@ class TestReminderDispatchMarker:
     ):
         import scheduler as sched
         monkeypatch.setattr(sched, "QUEUE_FILE", tmp_path / "queue.json")
-        (tmp_path / "queue.json").write_text('{"entries": []}')
+        (tmp_path / "queue.json").write_text('[]')
 
         reminder = {
             "id": "r-abc",

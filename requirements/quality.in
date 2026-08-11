@@ -1,0 +1,5 @@
+# Pinned quality tools keep local and CI diagnostics identical. Runtime and
+# test dependencies remain sourced from bot/requirements.txt and
+# tests/requirements-test.txt when constraints are compiled.
+mypy==1.19.1
+ruff==0.15.16

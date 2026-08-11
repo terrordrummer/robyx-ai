@@ -4,8 +4,9 @@
 - Main runtime entrypoint is `bot/bot.py`.
 - `bot/handlers.py` owns command/message routing.
 - `bot/topics.py` is the write path for workspace/specialist/continuous-task creation and mutates `data/queue.json`, `data/specialists.md`, and instruction files under `data/agents/` and `data/specialists/`. These paths live under `data/` (gitignored) since v0.16; the repo ships a clean shell with no personal runtime data.
-- `bot/scheduler.py` is the unified scheduler (every 60s). It reads `data/queue.json` and handles all task types: reminders, one-shot, periodic, and continuous. Agents schedule work via `scheduler.add_task(...)`.
-- `bot/continuous.py` manages state for continuous (iterative autonomous) tasks. State lives in `data/continuous/<name>/state.json`.
+- `bot/scheduler.py` is the unified scheduler (every 60s). It reads `data/queue.json` and handles all task types: reminders, one-shot, periodic, and continuous. `scheduler.add_task(...)` is an internal runtime boundary; chat-facing agents must use the validated reminder/workspace macros so canonical platform/chat/thread scope is attached.
+- `bot/continuous.py` manages state for continuous (iterative autonomous) tasks. Runtime state lives in `data/continuous/<name>/state.json`; the revisioned `program.json` is authoritative for user-edited objectives, constraints, checkpoint policy, context, and plan text, while `plan.md` is a repairable human-readable projection.
+- `bot/task_scope.py` defines the persisted workspace ownership boundary `(platform, canonical chat_id, parent_thread_id)`. Delivery topics are mutable destinations and must never be used as the authorization boundary.
 - `bot/task_runtime.py` resolves agent identity and `work_dir` for scheduled/timed runs so they execute with the correct context and memory.
 - `bot/scheduled_delivery.py` relays parsed AI output from scheduled runs back into the target workspace/specialist topic.
 - `bot/lifecycle_macros.py` parses & dispatches workspace-scoped lifecycle macros emitted by the primary workspace agent (`[LIST_TASKS]`, `[TASK_STATUS]`, `[STOP_TASK]`, `[PAUSE_TASK]`, `[RESUME_TASK]`, `[COMPLETE_TASK]`, `[DELETE_TASK]`, `[GET_PLAN]`). Contract at `specs/005-unified-workspace-chat/contracts/lifecycle-macros.md` (superseded for stop/complete/delete/resume by `specs/006-continuous-task-robustness/contracts/lifecycle-ops.md`).
@@ -15,8 +16,8 @@
 - `bot/config_updates.py` intercepts `KEY=value` messages in `handlers.py` and applies them directly to `.env` without routing secrets through the AI backend.
 
 ## Commands
-- Install runtime deps: `.venv/bin/pip install -r bot/requirements.txt`
-- Install test deps: `.venv/bin/pip install -r tests/requirements-test.txt`
+- Install the locked contributor environment: `uv pip sync --python .venv/bin/python requirements/locks/dev-py312.txt` (replace `312` with the venv's Python minor).
+- Install runtime-only deps: `.venv/bin/pip install --require-hashes -r requirements/locks/runtime-py312.txt` (same minor-selection rule). Human-edited `bot/requirements.txt` and `tests/requirements-test.txt` are lock inputs, not production install commands.
 - Run locally: `.venv/bin/python bot/bot.py`
 - Run full test suite from repo root: `pytest`
 - Run focused tests: `pytest tests/test_scheduler.py -k <expr>`
@@ -30,7 +31,7 @@
 ## File Format Contracts
 - `data/queue.json` is the unified task queue (reminders, one-shot, periodic, continuous). All entries share an atomic claim system.
 - `data/specialists.md` is a machine-parsed Markdown table. Preserve pipe-table structure and column order when editing manually.
-- `data/continuous/<name>/state.json` tracks iterative task progress (steps, history, next planned step).
+- `data/continuous/<name>/state.json` tracks iterative task progress (steps, history, next planned step); `program.json` carries the revisioned user program and exact plan body.
 - Legacy formats (`data/tasks.md`, `data/timed_queue.json`, `data/reminders.json`) are migrated automatically at boot into `queue.json`.
 
 ## Changelog

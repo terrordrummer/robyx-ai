@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import uuid as _uuid
@@ -62,8 +63,16 @@ from config import (
     TIMED_QUEUE_FILE,
 )
 from memory import build_memory_context
+from maintenance import MaintenanceActiveError, get_maintenance_gate
 from model_preferences import resolve_model_preference
+from persistence_recovery import (
+    PersistenceUnavailableError,
+    guard_json_write,
+    load_json_with_recovery,
+    recovery_marker_path,
+)
 from scheduled_delivery import start_task_delivery_watch
+from task_scope import TaskScope, attach_scope, scope_from_record
 from task_runtime import (
     resolve_agent_file_path,
     resolve_task_runtime_context,
@@ -86,6 +95,71 @@ FREQUENCY_SECONDS = {
 }
 
 _queue_lock = threading.Lock()
+
+
+class QueueUnavailableError(PersistenceUnavailableError):
+    """The queue is corrupt and no verified recovery copy is available."""
+
+
+def _valid_queue_payload(value: Any) -> bool:
+    """Validate the complete semantic shape of live and snapshot queues.
+
+    Legacy records may omit ``workspace_scope`` so authoritative lifecycle
+    lookup can migrate them under its stricter ambiguity rules. A present
+    scope, however, must always be canonical. Structurally valid but empty or
+    unknown entry objects are corruption, not an empty queue.
+    """
+    if not isinstance(value, list):
+        return False
+
+    def _text(raw: Any) -> bool:
+        return isinstance(raw, str) and bool(raw.strip())
+
+    def _timestamp(raw: Any) -> bool:
+        if not _text(raw):
+            return False
+        try:
+            datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    for entry in value:
+        if not isinstance(entry, dict):
+            return False
+        entry_type = entry.get("type")
+        if entry_type not in {"reminder", "one-shot", "periodic", "continuous"}:
+            return False
+        if not _text(entry.get("status")):
+            return False
+        try:
+            if scope_from_record(entry) is not None:
+                pass
+        except (TypeError, ValueError):
+            return False
+
+        if entry_type == "reminder":
+            if not (
+                _text(entry.get("id"))
+                and isinstance(entry.get("message"), str)
+                and bool(entry["message"].strip())
+                and _timestamp(entry.get("fire_at"))
+            ):
+                return False
+            continue
+
+        if not _text(entry.get("name")):
+            return False
+        try:
+            validate_task_name(entry["name"])
+        except (TypeError, ValueError):
+            return False
+        # Old unified-queue generations did not persist every operational
+        # field consistently. Keep those records readable for the explicit
+        # migration/repair paths, but require a known type, status and stable
+        # task name. The public enqueue APIs below enforce the complete modern
+        # shape before any new record can be written.
+    return True
 
 
 @contextlib.contextmanager
@@ -118,14 +192,25 @@ def _queue_mutex():
 
 
 def _load_queue_unlocked() -> list[dict]:
-    if not QUEUE_FILE.exists():
-        return []
     try:
-        data = json.loads(QUEUE_FILE.read_text())
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError) as exc:
-        log.error("Failed to load queue.json: %s", exc)
+        result = load_json_with_recovery(
+            QUEUE_FILE,
+            data_dir=DATA_DIR,
+            validator=_valid_queue_payload,
+            kind="scheduler queue",
+            logger=log,
+        )
+    except PersistenceUnavailableError as exc:
+        raise QueueUnavailableError(str(exc)) from exc
+    if result.status == "missing":
         return []
+    if result.status == "recovered":
+        log.critical(
+            "Scheduler queue recovered from %s; inspect quarantined data and "
+            "reconcile work created after the snapshot",
+            result.snapshot,
+        )
+    return result.value
 
 
 def load_queue() -> list[dict]:
@@ -143,6 +228,8 @@ _queue_size_warned = False
 
 
 def _save_queue_unlocked(entries: list[dict]) -> None:
+    if not _valid_queue_payload(entries):
+        raise ValueError("refusing to persist a malformed scheduler queue")
     QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = QUEUE_FILE.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -167,6 +254,19 @@ def _save_queue_unlocked(entries: list[dict]) -> None:
 
 def save_queue(entries: list[dict]) -> None:
     with _queue_mutex():
+        # Public replacement is still a mutation: validate/recover the current
+        # file first so callers cannot overwrite a corrupt queue with an
+        # apparently-clean list derived from stale or incomplete data.
+        try:
+            guard_json_write(
+                QUEUE_FILE,
+                data_dir=DATA_DIR,
+                validator=_valid_queue_payload,
+                kind="scheduler queue",
+                logger=log,
+            )
+        except PersistenceUnavailableError as exc:
+            raise QueueUnavailableError(str(exc)) from exc
         _save_queue_unlocked(entries)
 
 
@@ -200,15 +300,27 @@ def validate_one_shot_scheduled_at(
 # ── Public API: add entries ──────────────────────────────────────────────────
 
 
-def add_task(task: dict) -> None:
+def add_task(
+    task: dict,
+    *,
+    scope: TaskScope | None = None,
+    allow_legacy_unscoped: bool = False,
+) -> None:
     """Append a one-shot, periodic, or continuous task to the queue atomically.
 
     Required: ``name``, ``agent_file``, ``type``, ``scheduled_at`` (one-shot).
     """
     queued = dict(task)
+    if scope is None:
+        if not allow_legacy_unscoped:
+            raise ValueError("workspace scope is required for new scheduler tasks")
+    else:
+        attach_scope(queued, scope)
     queued["name"] = validate_task_name(queued.get("name", ""))
 
     task_type = queued.get("type", "one-shot")
+    if task_type not in {"one-shot", "periodic", "continuous"}:
+        raise ValueError("unsupported scheduler task type: %r" % task_type)
 
     # Continuous tasks don't need agent_file validation at queue level
     if task_type != "continuous":
@@ -220,6 +332,22 @@ def add_task(task: dict) -> None:
             queued.get("scheduled_at"),
             label="one-shot tasks",
         )
+    elif task_type == "periodic":
+        interval = queued.get("interval_seconds")
+        if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval <= 0:
+            raise ValueError("interval_seconds must be positive for periodic tasks")
+        queued["next_run"] = validate_one_shot_scheduled_at(
+            queued.get("next_run"),
+            label="periodic tasks",
+        )
+    elif (
+        not allow_legacy_unscoped
+        and (
+            not isinstance(queued.get("state_file"), str)
+            or not queued["state_file"].strip()
+        )
+    ):
+        raise ValueError("state_file is required for continuous tasks")
 
     queued.setdefault("id", str(_uuid.uuid4()))
     queued.setdefault("status", "pending")
@@ -227,16 +355,49 @@ def add_task(task: dict) -> None:
 
     with _queue_mutex():
         entries = _load_queue_unlocked()
+        if task_type == "continuous":
+            # A deleted task keeps a canceled queue tombstone so repeated
+            # delete remains distinguishable from never-created.  Once a new
+            # generation with the same name has passed creation validation,
+            # replace only those old continuous tombstones; otherwise both
+            # entries resolve through the same new state.json and lifecycle
+            # lookup becomes spuriously ambiguous.  Active/resumable entries
+            # and same-name entries of other task types are untouched.
+            entries = [
+                entry for entry in entries
+                if not (
+                    entry.get("type") == "continuous"
+                    and entry.get("name") == queued["name"]
+                    and entry.get("status") == "canceled"
+                )
+            ]
         entries.append(queued)
         _save_queue_unlocked(entries)
 
 
-def add_reminder(entry: dict) -> None:
+def add_reminder(
+    entry: dict,
+    *,
+    scope: TaskScope | None = None,
+    allow_legacy_unscoped: bool = False,
+) -> None:
     """Append a reminder entry to the queue atomically.
 
     Required: ``fire_at``, ``message``. Optional: ``chat_id``, ``thread_id``.
     """
     queued = dict(entry)
+    if scope is None:
+        if not allow_legacy_unscoped:
+            raise ValueError("workspace scope is required for new reminders")
+    else:
+        attach_scope(queued, scope)
+    message = queued.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("message is required for reminders")
+    queued["fire_at"] = validate_one_shot_scheduled_at(
+        queued.get("fire_at"),
+        label="reminders",
+    )
     queued["type"] = "reminder"
     queued.setdefault("id", str(_uuid.uuid4()))
     queued.setdefault("status", "pending")
@@ -249,11 +410,107 @@ def add_reminder(entry: dict) -> None:
         _save_queue_unlocked(entries)
 
 
+def rollback_continuous_creation(name: str, previous_entries: list[dict]) -> None:
+    """Restore one task name's queue slice after a failed create transaction.
+
+    The queue mutex keeps unrelated scheduler/lifecycle writes intact; this is
+    deliberately narrower than restoring a whole pre-create queue snapshot.
+    """
+    with _queue_mutex():
+        entries = [
+            entry for entry in _load_queue_unlocked()
+            if not (
+                entry.get("type") == "continuous"
+                and entry.get("name") == name
+            )
+        ]
+        entries.extend(dict(entry) for entry in previous_entries)
+        _save_queue_unlocked(entries)
+
+
+def repoint_continuous_topic(name: str, new_thread_id: Any) -> None:
+    """Atomically update the active queue route for a recreated topic."""
+    with _queue_mutex():
+        entries = _load_queue_unlocked()
+        matched = False
+        for entry in entries:
+            if (
+                entry.get("type") == "continuous"
+                and entry.get("name") == name
+                and entry.get("status") != "canceled"
+            ):
+                entry["thread_id"] = str(new_thread_id)
+                matched = True
+        if not matched:
+            raise RuntimeError("active queue entry missing for continuous task '%s'" % name)
+        _save_queue_unlocked(entries)
+
+
+def set_continuous_workspace_scope(name: str, workspace_scope: dict) -> None:
+    """Persist a continuous task's immutable ownership scope atomically.
+
+    Used by the one-time legacy migration after state-level ownership has
+    been proven. A conflicting modern scope is an integrity error and is
+    never overwritten.
+    """
+    from task_scope import TaskScope, scope_from_record
+
+    canonical = TaskScope.from_dict(workspace_scope)
+    with _queue_mutex():
+        entries = _load_queue_unlocked()
+        matched = False
+        for entry in entries:
+            if (
+                entry.get("type") != "continuous"
+                or entry.get("name") != name
+                or entry.get("status") == "canceled"
+            ):
+                continue
+            existing = scope_from_record(entry)
+            if existing is not None and existing != canonical:
+                raise RuntimeError(
+                    "continuous queue scope conflict for task '%s'" % name
+                )
+            entry["workspace_scope"] = canonical.to_dict()
+            matched = True
+        if not matched:
+            raise RuntimeError(
+                "active queue entry missing for continuous task '%s'" % name
+            )
+        _save_queue_unlocked(entries)
+
+
+def set_queue_entry_workspace_scope(entry_id: str, workspace_scope: dict) -> None:
+    """Atomically migrate one legacy non-continuous queue entry."""
+    from task_scope import TaskScope, scope_from_record
+
+    canonical = TaskScope.from_dict(workspace_scope)
+    with _queue_mutex():
+        entries = _load_queue_unlocked()
+        matched = False
+        for entry in entries:
+            if str(entry.get("id") or "") != str(entry_id):
+                continue
+            existing = scope_from_record(entry)
+            if existing is not None and existing != canonical:
+                raise RuntimeError(
+                    "queue scope conflict for entry '%s'" % entry_id
+                )
+            entry["workspace_scope"] = canonical.to_dict()
+            matched = True
+            break
+        if not matched:
+            raise RuntimeError("queue entry '%s' is missing" % entry_id)
+        _save_queue_unlocked(entries)
+
+
 async def drain_and_cancel_continuous_task(
     task_name: str,
     *,
     reason: str = "workspace closed",
     drain_timeout_seconds: int | None = None,
+    terminate_immediately: bool = False,
+    journal_events: bool = True,
 ) -> dict:
     """Spec 006 FR-021 — drain-on-close with a bounded window.
 
@@ -261,20 +518,30 @@ async def drain_and_cancel_continuous_task(
     up to ``drain_timeout_seconds`` (or the task's per-state override,
     or ``DRAIN_TIMEOUT_DEFAULT_SECONDS``) for it to exit naturally. If
     the timeout elapses first, SIGTERM + 5s grace + SIGKILL, then
-    journal ``drain_timeout``. Finally cancel the queue entry.
+    journal ``drain_timeout``.
 
-    Returns ``{"drained": bool, "timeout": bool, "waited_seconds": float}``.
+    Lifecycle operations pass ``terminate_immediately=True``: in that mode
+    SIGTERM is sent first, followed by a bounded grace window (at most five
+    seconds) and SIGKILL if necessary. Workspace-close keeps the historical
+    drain-first behaviour. The queue entry is canceled *before* either flow,
+    preventing a new scheduler cycle from dispatching while the drain waits.
+
+    ``journal_events=False`` is used by lifecycle transitions because their
+    public contract requires a single transition event; workspace-close keeps
+    the lower-level drain events enabled.
+
+    Returns drain/termination outcome flags and the elapsed wait duration.
     """
     import asyncio as _asyncio
-    import signal as _signal
     from process import is_pid_alive
+    from runtime_supervisor import get_runtime_supervisor
 
     try:
         from config import DRAIN_TIMEOUT_DEFAULT_SECONDS as _default_drain
     except Exception:
         _default_drain = 3600
 
-    from continuous import load_state, state_file_path
+    from continuous import load_state, save_state, state_file_path
 
     # Resolve effective drain window.
     state_path = state_file_path(task_name)
@@ -286,70 +553,144 @@ async def drain_and_cancel_continuous_task(
         effective = _default_drain
     effective = max(1, int(effective))
 
-    _journal_scheduler_event(
-        task_name=task_name,
-        event_type="drain_started",
-        outcome="ok",
-        payload={"timeout_seconds": effective, "reason": reason},
-    )
+    # Stop future dispatches before yielding to the event loop.  Canceling at
+    # the end left a window where a concurrent scheduler cycle could spawn a
+    # new step while this coroutine was waiting for the previous one.
+    cancel_task_by_name(task_name, reason=reason)
+
+    if journal_events:
+        _journal_scheduler_event(
+            task_name=task_name,
+            event_type="drain_started",
+            outcome="ok",
+            payload={"timeout_seconds": effective, "reason": reason},
+        )
 
     # Locate the running subprocess via lock file.
     lock_file = DATA_DIR / task_name / "lock"
     pid: int | None = None
+    lock_identity: dict[str, object] | None = None
     if lock_file.exists():
-        pid_raw, _ = _parse_lock_content(lock_file.read_text())
+        pid_raw, _, lock_identity = _parse_lock_record(lock_file.read_text())
         pid = pid_raw
 
     waited = 0.0
     timed_out = False
     drained = False
-
-    if pid is not None and is_pid_alive(pid):
-        # Poll for natural exit up to the drain window.
-        interval = 1.0
-        start = time.monotonic()
-        while waited < effective:
-            if not is_pid_alive(pid):
-                drained = True
-                break
-            await _asyncio.sleep(interval)
-            waited = time.monotonic() - start
-
-        if not drained and is_pid_alive(pid):
-            timed_out = True
-            try:
-                os.kill(pid, _signal.SIGTERM)
-                await _asyncio.sleep(5)
-                if is_pid_alive(pid):
-                    os.kill(pid, _signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-            _journal_scheduler_event(
-                task_name=task_name,
-                event_type="drain_timeout",
-                outcome="killed",
-                payload={"pid": pid, "timeout_seconds": effective},
-            )
-
-    # Cancel the queue entry regardless of drain outcome.
-    cancel_task_by_name(task_name, reason=reason)
-
-    _journal_scheduler_event(
-        task_name=task_name,
-        event_type="drain_completed",
-        outcome="drained" if drained else ("timeout" if timed_out else "not_running"),
-        payload={"waited_seconds": round(waited, 2)},
+    terminated = False
+    supervisor = get_runtime_supervisor()
+    if (
+        pid is not None
+        and is_pid_alive(pid)
+        and not supervisor.process_tree_alive(pid)
+        and not _lock_process_identity_matches(pid, lock_identity)
+    ):
+        log.error(
+            "Refusing to drain PID %d for '%s': persisted process identity "
+            "is missing or changed",
+            pid,
+            task_name,
+        )
+        lock_file.unlink(missing_ok=True)
+        pid = None
+    process_found = pid is not None and (
+        supervisor.process_tree_alive(pid) or is_pid_alive(pid)
     )
+
+    if process_found and pid is not None:
+        def _tree_alive() -> bool:
+            return supervisor.process_tree_alive(pid) or is_pid_alive(pid)
+
+        if state is not None and reason == "workspace closed":
+            # The delivery watcher reads this just before rendering.  Persist
+            # it before waiting so a naturally-completing step is visibly
+            # distinguished from an ordinary step completion.
+            state["delivery_state_override"] = "workspace_closed"
+            state["workspace_closed_at"] = datetime.now(timezone.utc).isoformat()
+            save_state(state_path, state)
+
+        # Explicit lifecycle operations terminate now; workspace close allows
+        # natural completion for the configured drain window.
+        if terminate_immediately:
+            start = time.monotonic()
+            drained = await supervisor.terminate_process_by_pid(
+                pid,
+                grace_seconds=min(float(effective), 5.0),
+            )
+            waited = time.monotonic() - start
+            terminated = True
+            timed_out = not drained
+        else:
+            start = time.monotonic()
+            while waited < float(effective):
+                if not _tree_alive():
+                    drained = True
+                    break
+                await _asyncio.sleep(min(1.0, max(0.0, float(effective) - waited)))
+                waited = time.monotonic() - start
+            if not _tree_alive():
+                drained = True
+
+        if not drained and not terminate_immediately and _tree_alive():
+            timed_out = True
+            if state is not None and reason == "workspace closed":
+                state = load_state(state_path) or state
+                state["delivery_state_override"] = "drain_timeout"
+                save_state(state_path, state)
+            terminated = True
+            drained = await supervisor.terminate_process_by_pid(
+                pid,
+                grace_seconds=5.0,
+            )
+            if journal_events:
+                _journal_scheduler_event(
+                    task_name=task_name,
+                    event_type="drain_timeout",
+                    outcome="killed",
+                    payload={"pid": pid, "timeout_seconds": effective},
+                )
+
+        # Await the delivery watcher too: closing a workspace must not archive
+        # its parent and return while final task output is still in flight.
+        watcher = supervisor.get_named_task("scheduled_delivery:%s" % pid)
+        if watcher is not None:
+            try:
+                await _asyncio.wait_for(_asyncio.shield(watcher), timeout=5.0)
+            except _asyncio.TimeoutError:
+                log.error("Delivery watcher for '%s' did not drain", task_name)
+
+        # The watcher normally removes the lock.  Do it here only after the
+        # complete tree is gone; retaining it on failure keeps recovery
+        # fail-closed instead of allowing a duplicate dispatch.
+        if drained and not _tree_alive():
+            lock_file.unlink(missing_ok=True)
+
+    if journal_events:
+        _journal_scheduler_event(
+            task_name=task_name,
+            event_type="drain_completed",
+            outcome=(
+                "drained" if drained
+                else ("timeout" if timed_out else "not_running")
+            ),
+            payload={"waited_seconds": round(waited, 2)},
+        )
 
     return {
         "drained": drained,
         "timeout": timed_out,
+        "terminated": terminated,
+        "process_found": process_found,
+        "tree_stopped": not process_found or drained,
         "waited_seconds": round(waited, 2),
     }
 
 
 def cancel_tasks_for_agent_file(
-    agent_file: str, *, reason: str = "workspace closed"
+    agent_file: str,
+    *,
+    reason: str = "workspace closed",
+    transaction_id: str | None = None,
 ) -> int:
     """Mark pending entries targeting ``agent_file`` as canceled."""
     if not agent_file:
@@ -368,6 +709,8 @@ def cancel_tasks_for_agent_file(
             entry["status"] = "canceled"
             entry["canceled_at"] = canceled_at
             entry["canceled_reason"] = reason
+            if transaction_id is not None:
+                entry["cancel_transaction_id"] = transaction_id
             canceled += 1
 
         if canceled:
@@ -378,6 +721,42 @@ def cancel_tasks_for_agent_file(
             )
 
     return canceled
+
+
+def restore_tasks_canceled_by_transaction(
+    agent_file: str,
+    transaction_id: str,
+    *,
+    exclude_names: set[str] | None = None,
+) -> int:
+    """Compensate only cancellation fields still owned by one close attempt."""
+    if not agent_file or not transaction_id:
+        return 0
+    excluded = exclude_names or set()
+    with _queue_mutex():
+        entries = _load_queue_unlocked()
+        restored = 0
+        changed = False
+        for entry in entries:
+            if (
+                entry.get("agent_file") != agent_file
+                or entry.get("status") != "canceled"
+                or entry.get("cancel_transaction_id") != transaction_id
+            ):
+                continue
+            if entry.get("name") in excluded:
+                entry.pop("cancel_transaction_id", None)
+                changed = True
+                continue
+            entry["status"] = "pending"
+            entry.pop("canceled_at", None)
+            entry.pop("canceled_reason", None)
+            entry.pop("cancel_transaction_id", None)
+            restored += 1
+            changed = True
+        if changed:
+            _save_queue_unlocked(entries)
+    return restored
 
 
 # Alias for backward compatibility
@@ -416,6 +795,40 @@ def cancel_task_by_name(name: str, *, reason: str = "stopped by user") -> bool:
                 canceled, "y" if canceled == 1 else "ies", name, reason,
             )
     return canceled > 0
+
+
+def reactivate_continuous_task_by_name(name: str) -> bool:
+    """Return a stopped continuous queue entry to ``pending`` on resume.
+
+    Stop/complete/delete cancel queue entries before draining so no new step
+    can race the lifecycle transition.  Resume is the sole operation allowed
+    to reverse that cancellation, and only for continuous tasks whose state
+    machine has independently accepted the transition.
+    """
+    if not name:
+        return False
+
+    reactivated = 0
+    with _queue_mutex():
+        entries = _load_queue_unlocked()
+        for entry in entries:
+            if entry.get("name") != name or entry.get("type") != "continuous":
+                continue
+            if entry.get("status") != "canceled":
+                continue
+            entry["status"] = "pending"
+            entry.pop("canceled_at", None)
+            entry.pop("canceled_reason", None)
+            reactivated += 1
+        if reactivated:
+            _save_queue_unlocked(entries)
+            log.info(
+                "Reactivated %d continuous queue entr%s for name=%r",
+                reactivated,
+                "y" if reactivated == 1 else "ies",
+                name,
+            )
+    return reactivated > 0
 
 
 # ── Startup cleanup ──────────────────────────────────────────────────────────
@@ -901,6 +1314,8 @@ async def _spawn_ai_subprocess(
     stdin_payload: bytes | str | None,
     output_log: Path,
     work_dir: str,
+    env_overrides: dict[str, str] | None = None,
+    owner: str = "scheduled",
 ) -> asyncio.subprocess.Process:
     """Run an AI CLI subprocess, redirecting stdout+stderr to ``output_log``.
 
@@ -909,55 +1324,112 @@ async def _spawn_ai_subprocess(
     prompt payload into stdin (tolerating both sync and async
     ``write`` / ``close`` variants that asyncio StreamWriter exposes).
     """
-    with open(output_log, "w") as out_f:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=(
-                asyncio.subprocess.PIPE if stdin_payload is not None
-                else asyncio.subprocess.DEVNULL
-            ),
-            stdout=out_f,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=work_dir,
-        )
-        if stdin_payload is not None and proc.stdin is not None:
-            write_result = proc.stdin.write(stdin_payload)
-            if inspect.isawaitable(write_result):
-                await write_result
-            await proc.stdin.drain()
-            close_result = proc.stdin.close()
-            if inspect.isawaitable(close_result):
-                await close_result
+    child_env = None
+    if env_overrides:
+        child_env = os.environ.copy()
+        child_env.update(env_overrides)
+
+    proc = None
+    try:
+        from runtime_supervisor import get_runtime_supervisor
+
+        supervisor = get_runtime_supervisor()
+        supervisor.reject_if_closing()
+        with open(output_log, "w") as out_f:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=(
+                    asyncio.subprocess.PIPE if stdin_payload is not None
+                    else asyncio.subprocess.DEVNULL
+                ),
+                stdout=out_f,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=work_dir,
+                env=child_env,
+                start_new_session=sys.platform != "win32",
+            )
+            supervisor.track_process(
+                proc, owner=owner, process_group=sys.platform != "win32",
+            )
+            if stdin_payload is not None and proc.stdin is not None:
+                write_result = proc.stdin.write(stdin_payload)
+                if inspect.isawaitable(write_result):
+                    await write_result
+                await proc.stdin.drain()
+                close_result = proc.stdin.close()
+                if inspect.isawaitable(close_result):
+                    await close_result
+    except BaseException:
+        if proc is not None:
+            await _terminate_uncommitted_subprocess(proc)
+        raise
     return proc
 
 
+async def _terminate_uncommitted_subprocess(
+    proc: asyncio.subprocess.Process,
+    *,
+    grace_seconds: float = 5.0,
+) -> None:
+    """Terminate a process spawned for a dispatch that lost its state race.
+
+    The process has not yet been recorded in state or in the lock file, so the
+    normal drain path cannot find it.  Waiting here guarantees that a lifecycle
+    transition which canceled the queue during ``create_subprocess_exec`` does
+    not leave an untracked agent running in the workspace.
+    """
+    from runtime_supervisor import get_runtime_supervisor
+
+    await get_runtime_supervisor().terminate_process(
+        proc, grace_seconds=grace_seconds,
+    )
+
+
 def _write_lock_file(lock_file: Path, pid: int) -> None:
-    """Write the initial lock file — spec 006 two-line format.
+    """Write the initial lock file with an optional process identity.
 
     Line 1: ``<pid>``
     Line 2: ``<iso8601_heartbeat_ts>``
+    Line 3: compact JSON process identity (start fingerprint, executable,
+    command name, and process group). Older two-line readers remain valid.
 
     The heartbeat timestamp is refreshed periodically by the subprocess
     via :func:`refresh_heartbeat` so stale-lock detection can distinguish
     "subprocess alive but slow" from "subprocess crashed/SIGKILL'd".
     """
+    from process import get_process_identity_sync
+
     now_str = datetime.now(timezone.utc).isoformat()
+    identity = get_process_identity_sync(pid)
+    suffix = ""
+    if identity is not None:
+        suffix = json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n"
     # Pre-spec-006 single-line format kept as a subline-safe prefix: some
     # readers that only look at line 1 still see the pid.
-    lock_file.write_text("%d\n%s\n" % (pid, now_str))
+    lock_file.write_text("%d\n%s\n%s" % (pid, now_str, suffix))
 
 
 def refresh_heartbeat(lock_file: Path, pid: int) -> None:
-    """Atomic heartbeat refresh — writes the same two-line lock format
+    """Atomic heartbeat refresh preserving the original process identity
     via a temp file + ``os.replace`` so concurrent ``check_lock`` readers
     never see a torn file.
 
     Used by the subprocess-side heartbeat loop (spec 006 FR-019).
     """
     now_str = datetime.now(timezone.utc).isoformat()
+    identity = None
+    try:
+        recorded_pid, _, identity = _parse_lock_record(lock_file.read_text())
+        if recorded_pid != pid:
+            return
+    except OSError:
+        pass
+    suffix = ""
+    if identity is not None:
+        suffix = json.dumps(identity, sort_keys=True, separators=(",", ":")) + "\n"
     tmp = lock_file.with_suffix(".lock.tmp-%d" % pid)
     try:
-        tmp.write_text("%d\n%s\n" % (pid, now_str))
+        tmp.write_text("%d\n%s\n%s" % (pid, now_str, suffix))
         os.replace(str(tmp), str(lock_file))
     except OSError:
         # Best-effort — failure to refresh is non-fatal; scheduler will
@@ -973,44 +1445,56 @@ class LockStatus(str, Enum):
     ALIVE = "alive"
     STALE_DEAD_PID = "stale_dead_pid"
     STALE_ZOMBIE = "stale_zombie"
+    PID_REUSED = "pid_reused"
     MISSING = "missing"
 
 
-def _parse_lock_content(content: str) -> tuple[int | None, datetime | None]:
-    """Parse a lock file body into ``(pid, heartbeat_ts)``.
+def _parse_lock_record(
+    content: str,
+) -> tuple[int | None, datetime | None, dict[str, object] | None]:
+    """Parse pid, heartbeat, and optional durable process identity.
 
     Accepts three formats for backward compat:
     * Legacy single-line ``<pid> <iso_ts>`` (space-separated).
     * Legacy pid-only ``<pid>``.
     * Spec 006 two-line ``<pid>\\n<iso_ts>\\n``.
+    * Hardened three-line record with a JSON identity on line 3.
 
-    Returns ``(None, None)`` on unparseable content.
+    Returns ``(None, None, None)`` on unparseable content.
     """
     content = content.strip()
     if not content:
-        return None, None
+        return None, None, None
     pid: int | None = None
     ts: datetime | None = None
+    identity: dict[str, object] | None = None
 
     if "\n" in content:
         lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
         if not lines:
-            return None, None
+            return None, None, None
         try:
             pid = int(lines[0])
         except ValueError:
-            return None, None
+            return None, None, None
         if len(lines) >= 2:
             try:
                 ts = datetime.fromisoformat(lines[1])
             except ValueError:
                 ts = None
+        if len(lines) >= 3:
+            try:
+                candidate = json.loads(lines[2])
+                if isinstance(candidate, dict):
+                    identity = candidate
+            except (TypeError, ValueError):
+                identity = None
     else:
         parts = content.split()
         try:
             pid = int(parts[0])
         except (ValueError, IndexError):
-            return None, None
+            return None, None, None
         if len(parts) >= 2:
             try:
                 ts = datetime.fromisoformat(parts[1])
@@ -1019,7 +1503,32 @@ def _parse_lock_content(content: str) -> tuple[int | None, datetime | None]:
 
     if ts is not None and ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    return pid, ts
+    return pid, ts, identity
+
+
+def _parse_lock_content(content: str) -> tuple[int | None, datetime | None]:
+    """Backward-compatible two-field view of :func:`_parse_lock_record`."""
+    pid, heartbeat_ts, _ = _parse_lock_record(content)
+    return pid, heartbeat_ts
+
+
+def _lock_process_identity_matches(
+    pid: int,
+    identity: dict[str, object] | None,
+) -> bool:
+    """Verify a persisted lock owner without trusting PID/name alone."""
+    from process import process_identity_matches
+
+    if identity is not None:
+        return process_identity_matches(pid, identity)
+    try:
+        from runtime_supervisor import get_runtime_supervisor
+        if get_runtime_supervisor().process_tree_alive(pid):
+            return True
+        import orphan_tracker
+        return orphan_tracker.registered_identity_matches(pid)
+    except Exception:
+        return False
 
 
 async def check_lock_status(task_name: str) -> tuple[LockStatus, int | None]:
@@ -1059,7 +1568,7 @@ async def check_lock_status(task_name: str) -> tuple[LockStatus, int | None]:
         )
         return LockStatus.MISSING, None
 
-    pid, heartbeat_ts = _parse_lock_content(content)
+    pid, heartbeat_ts, identity = _parse_lock_record(content)
     if pid is None:
         # Unparseable lock — treat as missing so we don't deadlock.
         try:
@@ -1073,6 +1582,11 @@ async def check_lock_status(task_name: str) -> tuple[LockStatus, int | None]:
     if not is_pid_alive(pid):
         return LockStatus.STALE_DEAD_PID, pid
 
+    # A live PID and familiar command name are not ownership proofs. Detect
+    # PID reuse before trusting even a fresh heartbeat.
+    if identity is not None and not _lock_process_identity_matches(pid, identity):
+        return LockStatus.PID_REUSED, pid
+
     # Pid alive. If heartbeat info is absent (legacy format), trust the
     # pid — earlier Robyx never deadlocked on pid-alive-but-slow. If
     # present, enforce the stale threshold.
@@ -1083,6 +1597,10 @@ async def check_lock_status(task_name: str) -> tuple[LockStatus, int | None]:
             _threshold = 300
         age = (datetime.now(timezone.utc) - heartbeat_ts).total_seconds()
         if age > _threshold:
+            # Legacy two-line locks are signal-safe only when the current
+            # in-memory supervisor or durable orphan registry proves identity.
+            if not _lock_process_identity_matches(pid, identity):
+                return LockStatus.PID_REUSED, pid
             return LockStatus.STALE_ZOMBIE, pid
 
     return LockStatus.ALIVE, pid
@@ -1194,11 +1712,12 @@ async def _spawn_agent_task(task: dict, backend: AIBackend, platform=None) -> in
         ) % (task_name, agent_instructions, memory_ctx,
              silence_policy, LOG_FILE, task_name, lock_file)
 
-    cmd = backend.build_spawn_command(
+    invocation = backend.build_spawn_invocation(
         prompt=full_prompt,
         model=model,
         work_dir=runtime.work_dir,
     )
+    cmd = invocation.argv
     stdin_payload = backend.spawn_stdin_payload(full_prompt)
 
     try:
@@ -1207,6 +1726,8 @@ async def _spawn_agent_task(task: dict, backend: AIBackend, platform=None) -> in
             stdin_payload=stdin_payload,
             output_log=output_log,
             work_dir=runtime.work_dir,
+            env_overrides=invocation.env_overrides,
+            owner="scheduled:%s" % task_name,
         )
         _write_lock_file(lock_file, proc.pid)
         start_task_delivery_watch(task, proc, output_log, lock_file, platform, backend, log)
@@ -1360,6 +1881,72 @@ def _maybe_demote_on_demand_awaiting_input(state: dict, name: str) -> bool:
     return True
 
 
+async def _sync_continuous_topic_marker(
+    state: dict,
+    name: str,
+    platform,
+    *,
+    actionable_event: str | None = None,
+) -> bool:
+    """Apply a state marker once, routing permanent failures to recovery."""
+    if platform is None:
+        return False
+    from continuous import (
+        save_state,
+        state_file_path,
+        unpin_awaiting_message,
+        update_topic_state_marker,
+    )
+    if (
+        state.get("status") not in ("awaiting_input", "awaiting-input")
+        and state.get("awaiting_pinned_msg_id") is not None
+    ):
+        try:
+            from config import CHAT_ID
+            if await unpin_awaiting_message(state, platform, CHAT_ID):
+                save_state(state_file_path(name), state)
+        except Exception as exc:
+            from messaging.base import TopicUnreachable
+            if isinstance(exc, TopicUnreachable):
+                from topic_recovery import recover_unreachable_topic
+                await recover_unreachable_topic(
+                    name,
+                    platform,
+                    reason=exc.reason or str(exc),
+                    event=actionable_event,
+                )
+                return False
+            raise
+    if state.get("topic_marker_status") == state.get("status"):
+        return False
+    try:
+        updated = await update_topic_state_marker(state, platform)
+    except Exception as exc:
+        from messaging.base import TopicUnreachable
+        if not isinstance(exc, TopicUnreachable):
+            raise
+        from topic_recovery import recover_unreachable_topic
+        await recover_unreachable_topic(
+            name,
+            platform,
+            reason=exc.reason or str(exc),
+            event=actionable_event,
+        )
+        return False
+    if updated:
+        state["topic_marker_status"] = state.get("status")
+        save_state(state_file_path(name), state)
+    elif state.get("dedicated_thread_id") is not None:
+        from topic_recovery import recover_unreachable_topic
+        await recover_unreachable_topic(
+            name,
+            platform,
+            reason="topic marker update returned false",
+            event=actionable_event,
+        )
+    return bool(updated)
+
+
 async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple[list[tuple[str, int]], list[str]]:
     """Check continuous entries in the queue and dispatch next steps if ready.
 
@@ -1406,17 +1993,38 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                 continue
 
             # Handle rate-limited tasks
-            if state["status"] == "rate-limited":
+            if state["status"] in ("rate_limited", "rate-limited"):
                 if check_rate_limit_recovery(state):
+                    previous_status = state["status"]
                     resume_task(state)
                     save_state(Path(sf), state)
+                    await _sync_continuous_topic_marker(state, name, platform)
+                    _journal_scheduler_event(
+                        task_name=name,
+                        event_type="rate_limit_recovered",
+                        outcome="recovered",
+                        payload={"prev_status": previous_status},
+                    )
                     log.info("Continuous task '%s': rate limit recovered, resuming", name)
                 else:
+                    await _sync_continuous_topic_marker(state, name, platform)
                     continue
 
             # Server-side enforcement of on-demand checkpoint policy.
             if _maybe_demote_on_demand_awaiting_input(state, name):
                 save_state(Path(sf), state)
+
+            status_event = (
+                "awaiting_input"
+                if state["status"] in ("awaiting_input", "awaiting-input")
+                else ("error" if state["status"] == "error" else None)
+            )
+            await _sync_continuous_topic_marker(
+                state,
+                name,
+                platform,
+                actionable_event=status_event,
+            )
 
             # Skip if not ready.
             # Spec 006: accept both legacy (hyphen / "paused") and canonical
@@ -1443,23 +2051,19 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                 # termination before unlinking.
                 lock_file = DATA_DIR / name / "lock"
                 if lock_status == LockStatus.STALE_ZOMBIE and pid is not None:
-                    import signal as _signal
-                    try:
-                        os.kill(pid, _signal.SIGTERM)
-                        await asyncio.sleep(5)
-                    except ProcessLookupError:
-                        pass
-                    except OSError as exc:
-                        log.warning(
-                            "STALE_ZOMBIE SIGTERM failed for %s (pid=%d): %s",
-                            name, pid, exc,
+                    from runtime_supervisor import get_runtime_supervisor
+                    stopped = await get_runtime_supervisor().terminate_process_by_pid(
+                        pid,
+                        grace_seconds=5.0,
+                    )
+                    if not stopped:
+                        log.error(
+                            "STALE_ZOMBIE tree termination failed for %s (pid=%d); "
+                            "retaining lock",
+                            name,
+                            pid,
                         )
-                    try:
-                        from process import is_pid_alive
-                        if is_pid_alive(pid):
-                            os.kill(pid, _signal.SIGKILL)
-                    except (ProcessLookupError, OSError):
-                        pass
+                        continue
 
                 lock_file.unlink(missing_ok=True)
                 _journal_scheduler_event(
@@ -1472,8 +2076,21 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                 # Feed into the orphan-backoff path (writes state; the
                 # scheduler may re-dispatch on the next cycle if below
                 # threshold, or escalate to incident).
-                _handle_continuous_orphan(state, name)
+                incident = _handle_continuous_orphan(state, name)
                 save_state(Path(sf), state)
+                if incident is not None:
+                    await _sync_continuous_topic_marker(
+                        state,
+                        name,
+                        platform,
+                        actionable_event="task_death",
+                    )
+                    await _deliver_orphan_incident(
+                        state,
+                        name,
+                        incident,
+                        platform,
+                    )
                 continue
 
             if not is_ready_for_next_step(state):
@@ -1552,11 +2169,12 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
             )
             work_dir = state.get("work_dir", "")
 
-            cmd = step_backend.build_spawn_command(
+            invocation = step_backend.build_spawn_invocation(
                 prompt=prompt,
                 model=model,
                 work_dir=work_dir,
             )
+            cmd = invocation.argv
             stdin_payload = step_backend.spawn_stdin_payload(prompt)
 
             (DATA_DIR / name).mkdir(parents=True, exist_ok=True)
@@ -1568,7 +2186,46 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                     stdin_payload=stdin_payload,
                     output_log=output_log,
                     work_dir=work_dir,
+                    env_overrides=invocation.env_overrides,
+                    owner="continuous:%s" % name,
                 )
+
+                # ``create_subprocess_exec`` yields to the event loop.  A stop,
+                # complete, or delete can therefore cancel the queue and write
+                # a terminal state while the child is being created.  Re-read
+                # both authorities before committing state=running; otherwise
+                # the stale in-memory ``state`` would resurrect the task and
+                # leave the just-spawned process untracked.
+                fresh_state = load_state(Path(sf))
+                queue_still_pending = any(
+                    queued.get("type") == "continuous"
+                    and queued.get("name") == name
+                    and queued.get("status") == "pending"
+                    for queued in load_queue()
+                )
+                if (
+                    fresh_state is None
+                    or not queue_still_pending
+                    or not is_ready_for_next_step(fresh_state)
+                ):
+                    await _terminate_uncommitted_subprocess(proc)
+                    current_status = (
+                        fresh_state.get("status") if fresh_state is not None
+                        else "missing"
+                    )
+                    append_log(
+                        "%s -- DISPATCH ABORTED -- lifecycle state=%s"
+                        % (name, current_status)
+                    )
+                    _journal_scheduler_event(
+                        task_name=name,
+                        event_type="dispatch_aborted",
+                        outcome="lifecycle_race",
+                        payload={"pid": proc.pid, "status": current_status},
+                    )
+                    continue
+
+                state = fresh_state
 
                 # Persist state=running BEFORE writing the lock file. If we
                 # crash between the two writes, the next scheduler cycle sees
@@ -1577,10 +2234,39 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                 # a stale lock with a dead PID and leave state in a pre-running
                 # status, allowing a silent re-dispatch that overwrites
                 # output.log and stomps on the prior attempt.
+                previous_orphan_detections = int(
+                    state.get("orphan_detect_count") or 0
+                )
                 mark_step_started(state, step_number, step_description)
                 save_state(Path(sf), state)
 
                 _write_lock_file(lock_file, proc.pid)
+
+                # Spec 006 T059: a start is successful only after both the
+                # running state and its process lock are durable. Clear the
+                # prior orphan episode at that point, then journal the single
+                # recovery edge. Keeping the count through spawn/lock failure
+                # prevents a failed retry from masquerading as recovery.
+                if previous_orphan_detections > 0:
+                    state["orphan_detect_count"] = 0
+                    state["orphan_last_detected_ts"] = None
+                    save_state(Path(sf), state)
+                    _journal_scheduler_event(
+                        task_name=name,
+                        event_type="orphan_recovery",
+                        outcome="cleared",
+                        payload={
+                            "previous_detected_cycles": previous_orphan_detections,
+                            "step": step_number,
+                            "pid": proc.pid,
+                        },
+                    )
+                _journal_scheduler_event(
+                    task_name=name,
+                    event_type="step_start",
+                    outcome="ok",
+                    payload={"step": step_number, "pid": proc.pid},
+                )
 
                 # Start delivery watcher for output relay
                 start_task_delivery_watch(entry, proc, output_log, lock_file, platform, step_backend, log)
@@ -1610,6 +2296,24 @@ async def _handle_continuous_entries(backend: AIBackend, platform=None) -> tuple
                     payload={"step": step_number, "exc": str(exc)},
                 )
 
+        except PersistenceUnavailableError as exc:
+            errors.append(name or "?")
+            append_log(
+                "%s -- ERROR -- state unavailable; dispatch failed closed"
+                % (name or "?")
+            )
+            log.critical(
+                "Continuous '%s': state unavailable after recovery attempt; "
+                "dispatch failed closed (%s)",
+                name or "?",
+                exc,
+            )
+            _journal_scheduler_event(
+                task_name=name or "?",
+                event_type="state_unavailable",
+                outcome="failed_closed",
+                payload={"operation": "continuous_dispatch"},
+            )
         except Exception as exc:  # noqa: BLE001 - per-entry isolation boundary
             errors.append(name or "?")
             append_log(
@@ -1649,7 +2353,7 @@ async def _dispatch_awaiting_reminders(platform, default_chat_id) -> int:
         return 0
 
     try:
-        from config import AWAITING_REMINDER_SECONDS, CHAT_ID, CONTINUOUS_DIR
+        from config import AWAITING_REMINDER_SECONDS, CONTINUOUS_DIR
     except Exception:
         return 0
 
@@ -1669,7 +2373,22 @@ async def _dispatch_awaiting_reminders(platform, default_chat_id) -> int:
         sf = task_dir / "state.json"
         if not sf.exists():
             continue
-        state = load_state(sf)
+        try:
+            state = load_state(sf)
+        except PersistenceUnavailableError as exc:
+            log.critical(
+                "Awaiting reminder skipped for '%s': continuous state is "
+                "unavailable after recovery attempt (%s)",
+                task_dir.name,
+                exc,
+            )
+            _journal_scheduler_event(
+                task_name=task_dir.name,
+                event_type="state_unavailable",
+                outcome="failed_closed",
+                payload={"operation": "awaiting_reminder"},
+            )
+            continue
         if state is None:
             continue
         if state.get("status") not in ("awaiting_input", "awaiting-input"):
@@ -1689,9 +2408,6 @@ async def _dispatch_awaiting_reminders(platform, default_chat_id) -> int:
             continue
 
         dedicated = state.get("dedicated_thread_id")
-        if dedicated is None:
-            # No dedicated topic — rely on FR-002a last-resort or silent skip.
-            continue
 
         question = state.get("awaiting_question") or "a user decision"
         body = (
@@ -1699,13 +2415,39 @@ async def _dispatch_awaiting_reminders(platform, default_chat_id) -> int:
             "Reply in this topic to resume the task."
             % (state.get("name") or task_dir.name, question)
         )
+        delivered = False
         try:
-            await platform.send_to_channel(dedicated, body, parse_mode="markdown")
+            if dedicated is None:
+                reason = "dedicated topic is missing"
+            else:
+                delivered = bool(
+                    await platform.send_to_channel(dedicated, body, parse_mode="markdown")
+                )
         except Exception as exc:
-            log.warning(
-                "awaiting-reminder delivery failed for '%s': %s",
-                state.get("name"), exc,
+            from messaging.base import TopicUnreachable
+            if not isinstance(exc, TopicUnreachable):
+                log.warning(
+                    "awaiting-reminder delivery failed for '%s': %s",
+                    state.get("name"), exc,
+                )
+                continue
+            reason = exc.reason or str(exc)
+        else:
+            if dedicated is not None:
+                reason = "awaiting reminder delivery returned false"
+
+        if not delivered:
+            from topic_recovery import recover_unreachable_topic
+            recovery = await recover_unreachable_topic(
+                state.get("name") or task_dir.name,
+                platform,
+                reason=reason,
+                event="awaiting_input",
+                pending_delivery=body,
+                hq_chat_id=default_chat_id,
             )
+            delivered = recovery.pending_delivered
+        if not delivered:
             continue
 
         state["awaiting_reminder_sent_ts"] = now.isoformat()
@@ -1727,7 +2469,7 @@ async def _dispatch_awaiting_reminders(platform, default_chat_id) -> int:
     return posted
 
 
-def _handle_continuous_orphan(state: dict, name: str) -> None:
+def _handle_continuous_orphan(state: dict, name: str) -> dict | None:
     """Spec 006 FR-022 orphan backoff.
 
     Counts consecutive orphan detections; once the threshold is reached
@@ -1781,7 +2523,7 @@ def _handle_continuous_orphan(state: dict, name: str) -> None:
             outcome="below_threshold",
             payload={"cycle": count, "threshold": _threshold},
         )
-        return
+        return None
 
     # Threshold reached — escalate to single incident.
     from pathlib import Path as _Path
@@ -1823,6 +2565,56 @@ def _handle_continuous_orphan(state: dict, name: str) -> None:
         "detections — state=error",
         name, count,
     )
+    return payload
+
+
+async def _deliver_orphan_incident(
+    state: dict,
+    name: str,
+    payload: dict,
+    platform,
+) -> bool:
+    """Post the one threshold incident, with recovery/HQ fallback support."""
+    if platform is None:
+        return False
+    from scheduled_delivery import _build_continuous_header
+
+    header, _ = _build_continuous_header(name, state, state_override="error")
+    tail = (payload.get("last_output_tail") or "").strip()
+    body = (
+        "%s\n\nThe task process died repeatedly (%d detections) and has been "
+        "stopped. Review the latest output and resume the task when ready."
+        % (header, payload.get("detected_cycles") or 0)
+    )
+    if tail:
+        body += "\n\nLast output:\n```\n%s\n```" % tail[-500:]
+    dedicated = state.get("dedicated_thread_id")
+    reason = "dedicated topic is missing"
+    delivered = False
+    if dedicated is not None:
+        try:
+            delivered = bool(
+                await platform.send_to_channel(dedicated, body, parse_mode="Markdown")
+            )
+        except Exception as exc:
+            from messaging.base import TopicUnreachable
+            if not isinstance(exc, TopicUnreachable):
+                log.error("Orphan incident delivery failed for %s: %s", name, exc)
+                return False
+            reason = exc.reason or str(exc)
+        else:
+            reason = "orphan incident delivery returned false"
+    if delivered:
+        return True
+    from topic_recovery import recover_unreachable_topic
+    recovery = await recover_unreachable_topic(
+        name,
+        platform,
+        reason=reason,
+        event="task_death",
+        pending_delivery=body,
+    )
+    return recovery.pending_delivered
 
 
 def _journal_scheduler_event(
@@ -1885,6 +2677,32 @@ async def run_scheduler_cycle(
     platform=None,
     default_chat_id: Any = None,
 ) -> dict:
+    """Run one cycle under a shared maintenance lease.
+
+    Update writer intent rejects a new tick before it can claim queue entries,
+    so the exclusive updater never snapshots state concurrently with a cycle.
+    """
+    try:
+        async with get_maintenance_gate().shared():
+            return await _run_scheduler_cycle(
+                backend,
+                platform=platform,
+                default_chat_id=default_chat_id,
+            )
+    except MaintenanceActiveError:
+        return {
+            "dispatched": [],
+            "errors": [],
+            "reminders_sent": 0,
+            "maintenance": True,
+        }
+
+
+async def _run_scheduler_cycle(
+    backend: AIBackend,
+    platform=None,
+    default_chat_id: Any = None,
+) -> dict:
     """Run one unified scheduler cycle.
 
     Returns a summary dict with dispatched tasks, errors, and reminder counts.
@@ -1897,30 +2715,99 @@ async def run_scheduler_cycle(
         except Exception as exc:
             log.error("Startup lock cleanup failed: %s", exc, exc_info=True)
 
-    due_tasks, due_reminders = _claim_due_entries()
-
     dispatched: list[tuple[str, int]] = []
     errors: list[str] = []
     reminders_sent = 0
+    queue_failed = False
+
+    try:
+        due_tasks, due_reminders = _claim_due_entries()
+    except QueueUnavailableError as exc:
+        log.critical(
+            "Scheduler cycle stopped: queue unavailable after recovery "
+            "attempt (%s). No task mutation or dispatch was performed.",
+            exc,
+        )
+        _journal_scheduler_event(
+            task_name="scheduler-queue",
+            task_type="scheduler",
+            event_type="queue_unavailable",
+            outcome="failed_closed",
+            payload={"operation": "claim"},
+        )
+        return {
+            "dispatched": dispatched,
+            "errors": ["queue_unavailable"],
+            "reminders_sent": reminders_sent,
+            "degraded": True,
+        }
 
     # Dispatch reminders (no LLM)
     if due_reminders:
-        await _dispatch_reminders(due_reminders, platform, default_chat_id=default_chat_id)
+        try:
+            await _dispatch_reminders(
+                due_reminders,
+                platform,
+                default_chat_id=default_chat_id,
+            )
+        except QueueUnavailableError as exc:
+            log.critical("Reminder reconciliation failed closed: %s", exc)
+            errors.append("queue_unavailable")
+            queue_failed = True
+            _journal_scheduler_event(
+                task_name="scheduler-queue",
+                task_type="scheduler",
+                event_type="queue_unavailable",
+                outcome="failed_closed",
+                payload={"operation": "reminder_reconcile"},
+            )
         reminders_sent = len(due_reminders)
 
     # Dispatch agent tasks (one-shot / periodic)
-    if due_tasks:
-        task_dispatched, task_errors = await _dispatch_agent_tasks(due_tasks, backend, platform)
-        dispatched.extend(task_dispatched)
-        errors.extend(task_errors)
+    if due_tasks and not queue_failed:
+        try:
+            task_dispatched, task_errors = await _dispatch_agent_tasks(
+                due_tasks,
+                backend,
+                platform,
+            )
+            dispatched.extend(task_dispatched)
+            errors.extend(task_errors)
+        except QueueUnavailableError as exc:
+            log.critical("Task reconciliation failed closed: %s", exc)
+            errors.append("queue_unavailable")
+            queue_failed = True
+            _journal_scheduler_event(
+                task_name="scheduler-queue",
+                task_type="scheduler",
+                event_type="queue_unavailable",
+                outcome="failed_closed",
+                payload={"operation": "task_reconcile"},
+            )
 
     # Dispatch continuous task steps (checked independently of the claim system)
+    if not queue_failed:
+        try:
+            cont_dispatched, cont_errors = await _handle_continuous_entries(backend, platform)
+            dispatched.extend(cont_dispatched)
+            errors.extend(cont_errors)
+        except QueueUnavailableError as exc:
+            log.critical("Continuous scheduling skipped: queue unavailable: %s", exc)
+            errors.append("queue_unavailable")
+            queue_failed = True
+        except Exception as exc:
+            log.error("Continuous task handling failed: %s", exc, exc_info=True)
+
+    # Retry persisted dedicated-topic failures independently of task dispatch.
+    # This is what advances the retry window when no new step/reminder occurs.
     try:
-        cont_dispatched, cont_errors = await _handle_continuous_entries(backend, platform)
-        dispatched.extend(cont_dispatched)
-        errors.extend(cont_errors)
+        from topic_recovery import retry_unreachable_topics
+        await retry_unreachable_topics(
+            platform,
+            hq_chat_id=default_chat_id,
+        )
     except Exception as exc:
-        log.error("Continuous task handling failed: %s", exc, exc_info=True)
+        log.error("Dedicated-topic recovery failed: %s", exc, exc_info=True)
 
     # Spec 006 — rotate the hot event journal (hourly + size-based) and
     # prune retention once per cycle. Idempotent and cheap.
@@ -1936,11 +2823,14 @@ async def run_scheduler_cycle(
     except Exception as exc:
         log.error("awaiting-reminder loop failed: %s", exc, exc_info=True)
 
-    return {
+    result = {
         "dispatched": dispatched,
         "errors": errors,
         "reminders_sent": reminders_sent,
     }
+    if queue_failed:
+        result["degraded"] = True
+    return result
 
 
 # ── Migration from legacy formats ────────────────────────────────────────────
@@ -2004,8 +2894,15 @@ def migrate_to_unified_queue() -> int:
 
     Returns the number of entries migrated.
     """
-    if QUEUE_FILE.exists():
-        log.info("queue.json already exists — skipping migration")
+    # A missing live file with a recovery marker is *not* a fresh install: it
+    # means a prior process stopped between quarantine and restore. Resume (or
+    # fail) that recovery before considering legacy migration, otherwise the
+    # migration could overwrite evidence with a newly-built queue.
+    marker = recovery_marker_path(QUEUE_FILE)
+    if QUEUE_FILE.exists() or marker.exists():
+        with _queue_mutex():
+            _load_queue_unlocked()
+        log.info("queue.json already exists or was recovered — skipping migration")
         return 0
 
     unified: list[dict] = []

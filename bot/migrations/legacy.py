@@ -42,9 +42,7 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, List
 
@@ -81,20 +79,9 @@ def migration(id: str, description: str):
 
 
 def _load_applied() -> dict:
-    if not MIGRATIONS_FILE.exists():
-        return {}
-    try:
-        data = json.loads(MIGRATIONS_FILE.read_text())
-        if not isinstance(data, dict):
-            log.warning(
-                "Migrations file %s has unexpected shape, treating as empty",
-                MIGRATIONS_FILE,
-            )
-            return {}
-        return data
-    except Exception as e:
-        log.warning("Cannot read %s: %s — treating as empty", MIGRATIONS_FILE, e)
-        return {}
+    from .tracker import load
+
+    return load(MIGRATIONS_FILE.parent)
 
 
 def _save_applied(data: dict) -> None:
@@ -105,30 +92,15 @@ def _save_applied(data: dict) -> None:
     wipe the chain progress on every boot. We re-read the file, merge
     anything outside our legacy ID keys, and then write.
     """
+    from .tracker import load, save
+
     MIGRATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    merged: dict = {}
-    if MIGRATIONS_FILE.exists():
-        try:
-            existing = json.loads(MIGRATIONS_FILE.read_text())
-            if isinstance(existing, dict):
-                for k, v in existing.items():
-                    if k not in data:
-                        merged[k] = v
-        except Exception:
-            pass
+    existing = load(MIGRATIONS_FILE.parent)
+    merged: dict = {
+        key: value for key, value in existing.items() if key not in data
+    }
     merged.update(data)
-    # tmp + fsync + os.replace: a SIGKILL or power loss mid-save must never
-    # leave migrations.json partially written (same contract as tracker.save).
-    tmp = MIGRATIONS_FILE.with_suffix(MIGRATIONS_FILE.suffix + ".tmp")
-    payload = json.dumps(merged, indent=2)
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(payload)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
-        except OSError:
-            pass
-    os.replace(tmp, MIGRATIONS_FILE)
+    save(MIGRATIONS_FILE.parent, merged)
 
 
 async def run_pending(platform, manager) -> list[tuple[str, str]]:

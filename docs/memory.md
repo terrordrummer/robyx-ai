@@ -52,6 +52,16 @@ Crash safety:
 - Every write uses a parameterized statement inside an implicit
   transaction — there is no partial-row state an agent can observe.
 
+Local privacy:
+
+- On POSIX, every connection repairs the containing memory directory to
+  `0700` and the database plus active `-wal`/`-shm` sidecars to `0600`.
+  A new DB is precreated owner-only before SQLite opens it, so this invariant
+  also covers workspace memory outside Robyx's central `data/` tree.
+- A symlinked memory directory/database or a non-regular database path is
+  rejected rather than followed. Windows retains SQLite/atomicity behavior;
+  exact ACL hardening is not attempted by the portable stdlib path.
+
 ## Integration with existing projects
 
 Robyx respects each project's existing setup:

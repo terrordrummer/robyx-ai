@@ -1,5 +1,8 @@
 """Tests for bot/memory_store.py — SQLite-backed memory storage."""
 
+import os
+import stat
+
 import sqlite3
 from pathlib import Path
 
@@ -17,6 +20,54 @@ from memory_store import (
     save_active_snapshot,
     search_archive,
 )
+
+
+def _mode(path):
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode contract")
+def test_connection_hardens_workspace_memory_db_and_sidecars(tmp_path):
+    memory_dir = tmp_path / "workspace" / ".robyx"
+    memory_dir.mkdir(parents=True)
+    memory_dir.chmod(0o755)
+    db_path = memory_dir / "memory.db"
+    db_path.write_bytes(b"")
+    db_path.chmod(0o644)
+
+    conn = get_connection(db_path)
+    try:
+        assert _mode(memory_dir) == 0o700
+        assert _mode(db_path) == 0o600
+        assert _mode(Path(str(db_path) + "-wal")) == 0o600
+        assert _mode(Path(str(db_path) + "-shm")) == 0o600
+    finally:
+        conn.close()
+
+
+def test_connection_rejects_symlinked_memory_database(tmp_path):
+    memory_dir = tmp_path / "workspace" / ".robyx"
+    memory_dir.mkdir(parents=True)
+    target = tmp_path / "external.db"
+    target.write_bytes(b"")
+    db_path = memory_dir / "memory.db"
+    db_path.symlink_to(target)
+
+    with pytest.raises(OSError, match="symlinks"):
+        get_connection(db_path)
+
+
+def test_windows_compatibility_skips_posix_chmod(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory_store, "supports_posix_permissions", lambda: False)
+    monkeypatch.setattr(
+        memory_store.os,
+        "chmod",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("chmod must not run on Windows compatibility path")
+        ),
+    )
+    conn = get_connection(tmp_path / "workspace" / ".robyx" / "memory.db")
+    conn.close()
 
 
 # ── Connection & Schema ──

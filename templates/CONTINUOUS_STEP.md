@@ -83,6 +83,13 @@ answer without their decision.
 
 Your state file is at `{{STATE_FILE}}`. You MUST update it when done.
 
+The task program is revisioned separately by Robyx in `program.json`. The
+`program`, `program_revision`, and `workspace_scope` fields you read from
+`state.json` are ownership/intent metadata: preserve them exactly and never
+edit or remove them. Immediately before writing progress, reload `state.json`
+and merge only the lifecycle/progress fields listed below into that newest
+document. An older whole-file snapshot must never replace newer metadata.
+
 ## Instructions
 
 1. **Execute the step** described above completely and with maximum quality.
@@ -90,7 +97,8 @@ Your state file is at `{{STATE_FILE}}`. You MUST update it when done.
 
 2. **Version your work** (if git is available — see Versioning section above).
 
-3. **Update the state file** (`{{STATE_FILE}}`). Read it, then write back with:
+3. **Update the state file** (`{{STATE_FILE}}`). Reload it immediately before
+   writing, preserve the authority metadata above, then write back with:
    - If step succeeded:
      - Set `current_step.status` to `"completed"`
      - Add `current_step.completed_at` with current ISO timestamp

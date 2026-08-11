@@ -1,6 +1,7 @@
 #!/bin/bash
 # Robyx — Linux installer (systemd user service)
 set -e
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -11,7 +12,7 @@ SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME.service"
 echo "=== Robyx Linux Installer ==="
 echo ""
 
-# Pick the newest available Python >= 3.10 from python/python3
+# Pick the newest lock-supported Python (3.10 through 3.14).
 get_python_version() {
     local cmd="$1"
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -27,6 +28,15 @@ version_ge_3_10() {
 $version
 EOF
     [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 10 ]; }
+}
+
+version_le_3_14() {
+    local version="$1"
+    local major minor
+    IFS='.' read -r major minor _ << EOF
+$version
+EOF
+    [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -le 14 ]; }
 }
 
 version_gt() {
@@ -55,14 +65,14 @@ PYTHON_VERSION=""
 FOUND_PYTHON="not found"
 FOUND_PYTHON3="not found"
 
-for candidate in python python3 python3.13 python3.12 python3.11 python3.10; do
+for candidate in python python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
     version=$(get_python_version "$candidate") || continue
     if [ "$candidate" = "python" ]; then
         FOUND_PYTHON="$version"
     elif [ "$candidate" = "python3" ]; then
         FOUND_PYTHON3="$version"
     fi
-    if ! version_ge_3_10 "$version"; then
+    if ! version_ge_3_10 "$version" || ! version_le_3_14 "$version"; then
         continue
     fi
     if [ -z "$PYTHON_BIN" ] || version_gt "$version" "$PYTHON_VERSION"; then
@@ -72,11 +82,32 @@ for candidate in python python3 python3.13 python3.12 python3.11 python3.10; do
 done
 
 if [ -z "$PYTHON_BIN" ]; then
-    echo "Error: Neither 'python' nor 'python3' provides Python 3.10+. Found python=$FOUND_PYTHON, python3=$FOUND_PYTHON3."
+    echo "Error: Neither 'python' nor 'python3' provides a lock-supported Python (3.10-3.14). Found python=$FOUND_PYTHON, python3=$FOUND_PYTHON3."
     exit 1
 fi
 
 echo "Python: $PYTHON_BIN ($PYTHON_VERSION)"
+
+# Stop the live user service before clearing its interpreter. A fresh install
+# or a host without a systemd user session skips this block safely.
+if command -v systemctl >/dev/null 2>&1 && \
+        systemctl --user is-active --quiet "$SERVICE_NAME"; then
+    echo "Stopping existing service before dependency update..."
+    if ! systemctl --user stop "$SERVICE_NAME"; then
+        echo "Error: Could not stop the existing Robyx service; the venv was not modified. Run: systemctl --user stop '$SERVICE_NAME'"
+        exit 1
+    fi
+    for _wait_attempt in $(seq 1 30); do
+        if ! systemctl --user is-active --quiet "$SERVICE_NAME"; then
+            break
+        fi
+        sleep 1
+    done
+    if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+        echo "Error: $SERVICE_NAME did not stop within 30 seconds; the existing venv was not modified. Stop it manually with: systemctl --user stop '$SERVICE_NAME'"
+        exit 1
+    fi
+fi
 
 # Create venv
 echo "Creating virtual environment..."
@@ -85,7 +116,11 @@ source "$PROJECT_ROOT/.venv/bin/activate"
 
 # Install deps
 echo "Installing dependencies..."
-pip install -q -r "$PROJECT_ROOT/bot/requirements.txt"
+RUNTIME_LOCK="$("$PROJECT_ROOT/.venv/bin/python" \
+    "$PROJECT_ROOT/bot/dependency_locks.py" \
+    --project-root "$PROJECT_ROOT" --kind runtime)"
+"$PROJECT_ROOT/.venv/bin/python" -m pip install -q --require-hashes \
+    -r "$RUNTIME_LOCK"
 
 # Run setup if no .env
 if [ ! -f "$PROJECT_ROOT/.env" ]; then
@@ -94,8 +129,11 @@ if [ ! -f "$PROJECT_ROOT/.env" ]; then
     "$PYTHON_BIN" "$PROJECT_ROOT/setup.py"
 fi
 
-# Create data dirs
-mkdir -p "$PROJECT_ROOT/data/system-monitor"
+# Create and repair private runtime paths. This is intentionally run on every
+# install/upgrade, including installations whose migration tracker is current.
+install -d -m 700 "$PROJECT_ROOT/data/system-monitor"
+"$PROJECT_ROOT/.venv/bin/python" "$PROJECT_ROOT/bot/local_security.py" \
+    --project-root "$PROJECT_ROOT"
 
 # Check if systemd user is available
 if ! command -v systemctl &>/dev/null; then
@@ -103,9 +141,6 @@ if ! command -v systemctl &>/dev/null; then
     echo "  $PROJECT_ROOT/.venv/bin/python $PROJECT_ROOT/bot/bot.py"
     exit 0
 fi
-
-# Stop existing service
-systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
 
 # Create systemd unit
 mkdir -p "$SERVICE_DIR"
@@ -117,6 +152,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+UMask=0077
 WorkingDirectory=$PROJECT_ROOT
 EnvironmentFile=$PROJECT_ROOT/.env
 ExecStart=$PROJECT_ROOT/.venv/bin/python $PROJECT_ROOT/bot/bot.py

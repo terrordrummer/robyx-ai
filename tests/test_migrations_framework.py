@@ -63,11 +63,26 @@ class TestTracker:
 
         assert load(data_dir) == {}
 
-    def test_load_corrupt_returns_empty(self, data_dir):
+    def test_load_corrupt_fails_closed(self, data_dir):
         from migrations.tracker import load
+        from persistence_recovery import PersistenceUnavailableError
 
         (data_dir / "migrations.json").write_text("{not json")
-        assert load(data_dir) == {}
+        with pytest.raises(PersistenceUnavailableError):
+            load(data_dir)
+        assert list(data_dir.glob("migrations.json.corrupt-*"))
+        assert (data_dir / "migrations.json.recovery-pending").exists()
+
+    def test_load_rejects_semantically_invalid_chain(self, data_dir):
+        from migrations.tracker import load
+        from persistence_recovery import PersistenceUnavailableError
+
+        (data_dir / "migrations.json").write_text(json.dumps({
+            "_chain_": {"current_version": "not-a-version", "history": []},
+        }))
+
+        with pytest.raises(PersistenceUnavailableError):
+            load(data_dir)
 
     def test_get_chain_state_seeds_when_missing(self, data_dir):
         from migrations.tracker import SEED_VERSION, get_chain_state

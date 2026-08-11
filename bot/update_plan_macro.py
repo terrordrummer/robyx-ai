@@ -33,6 +33,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from task_scope import (
+    TaskScope,
+    attach_scope,
+    legacy_scope_matches,
+    scope_from_record,
+)
+
 log = logging.getLogger("robyx.update_plan_macro")
 
 
@@ -115,6 +122,7 @@ class UpdatePlanOutcome:
 class UpdatePlanContext:
     thread_id: Any
     chat_id: Any = None
+    task_scope: TaskScope | None = None
     manager: Any = None
     platform: Any = None
     # Injection seam for tests.
@@ -390,10 +398,31 @@ def _find_task(name: str, ctx: UpdatePlanContext) -> tuple[Any, dict | None]:
     if state is None:
         return path, None
 
-    # Workspace scoping: only tasks that belong to the invoking thread
-    # are visible. Prevents a primary agent from editing another
-    # workspace's task.
+    # Modern records are authorized by the complete immutable scope.  Legacy
+    # tests/callers without a boundary TaskScope retain the historical thread
+    # check, while production legacy data must pass explicit migration
+    # evidence before it becomes visible.
     task_thread = state.get("workspace_thread_id")
+    if ctx.task_scope is not None:
+        try:
+            persisted = scope_from_record(state)
+        except (TypeError, ValueError):
+            log.error("update_plan invalid workspace_scope name=%s", name)
+            return path, None
+        if persisted is not None:
+            if persisted != ctx.task_scope:
+                return path, None
+            return path, state
+        if not legacy_scope_matches(
+            state,
+            ctx.task_scope,
+            legacy_parent_thread_id=task_thread,
+            manager=ctx.manager,
+        ):
+            return path, None
+        attach_scope(state, ctx.task_scope)
+        return path, state
+
     if _norm_thread(task_thread) != _norm_thread(ctx.thread_id):
         return path, None
 
@@ -406,6 +435,29 @@ def _norm_thread(raw: Any) -> Any:
     if isinstance(raw, str) and raw.lstrip("-").isdigit():
         return int(raw)
     return raw
+
+
+def _ensure_queue_scope(name: str, ctx: UpdatePlanContext) -> None:
+    """Validate/migrate the queue half of a production canonical scope."""
+    if ctx.task_scope is None or ctx.state_writer is not None:
+        return
+    from scheduler import load_queue, set_continuous_workspace_scope
+
+    active = [
+        entry for entry in load_queue()
+        if entry.get("type") == "continuous"
+        and entry.get("name") == name
+        and entry.get("status") != "canceled"
+    ]
+    if len(active) != 1:
+        raise RuntimeError(
+            "continuous queue identity is ambiguous for task '%s'" % name
+        )
+    persisted = scope_from_record(active[0])
+    if persisted is not None and persisted != ctx.task_scope:
+        raise RuntimeError("continuous queue scope conflict for task '%s'" % name)
+    if persisted is None:
+        set_continuous_workspace_scope(name, ctx.task_scope.to_dict())
 
 
 async def apply_update_plan_macros(
@@ -493,96 +545,99 @@ async def apply_update_plan_macros(
             log.warning("update_plan bad_field name=%s field=%s", name, bad_field)
             continue
 
-        # No-op update: all keys were unknown / no overrides at all.
-        # Still treat as success so the agent knows the macro ran, but log
-        # a notice — this is usually a bug in the agent's output.
-        if not overrides:
-            outcomes.append(UpdatePlanOutcome(
-                outcome="applied", name=name, detail="no overrides provided",
-            ))
-            lines.append(strings["update_plan_ok"] % name)
-            log.info("update_plan applied noop name=%s", name)
-            continue
-
-        # Resolve the task, scoped to this workspace.
+        # Resolve and commit under the same per-name transaction used by
+        # lifecycle operations and continuous creation. This prevents a
+        # concurrent STOP/DELETE/UPDATE_PLAN read-modify-write collision.
         try:
-            state_path, state = _find_task(name, ctx)
-        except Exception as exc:  # pragma: no cover - defensive
-            outcomes.append(UpdatePlanOutcome(
-                outcome="rejected", name=name,
-                reason="downstream_error", detail=str(exc),
-            ))
-            lines.append(strings["update_plan_error_downstream"])
-            log.error("update_plan lookup failed name=%s exc=%s", name, exc, exc_info=True)
-            continue
+            from lifecycle_macros import _lifecycle_task_lock
 
-        if state is None:
-            outcomes.append(UpdatePlanOutcome(
-                outcome="rejected", name=name, reason="not_found",
-            ))
-            lines.append(strings["update_plan_error_not_found"] % name)
-            log.info("update_plan not_found name=%s", name)
-            continue
+            async with _lifecycle_task_lock(name):
+                state_path, state = _find_task(name, ctx)
+                if state is None:
+                    outcome = UpdatePlanOutcome(
+                        outcome="rejected", name=name, reason="not_found",
+                    )
+                elif not overrides:
+                    # Unknown/empty fields are a no-op, but lookup/scoping must
+                    # still happen before reporting success.
+                    _ensure_queue_scope(name, ctx)
+                    if ctx.state_writer is None and ctx.task_scope is not None:
+                        from pathlib import Path
+                        from continuous import save_state
 
-        # Apply overrides atomically.
-        try:
-            merged_program = dict(state.get("program") or {})
-            plan_text_override = overrides.pop("plan_text", None)
-            merged_program.update(overrides)
+                        save_state(Path(state_path), state)
+                    outcome = UpdatePlanOutcome(
+                        outcome="applied", name=name,
+                        detail="no overrides provided",
+                    )
+                else:
+                    _ensure_queue_scope(name, ctx)
+                    merged_program = dict(state.get("program") or {})
+                    applied_overrides = dict(overrides)
+                    plan_text_override = applied_overrides.pop("plan_text", None)
+                    merged_program.update(applied_overrides)
 
-            state["program"] = merged_program
-            state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    # If the task was parked awaiting input, redirecting the
+                    # program makes the old question obsolete.
+                    if state.get("status") in ("awaiting-input", "awaiting_input"):
+                        state["status"] = "pending"
+                        state.pop("awaiting_question", None)
+                        log.info(
+                            "update_plan: cleared awaiting-input on '%s' "
+                            "(plan redirected)",
+                            name,
+                        )
 
-            # If the task was parked in ``awaiting-input``, the prior
-            # question is no longer relevant — the plan has been redirected.
-            # Mirror ``resume_task`` semantics so the scheduler picks the
-            # task back up on its next tick instead of silently skipping it
-            # forever (scheduler.py:1139).
-            if state.get("status") == "awaiting-input":
-                state["status"] = "pending"
-                state.pop("awaiting_question", None)
-                log.info(
-                    "update_plan: cleared awaiting-input on '%s' (plan redirected)",
-                    name,
-                )
+                    plan_body = (
+                        plan_text_override
+                        if plan_text_override is not None
+                        else _render_plan_md(name, merged_program)
+                    )
 
-            if ctx.state_writer is not None:
-                ctx.state_writer(state_path, state)
-            else:
-                from pathlib import Path
-                from continuous import save_state
-                save_state(Path(state_path), state)
+                    if ctx.state_writer is not None:
+                        state["program"] = merged_program
+                        state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        ctx.state_writer(state_path, state)
+                    else:
+                        from pathlib import Path
+                        from continuous import update_program
 
-            # Regenerate plan.md: prefer the agent-supplied free-form
-            # body, otherwise render from the merged program.
-            plan_body = (
-                plan_text_override
-                if plan_text_override is not None
-                else _render_plan_md(name, merged_program)
-            )
-            if ctx.plan_writer is not None:
-                ctx.plan_writer(name, plan_body)
-            else:
-                from continuous import write_plan_md
-                write_plan_md(name, plan_body)
+                        update_program(
+                            Path(state_path),
+                            state,
+                            merged_program,
+                            plan_text=plan_body,
+                        )
+
+                    if ctx.plan_writer is not None:
+                        ctx.plan_writer(name, plan_body)
+                    elif ctx.state_writer is not None:
+                        from continuous import write_plan_md
+
+                        write_plan_md(name, plan_body)
+                    outcome = UpdatePlanOutcome(outcome="applied", name=name)
         except Exception as exc:
-            outcomes.append(UpdatePlanOutcome(
+            outcome = UpdatePlanOutcome(
                 outcome="rejected", name=name,
                 reason="downstream_error", detail=str(exc),
-            ))
-            lines.append(strings["update_plan_error_downstream"])
+            )
             log.error(
                 "update_plan write failed name=%s exc=%s",
                 name, exc, exc_info=True,
             )
-            continue
 
-        outcomes.append(UpdatePlanOutcome(outcome="applied", name=name))
-        lines.append(strings["update_plan_ok"] % name)
-        log.info(
-            "update_plan applied name=%s fields=%s",
-            name, sorted(overrides.keys()) + (["plan_text"] if plan_text_override is not None else []),
-        )
+        outcomes.append(outcome)
+        if outcome.outcome == "applied":
+            lines.append(strings["update_plan_ok"] % name)
+            log.info(
+                "update_plan applied name=%s fields=%s",
+                name, sorted(overrides.keys()),
+            )
+        elif outcome.reason == "not_found":
+            lines.append(strings["update_plan_error_not_found"] % name)
+            log.info("update_plan not_found name=%s", name)
+        else:
+            lines.append(strings["update_plan_error_downstream"])
 
     parts = [p for p in (stripped,) if p]
     parts.extend(lines)

@@ -11,14 +11,72 @@ The step agent reads it for context and updates it with results.
 import json
 import logging
 import os
+import threading
 import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from config import CONTINUOUS_DIR
+from persistence_recovery import (
+    PersistenceUnavailableError,
+    guard_json_write,
+    load_json_with_recovery,
+)
+from task_scope import TaskScope, attach_scope
 
 log = logging.getLogger("robyx.continuous")
+
+
+_VALID_STATE_STATUSES = {
+    "pending",
+    "running",
+    "awaiting_input",
+    "awaiting-input",
+    "rate_limited",
+    "rate-limited",
+    "stopped",
+    "paused",
+    "completed",
+    "error",
+    "deleted",
+}
+
+
+def _valid_continuous_state(value: Any) -> bool:
+    """Semantic validator for live and snapshot continuous state.
+
+    Only ``name`` and ``status`` are mandatory for compatibility with the
+    oldest queue migration snapshots. Fields introduced later are optional,
+    but when present their shape is checked before any caller can mutate or
+    overwrite the document.
+    """
+    if not isinstance(value, dict):
+        return False
+    if not isinstance(value.get("name"), str) or not value["name"].strip():
+        return False
+    if value.get("status") not in _VALID_STATE_STATUSES:
+        return False
+    typed_fields = (
+        ("program", dict),
+        ("history", list),
+        ("current_step", (dict, type(None))),
+        ("next_step", (dict, type(None))),
+        ("total_steps_completed", int),
+        ("program_revision", int),
+    )
+    for field, expected in typed_fields:
+        if field in value and not isinstance(value[field], expected):
+            return False
+    revision = value.get("program_revision", 0)
+    if isinstance(revision, int) and revision < 0:
+        return False
+    if "workspace_scope" in value:
+        try:
+            TaskScope.from_dict(value["workspace_scope"])
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 # ── State I/O ────────────────────────────────────────────────────────────────
@@ -30,6 +88,151 @@ def _state_dir(name: str) -> Path:
 
 def state_file_path(name: str) -> Path:
     return _state_dir(name) / "state.json"
+
+
+def program_file_path(name: str) -> Path:
+    """Path to the authoritative revisioned program sidecar."""
+    return _state_dir(name) / "program.json"
+
+
+def _program_path_for_state(path: Path) -> Path:
+    return Path(path).with_name("program.json")
+
+
+_program_locks: dict[str, threading.RLock] = {}
+_program_locks_guard = threading.Lock()
+
+
+def _program_lock(path: Path) -> threading.RLock:
+    key = str(Path(path).resolve())
+    with _program_locks_guard:
+        lock = _program_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _program_locks[key] = lock
+        return lock
+
+
+def _valid_program_record(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("schema_version") == 1
+        and isinstance(value.get("revision"), int)
+        and value["revision"] >= 0
+        and isinstance(value.get("program"), dict)
+        and isinstance(value.get("updated_at"), str)
+        and (
+            "plan_text" not in value
+            or isinstance(value.get("plan_text"), (str, type(None)))
+        )
+    )
+
+
+def _load_program_record(path: Path) -> dict | None:
+    result = load_json_with_recovery(
+        path,
+        data_dir=CONTINUOUS_DIR.parent,
+        validator=_valid_program_record,
+        kind="continuous program",
+        logger=log,
+    )
+    if result.status == "missing":
+        return None
+    if result.status == "recovered":
+        log.critical(
+            "Continuous program %s recovered from %s; the recovered revision "
+            "remains authoritative over state.json",
+            path,
+            result.snapshot,
+        )
+    return result.value
+
+
+def _write_program_record(path: Path, record: dict) -> None:
+    if not _valid_program_record(record):
+        raise ValueError("refusing to persist malformed continuous program")
+    guard_json_write(
+        path,
+        data_dir=CONTINUOUS_DIR.parent,
+        validator=_valid_program_record,
+        kind="continuous program",
+        logger=log,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(directory_fd)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _overlay_authoritative_program(path: Path, state: dict) -> dict:
+    """Overlay ``program.json`` onto state, initialising legacy authority.
+
+    Once ``program_revision`` is positive, a missing sidecar is an integrity
+    failure rather than a legacy state: continuing would let an old step
+    snapshot silently become authoritative again.
+    """
+    program = state.get("program")
+    if not isinstance(program, dict):
+        return state
+
+    program_path = _program_path_for_state(path)
+    record = _load_program_record(program_path)
+    if record is None:
+        revision = state.get("program_revision", 0)
+        if not isinstance(revision, int) or revision < 0:
+            raise PersistenceUnavailableError(
+                "continuous state %s has an invalid program revision" % path
+            )
+        if revision > 0:
+            raise PersistenceUnavailableError(
+                "authoritative program sidecar is missing for %s" % path
+            )
+        record = {
+            "schema_version": 1,
+            "revision": 0,
+            "program": dict(program),
+            "updated_at": str(state.get("updated_at") or ""),
+        }
+        _write_program_record(program_path, record)
+
+    state["program"] = dict(record["program"])
+    state["program_revision"] = record["revision"]
+    _repair_authoritative_plan(path, record)
+    return state
+
+
+def _repair_authoritative_plan(state_path: Path, record: dict) -> None:
+    """Materialize the accepted revision's plan after a partial commit."""
+    plan_text = record.get("plan_text")
+    if not isinstance(plan_text, str):
+        return
+    path = Path(state_path).with_name("plan.md")
+    try:
+        current = path.read_text(encoding="utf-8") if path.exists() else None
+    except OSError:
+        current = None
+    if current != plan_text:
+        _write_plan_path(path, plan_text)
 
 
 def plan_file_path(name: str) -> Path:
@@ -49,6 +252,11 @@ def write_plan_md(name: str, content: str) -> Path:
     Uses the same write-then-rename + fsync pattern as ``save_state``.
     """
     path = plan_file_path(name)
+    _write_plan_path(path, content)
+    return path
+
+
+def _write_plan_path(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -56,7 +264,6 @@ def write_plan_md(name: str, content: str) -> Path:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
-    return path
 
 
 def read_plan_md(name: str) -> str | None:
@@ -80,14 +287,26 @@ _SPEC_006_DEFAULTS: dict[str, Any] = {
     "orphan_detect_count": 0,
     "orphan_last_detected_ts": None,
     "hq_fallback_sent": False,
+    "hq_fallback_outcome": None,
+    "hq_fallback_claimed_at": None,
     "topic_unreachable_since_ts": None,
+    "topic_unreachable_reason": None,
+    "topic_unreachable_event": None,
+    "topic_recovery_attempts": 0,
+    "topic_pending_delivery": None,
+    "topic_recovery_candidate_thread_id": None,
+    "topic_marker_status": None,
+    "delete_in_progress_at": None,
+    "drain_delete_output_recorded_at": None,
+    "drain_delete_reference_pending": False,
+    "drain_delete_reference_sent_at": None,
     "archived_at": None,
     "migrated_v0_26_0": None,
 }
 
 
 def load_state(path: Path) -> dict | None:
-    """Load a continuous task state file. Returns None if missing or corrupt.
+    """Load continuous state, recovering corruption or failing closed.
 
     Spec 006: applies legacy status normalisation (``awaiting-input`` →
     ``awaiting_input``, ``rate-limited`` → ``rate_limited``, ``paused`` →
@@ -96,16 +315,29 @@ def load_state(path: Path) -> dict | None:
     The caller decides whether to persist the normalised form (save_state
     automatically writes canonical form).
     """
-    if not path.exists():
-        return None
     try:
-        data = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError) as exc:
-        log.error("Failed to load continuous state %s: %s", path, exc)
+        result = load_json_with_recovery(
+            path,
+            data_dir=CONTINUOUS_DIR.parent,
+            validator=_valid_continuous_state,
+            kind="continuous state",
+            logger=log,
+        )
+    except PersistenceUnavailableError:
+        # Preserve the explicit exception contract: returning None here would
+        # make corruption indistinguishable from a never-created task and let
+        # callers recreate or overwrite state accidentally.
+        raise
+    if result.status == "missing":
         return None
-
-    if not isinstance(data, dict):
-        return None
+    if result.status == "recovered":
+        log.critical(
+            "Continuous state %s recovered from %s; inspect task history "
+            "before resuming execution",
+            path,
+            result.snapshot,
+        )
+    data = result.value
 
     # Spec 006 — normalise legacy status strings and default new fields.
     try:
@@ -121,18 +353,94 @@ def load_state(path: Path) -> dict | None:
     for field, default in _SPEC_006_DEFAULTS.items():
         data.setdefault(field, default)
 
+    # ``program.json`` is the revisioned authority. A step agent can still
+    # write an old whole-state snapshot directly (the historical template
+    # contract), but loading that snapshot can never roll the program back.
+    with _program_lock(Path(path)):
+        _overlay_authoritative_program(Path(path), data)
+
     return data
 
 
 def save_state(path: Path, state: dict) -> None:
-    """Atomically persist a continuous task state (write-then-rename, fsynced)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    """Atomically persist state without overwriting corruption.
+
+    When the existing file is corrupt, it is quarantined/recovered but this
+    write is rejected: callers must reload before retrying so a stale in-memory
+    state cannot clobber the recovered snapshot.
+    """
+    path = Path(path)
+    if not _valid_continuous_state(state):
+        raise ValueError("refusing to persist malformed continuous state")
+    with _program_lock(path):
+        # A normal state writer owns lifecycle/progress fields, not the task
+        # program. Overlay the latest sidecar before every replace so even a
+        # stale in-process snapshot cannot clobber UPDATE_PLAN.
+        _overlay_authoritative_program(path, state)
+        guard_json_write(
+            path,
+            data_dir=CONTINUOUS_DIR.parent,
+            validator=_valid_continuous_state,
+            kind="continuous state",
+            logger=log,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+
+def update_program(
+    path: Path,
+    state: dict,
+    program: dict,
+    *,
+    plan_text: str,
+) -> dict:
+    """Commit a new authoritative task program and revision atomically.
+
+    The sidecar is replaced before ``state.json``. If the process exits in
+    between, the next ``load_state`` overlays the newer revision and repairs
+    the visible state; the inverse ordering could lose an accepted update.
+    Callers should hold the shared per-task lifecycle transaction while doing
+    their read/merge/update sequence.
+    """
+    if not isinstance(program, dict):
+        raise TypeError("continuous program must be a dict")
+    if not isinstance(plan_text, str):
+        raise TypeError("continuous plan text must be a string")
+
+    path = Path(path)
+    with _program_lock(path):
+        program_path = _program_path_for_state(path)
+        current = _load_program_record(program_path)
+        if current is None:
+            previous = state.get("program_revision", 0)
+            if not isinstance(previous, int) or previous < 0:
+                raise PersistenceUnavailableError(
+                    "continuous state %s has an invalid program revision" % path
+                )
+        else:
+            previous = current["revision"]
+
+        now = datetime.now(timezone.utc).isoformat()
+        record = {
+            "schema_version": 1,
+            "revision": previous + 1,
+            "program": dict(program),
+            "updated_at": now,
+            "plan_text": plan_text,
+        }
+        _write_program_record(program_path, record)
+        _repair_authoritative_plan(path, record)
+        state["program"] = dict(program)
+        state["program_revision"] = record["revision"]
+        state["updated_at"] = now
+        save_state(path, state)
+        return state
 
 
 # ── State creation ───────────────────────────────────────────────────────────
@@ -145,6 +453,8 @@ def create_continuous_task(
     thread_id: Any,
     branch: str,
     work_dir: str,
+    workspace_scope: TaskScope | None = None,
+    plan_text: str | None = None,
 ) -> dict:
     """Create a new continuous task state and persist it.
 
@@ -191,7 +501,10 @@ def create_continuous_task(
         "history": [],
         "total_steps_completed": 0,
         "rate_limited_until": None,
+        "program_revision": 0,
     }
+    if workspace_scope is not None:
+        attach_scope(state, workspace_scope)
     # Spec 006 additive fields — present from creation so every code path
     # can rely on them without defensive .get() calls.
     for field, default in _SPEC_006_DEFAULTS.items():
@@ -202,6 +515,17 @@ def create_continuous_task(
     # fills dedicated_thread_id after create_channel returns.
 
     path = state_file_path(name)
+    if plan_text is not None:
+        _write_program_record(
+            _program_path_for_state(path),
+            {
+                "schema_version": 1,
+                "revision": 0,
+                "program": dict(state["program"]),
+                "updated_at": now,
+                "plan_text": plan_text,
+            },
+        )
     save_state(path, state)
     log.info("Created continuous task '%s' at %s", name, path)
     return state

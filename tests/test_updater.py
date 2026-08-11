@@ -3,14 +3,13 @@
 import asyncio
 import json
 import subprocess
-from datetime import datetime, timezone
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import updater
-import config as cfg
+from dependency_locks import dependency_fingerprint, dependency_lock_path
+from maintenance import MaintenanceActiveError, MaintenanceGate
 
 
 # ── Helpers ──
@@ -19,11 +18,12 @@ import config as cfg
 @pytest.fixture(autouse=True)
 def _patch_updater_paths(tmp_path, _patch_env):
     """Patch updater module's local copies of config paths."""
+    gate = MaintenanceGate()
     with patch.object(updater, "VERSION_FILE", tmp_path / "VERSION"), \
          patch.object(updater, "UPDATES_STATE_FILE", tmp_path / "data" / "updates.json"), \
          patch.object(updater, "DATA_DIR", tmp_path / "data"), \
          patch.object(updater, "PROJECT_ROOT", tmp_path), \
-         patch.object(updater, "RELEASES_DIR", tmp_path / "releases"):
+         patch.object(updater, "get_maintenance_gate", return_value=gate):
         (tmp_path / "VERSION").write_text("0.1.0\n")
         (tmp_path / "data").mkdir(exist_ok=True)
         (tmp_path / "releases").mkdir(exist_ok=True)
@@ -34,6 +34,9 @@ def _patch_updater_paths(tmp_path, _patch_env):
         (tmp_path / ".venv" / "bin" / "pip").write_text("#!/bin/sh\nexit 0\n")
         (tmp_path / "bot").mkdir(exist_ok=True)
         (tmp_path / "bot" / "requirements.txt").write_text("dummy==1.0\n")
+        runtime_lock = dependency_lock_path(tmp_path, require_exists=False)
+        runtime_lock.parent.mkdir(parents=True, exist_ok=True)
+        runtime_lock.write_text("dummy==1.0 --hash=sha256:test\n")
         yield
 
 
@@ -45,7 +48,8 @@ def stub_safety_helpers():
     opt them out via ``pytestmark = pytest.mark.usefixtures(...)`` on
     the affected classes. Tests that exercise the safety path don't
     request this fixture and see the real helpers."""
-    with patch.object(updater, "_snapshot_data_dir", return_value=None), \
+    with patch.object(updater, "_data_snapshot_required", return_value=False), \
+         patch.object(updater, "_snapshot_data_dir", return_value=None), \
          patch.object(updater, "_post_update_smoke_test", new=AsyncMock(return_value=(True, ""))):
         yield
 
@@ -464,13 +468,24 @@ def _make_git_side_effect(
     (default) means "no diff" — the invalidation step becomes a no-op,
     matching the behaviour of every existing test.
     """
+    target_object_sha = "a" * 40
+    target_commit_sha = "b" * 40
+    rollback_sha = pre_pull_sha.lower()
+    installed_head = rollback_sha
+
     def side_effect(*args, check=True):
+        nonlocal installed_head
         cmd = args[0] if args else ""
         if cmd == "stash" and len(args) > 1 and args[1] == "--include-untracked":
             stdout = "Saved working directory" if has_stash else "No local changes to save"
             return subprocess.CompletedProcess(["git", *args], 0, stdout, "")
-        if cmd == "rev-parse" and len(args) > 1 and args[1] == "HEAD":
-            return subprocess.CompletedProcess(["git", *args], 0, pre_pull_sha + "\n", "")
+        if cmd == "rev-parse" and len(args) > 1:
+            if args[1] == "HEAD":
+                return subprocess.CompletedProcess(["git", *args], 0, installed_head + "\n", "")
+            if args[1].startswith("refs/robyx/updates/") and args[1].endswith("^{commit}"):
+                return subprocess.CompletedProcess(["git", *args], 0, target_commit_sha + "\n", "")
+            if args[1].startswith("refs/robyx/updates/"):
+                return subprocess.CompletedProcess(["git", *args], 0, target_object_sha + "\n", "")
         if cmd == "diff" and "--name-only" in args:
             stdout = "\n".join(diff_files or []) + ("\n" if diff_files else "")
             return subprocess.CompletedProcess(["git", *args], 0, stdout, "")
@@ -487,10 +502,34 @@ def _make_git_side_effect(
             rc = 0 if checkout_main_ok else 1
             stderr = "" if checkout_main_ok else "error: pathspec 'main' did not match"
             return subprocess.CompletedProcess(["git", *args], rc, "", stderr)
-        if cmd == "pull":
+        if cmd == "ls-remote":
+            return subprocess.CompletedProcess(
+                ["git", *args], 0,
+                "%s\trefs/tags/v0.2.0\n" % target_object_sha,
+                "",
+            )
+        if cmd == "fetch":
             rc = 0 if pull_ok else 1
             stderr = "" if pull_ok else "fatal: Not possible to fast-forward"
             return subprocess.CompletedProcess(["git", *args], rc, "", stderr)
+        if cmd == "show" and len(args) > 1:
+            spec = args[1]
+            if spec.endswith(":VERSION"):
+                return subprocess.CompletedProcess(["git", *args], 0, "0.2.0\n", "")
+            if ":releases/0.2.0.md" in spec:
+                notes_file = updater.PROJECT_ROOT / "releases" / "0.2.0.md"
+                if notes_file.exists():
+                    return subprocess.CompletedProcess(
+                        ["git", *args], 0, notes_file.read_text(), "",
+                    )
+                return subprocess.CompletedProcess(["git", *args], 1, "", "missing")
+        if cmd == "reset" and len(args) > 2 and args[1] == "--hard":
+            installed_head = args[2]
+            if args[2] == target_commit_sha:
+                updater.VERSION_FILE.write_text("0.2.0\n")
+            elif args[2] == rollback_sha:
+                updater.VERSION_FILE.write_text("0.1.0\n")
+            return subprocess.CompletedProcess(["git", *args], 0, "", "")
         return subprocess.CompletedProcess(["git", *args], 0, "", "")
     return side_effect
 
@@ -517,11 +556,11 @@ class TestApplyUpdate:
     @pytest.mark.asyncio
     @patch("updater.asyncio.create_subprocess_exec")
     @patch("updater._git")
-    async def test_pull_fails(self, mock_git, mock_exec):
+    async def test_exact_tag_fetch_fails(self, mock_git, mock_exec):
         mock_git.side_effect = _make_git_side_effect(pull_ok=False)
         success, msg = await updater.apply_update("0.2.0")
         assert success is False
-        assert "git pull --ff-only failed" in msg
+        assert "fetch of exact tag" in msg
 
     @pytest.mark.asyncio
     @patch("updater._git")
@@ -750,17 +789,22 @@ class TestApplyUpdate:
         assert "Migration step failed" in msg
 
     @pytest.mark.asyncio
-    @patch("updater.asyncio.wait_for", side_effect=[asyncio.TimeoutError()])
     @patch("updater.asyncio.create_subprocess_exec")
     @patch("updater._git")
-    async def test_migration_timeout(self, mock_git, mock_exec, mock_wait_for, tmp_path):
+    async def test_migration_timeout(self, mock_git, mock_exec, tmp_path):
         mock_git.side_effect = _make_git_side_effect()
         (tmp_path / "releases" / "0.2.0.md").write_text(
             "---\nversion: 0.2.0\nrequires_migration: true\n---\n"
             "## Migration\n1. `python slow.py`\n"
         )
         mock_exec.return_value = AsyncMock()
-        success, msg = await updater.apply_update("0.2.0")
+        mock_exec.return_value.kill = MagicMock()
+        async def timeout(awaitable, **_kwargs):
+            awaitable.close()
+            raise asyncio.TimeoutError()
+
+        with patch("updater.asyncio.wait_for", side_effect=timeout):
+            success, msg = await updater.apply_update("0.2.0")
         assert success is False
         assert "timed out" in msg
 
@@ -816,11 +860,11 @@ class TestApplyUpdate:
         assert success is False
         assert "pip install returned 1" in msg
         assert "could not find a version" in msg
-        # Rollback must reset main to the previous tag (v0.20.22+: no
-        # more detached-HEAD `git checkout v<tag>`).
+        # Rollback must reset main to the exact captured commit, not infer
+        # a potentially-moved tag from the previous VERSION value.
         reset_calls = [
             c for c in mock_git.call_args_list
-            if c[0][:3] == ("reset", "--hard", "v0.1.0")
+            if c[0][:3] == ("reset", "--hard", "oldsha")
         ]
         assert len(reset_calls) >= 1
 
@@ -837,7 +881,11 @@ class TestApplyUpdate:
         # Patch wait_for to raise TimeoutError only for the pip invocation.
         # The fixture does not set requires_migration so no other wait_for
         # call happens in this test.
-        with patch("updater.asyncio.wait_for", side_effect=asyncio.TimeoutError):
+        async def timeout(awaitable, **_kwargs):
+            awaitable.close()
+            raise asyncio.TimeoutError()
+
+        with patch("updater.asyncio.wait_for", side_effect=timeout):
             success, msg = await updater.apply_update("0.2.0")
 
         assert success is False
@@ -856,6 +904,23 @@ class TestApplyUpdate:
         assert "venv pip not found" in msg
 
     @pytest.mark.asyncio
+    @patch("updater._git")
+    async def test_missing_runtime_lock_rolls_back_without_unlocked_pip(
+        self, mock_git, tmp_path,
+    ):
+        mock_git.side_effect = _make_git_side_effect()
+        dependency_lock_path(tmp_path).unlink()
+
+        success, msg = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "runtime dependency lock unavailable" in msg
+        assert any(
+            call.args[:3] == ("reset", "--hard", "oldsha")
+            for call in mock_git.call_args_list
+        )
+
+    @pytest.mark.asyncio
     @patch("updater.asyncio.create_subprocess_exec")
     @patch("updater._git")
     async def test_successful_pip_refreshes_bootstrap_marker(self, mock_git, mock_exec, tmp_path):
@@ -870,21 +935,30 @@ class TestApplyUpdate:
 
         marker = tmp_path / ".venv" / ".robyx_deps_hash"
         assert marker.exists()
-        import hashlib
-        expected = hashlib.sha1((tmp_path / "bot" / "requirements.txt").read_bytes()).hexdigest()
+        expected = dependency_fingerprint(
+            tmp_path / "bot" / "requirements.txt",
+            dependency_lock_path(tmp_path),
+        )
         assert marker.read_text().strip() == expected
+
+        pip_argv = mock_exec.await_args_list[-1].args
+        assert pip_argv[1:] == (
+            "install",
+            "--require-hashes",
+            "-r",
+            str(dependency_lock_path(tmp_path)),
+        )
 
     @pytest.mark.asyncio
     @patch("updater.asyncio.create_subprocess_exec")
     @patch("updater._git")
     async def test_catastrophic_exception(self, mock_git, mock_exec, tmp_path):
+        base = _make_git_side_effect()
+
         def side_effect(*args, check=True):
-            cmd = args[0] if args else ""
-            if cmd == "stash" and len(args) > 1 and args[1] == "--include-untracked":
-                return subprocess.CompletedProcess(["git"], 0, "Saved working directory", "")
-            if cmd == "pull":
+            if args and args[0] == "fetch":
                 raise RuntimeError("Unexpected catastrophic error")
-            return subprocess.CompletedProcess(["git"], 0, "", "")
+            return base(*args, check=check)
 
         mock_git.side_effect = side_effect
         success, msg = await updater.apply_update("0.2.0")
@@ -900,7 +974,7 @@ class TestApplyUpdate:
 class TestMigratePersonalDataToDataDir:
     pytestmark = pytest.mark.usefixtures("stub_safety_helpers")
 
-    """v0.16 pre-pull migration: ``migrate_personal_data_to_data_dir``
+    """v0.16 pre-update migration: ``migrate_personal_data_to_data_dir``
     copies tracked runtime files (``tasks.md``, ``specialists.md``,
     ``agents/*.md``, ``specialists/*.md``) to ``data/`` before the git
     pull removes them from the working tree. Must be idempotent —
@@ -961,9 +1035,8 @@ class TestMigratePersonalDataToDataDir:
         assert "agents/foo.md" not in moved
         assert (tmp_path / "data" / "agents" / "foo.md").read_text() == "fresh\n"
 
-    def test_migration_runs_before_git_pull_in_apply_update(self, tmp_path):
-        """Order-of-operations guarantee: the pre-pull migration must
-        execute before ``git pull`` touches the working tree."""
+    def test_migration_runs_before_exact_target_install(self, tmp_path):
+        """Personal data is relocated before target reset touches code."""
         call_order: list[str] = []
 
         (tmp_path / "tasks.md").write_text("| Task |\n")
@@ -976,13 +1049,12 @@ class TestMigratePersonalDataToDataDir:
             call_order.append("migrate")
             return original_migrate()
 
+        base = _make_git_side_effect()
+
         def fake_git(*args, check=True):
-            cmd = args[0] if args else ""
-            if cmd == "stash" and len(args) > 1 and args[1] == "--include-untracked":
-                return subprocess.CompletedProcess(["git"], 0, "Saved", "")
-            if cmd == "pull":
-                call_order.append("pull")
-            return subprocess.CompletedProcess(["git"], 0, "", "")
+            if args[:2] == ("reset", "--hard") and args[2] == "b" * 40:
+                call_order.append("install")
+            return base(*args, check=check)
 
         pip_proc = AsyncMock()
         pip_proc.communicate = AsyncMock(return_value=(b"", b""))
@@ -995,7 +1067,7 @@ class TestMigratePersonalDataToDataDir:
                 await updater.apply_update("0.2.0")
 
         asyncio.get_event_loop().run_until_complete(run()) if False else asyncio.run(run())
-        assert call_order.index("migrate") < call_order.index("pull")
+        assert call_order.index("migrate") < call_order.index("install")
 
     @pytest.mark.asyncio
     async def test_notify_fn_receives_migration_message(self, tmp_path):
@@ -1422,8 +1494,7 @@ class TestSnapshotDataDir:
         )
 
     def test_returns_none_on_failure(self, tmp_path):
-        """Snapshot failure must NOT block the update — caller treats
-        ``None`` as "proceed without backup" (logged at WARNING)."""
+        """The helper reports failure; apply_update enforces fail-closed policy."""
         with patch("updater.tarfile.open", side_effect=OSError("disk full")):
             snap = updater._snapshot_data_dir("a", "b")
         assert snap is None
@@ -1453,6 +1524,26 @@ class TestPruneOldSnapshots:
                                "0.0.3-stamp.tar.gz",
                                "0.0.4-stamp.tar.gz")) for n in survivors)
 
+    def test_never_prunes_active_transaction_snapshot(self):
+        backups = updater.DATA_DIR / "backups"
+        backups.mkdir()
+        import os as _os
+        import time as _time
+
+        active = backups / "pre-update-active.tar.gz"
+        active.write_bytes(b"")
+        # Simulate a clock correction: the just-created active snapshot looks
+        # older than retained snapshots and would be selected by mtime alone.
+        _os.utime(active, (_time.time() - 1000, _time.time() - 1000))
+        for index in range(3):
+            candidate = backups / ("pre-update-old-%d.tar.gz" % index)
+            candidate.write_bytes(b"")
+
+        updater._prune_old_snapshots(backups, keep=3, preserve=active)
+
+        assert active.exists()
+        assert len(list(backups.glob("pre-update-*.tar.gz"))) == 3
+
 
 class TestRestoreDataDir:
     def test_round_trip_restores_original_contents(self, tmp_path):
@@ -1467,11 +1558,43 @@ class TestRestoreDataDir:
         ok = updater._restore_data_dir(snap)
         assert ok is True
         assert (updater.DATA_DIR / "state.json").read_text() == '{"v": 1}'
-        # Restore overlays the snapshot — files added after the snapshot
-        # remain (they were never in the tarball). This is desirable: it
-        # means a successful migration that adds *new* files isn't undone
-        # if a *later* step fails. Migrations that need atomic rollback
-        # should write to a staging area first.
+        assert not (updater.DATA_DIR / "leftover.txt").exists()
+
+    @pytest.mark.parametrize("fail_at_replace", [2, 3])
+    def test_swap_failure_restores_current_tree_intact(
+        self, tmp_path, fail_at_replace,
+    ):
+        """A failed staged-tree or backups rename must not half-delete data."""
+        (updater.DATA_DIR / "state.json").write_text('{"v": 1}')
+        snap = updater._snapshot_data_dir("a", "b")
+        assert snap is not None
+
+        # This is the complete tree at restore entry. A failed restore must
+        # leave it byte-for-byte usable, including the snapshot needed for a
+        # later manual retry.
+        (updater.DATA_DIR / "state.json").write_text('{"v": "CURRENT"}')
+        (updater.DATA_DIR / "created-after-snapshot.txt").write_text("keep-on-failure")
+
+        real_replace = updater.os.replace
+        replace_calls = 0
+
+        def injected_replace(source, destination):
+            nonlocal replace_calls
+            replace_calls += 1
+            if replace_calls == fail_at_replace:
+                raise OSError("injected atomic-swap failure")
+            return real_replace(source, destination)
+
+        with patch("updater.os.replace", side_effect=injected_replace):
+            ok = updater._restore_data_dir(snap)
+
+        assert ok is False
+        assert (updater.DATA_DIR / "state.json").read_text() == '{"v": "CURRENT"}'
+        assert (updater.DATA_DIR / "created-after-snapshot.txt").read_text() == (
+            "keep-on-failure"
+        )
+        assert snap.exists(), "the recovery snapshot must retain its stable path"
+        assert not list(tmp_path.glob(".robyx-data-*"))
 
     def test_returns_false_for_missing_snapshot(self, tmp_path):
         ok = updater._restore_data_dir(tmp_path / "nope.tar.gz")
@@ -1527,6 +1650,46 @@ class TestScrubbedChildEnv:
         assert env.get("HOME") == "/home/robyx"
         assert env.get("PIP_INDEX_URL") == "https://pypi.org/simple/"
 
+    def test_strips_unlisted_secret_names_and_restricts_migration_env(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("FUTURE_SERVICE_TOKEN", "future-token-value")
+        monkeypatch.setenv("DATABASE_PASSWORD", "database-password-value")
+        monkeypatch.setenv(
+            "PIP_INDEX_URL",
+            "https://alice:index-password@packages.example/simple",
+        )
+        monkeypatch.setenv("PATH", "/usr/bin")
+
+        pip_env = updater._scrubbed_child_env()
+        migration_env = updater._migration_child_env()
+
+        assert "FUTURE_SERVICE_TOKEN" not in pip_env
+        assert "DATABASE_PASSWORD" not in pip_env
+        assert "PIP_INDEX_URL" in pip_env
+        assert migration_env["PATH"] == "/usr/bin"
+        assert "FUTURE_SERVICE_TOKEN" not in migration_env
+        assert "DATABASE_PASSWORD" not in migration_env
+        assert "PIP_INDEX_URL" not in migration_env
+
+    def test_diagnostic_tail_redacts_env_values_and_url_userinfo(self, monkeypatch):
+        monkeypatch.setenv("SERVICE_TOKEN", "super-secret-token")
+        monkeypatch.setenv(
+            "PIP_INDEX_URL",
+            "https://alice:index-password@packages.example/simple",
+        )
+        safe = updater._safe_diagnostic_tail(
+            "token=inline-secret super-secret-token "
+            "https://bob:url-password@example.test/simple "
+            "https://alice:index-password@packages.example/simple",
+        )
+        assert "inline-secret" not in safe
+        assert "super-secret-token" not in safe
+        assert "url-password" not in safe
+        assert "index-password" not in safe
+        assert "[REDACTED]" in safe
+
 
 class TestApplyUpdateChildEnvHygiene:
     """Pass 2 P2-71: verify apply_update actually threads the scrubbed env
@@ -1558,8 +1721,9 @@ class TestApplyUpdateChildEnvHygiene:
              patch("updater.asyncio.create_subprocess_exec", side_effect=_capture_spawn), \
              patch("updater._snapshot_data_dir", return_value=None), \
              patch("updater._post_update_smoke_test", new=AsyncMock(return_value=(True, ""))):
-            await updater.apply_update("0.2.0")
+            success, message = await updater.apply_update("0.2.0")
 
+        assert success, message
         assert "pip_env" in captured, "pip install was not invoked"
         env = captured["pip_env"]
         assert env is not None, "pip must receive an explicit env kwarg"
@@ -1606,8 +1770,9 @@ class TestApplyUpdateChildEnvHygiene:
              patch("updater.asyncio.create_subprocess_exec", side_effect=_capture_spawn), \
              patch("updater._snapshot_data_dir", return_value=None), \
              patch("updater._post_update_smoke_test", new=AsyncMock(return_value=(True, ""))):
-            await updater.apply_update("0.2.0")
+            success, message = await updater.apply_update("0.2.0")
 
+        assert success, message
         mig_calls = [a for a in captured_argv if a and a[0] == "python"]
         assert mig_calls, "migration step was not invoked"
         argv = mig_calls[0]
@@ -1634,8 +1799,7 @@ class TestApplyUpdateChildEnvHygiene:
 
         with patch("updater._git", side_effect=_make_git_side_effect()), \
              patch("updater._snapshot_data_dir", return_value=None), \
-             patch("updater._restore_data_dir"), \
-             patch("updater._rollback_code_to", new=AsyncMock()):
+             patch("updater._restore_data_dir"):
             ok, msg = await updater.apply_update("0.2.0")
 
         assert ok is False
@@ -1677,8 +1841,9 @@ class TestApplyUpdateChildEnvHygiene:
              patch("updater.asyncio.create_subprocess_exec", side_effect=_capture_spawn), \
              patch("updater._snapshot_data_dir", return_value=None), \
              patch("updater._post_update_smoke_test", new=AsyncMock(return_value=(True, ""))):
-            await updater.apply_update("0.2.0")
+            success, message = await updater.apply_update("0.2.0")
 
+        assert success, message
         mig_calls = [
             env for args, env in captured_envs
             if args and args[0] == "echo"
@@ -1688,6 +1853,98 @@ class TestApplyUpdateChildEnvHygiene:
         assert env is not None
         assert "DISCORD_BOT_TOKEN" not in env
         assert "ANTHROPIC_API_KEY" not in env
+
+    @pytest.mark.asyncio
+    async def test_migration_failure_never_exposes_command_or_credentials(
+        self,
+        tmp_path,
+        monkeypatch,
+        caplog,
+    ):
+        env_secret = "environment-secret-value"
+        index_secret = "index-password-value"
+        command_secret = "command-secret-value"
+        monkeypatch.setenv("SERVICE_TOKEN", env_secret)
+        monkeypatch.setenv(
+            "PIP_INDEX_URL",
+            "https://alice:%s@packages.example/simple" % index_secret,
+        )
+        command = "python migrate.py --token=%s" % command_secret
+        (tmp_path / "releases" / "0.2.0.md").write_text(
+            "---\nversion: 0.2.0\nrequires_migration: true\n---\n"
+            "## Migration\n1. `%s`\n" % command
+        )
+        migration = AsyncMock()
+        migration.communicate = AsyncMock(return_value=(
+            b"",
+            (
+                "%s https://bob:url-secret@example.test %s"
+                % (env_secret, index_secret)
+            ).encode(),
+        ))
+        migration.returncode = 1
+        notify = AsyncMock()
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch(
+                 "updater.asyncio.create_subprocess_exec",
+                 AsyncMock(return_value=migration),
+             ):
+            success, message = await updater.apply_update(
+                "0.2.0",
+                notify_fn=notify,
+            )
+
+        assert success is False
+        history = (tmp_path / "data" / "updates.json").read_text()
+        notifications = "\n".join(
+            call.args[0] for call in notify.await_args_list
+        )
+        evidence = "\n".join((message, history, notifications, caplog.text))
+        for secret in (env_secret, index_secret, command_secret, command):
+            assert secret not in evidence
+        assert "Migration step failed (step 1)" in message
+
+    @pytest.mark.asyncio
+    async def test_pip_failure_exposes_only_bounded_redacted_tail(
+        self,
+        tmp_path,
+        monkeypatch,
+        caplog,
+    ):
+        secret = "pip-index-password-value"
+        token = "future-service-token-value"
+        monkeypatch.setenv("SERVICE_TOKEN", token)
+        monkeypatch.setenv(
+            "PIP_INDEX_URL",
+            "https://alice:%s@packages.example/simple" % secret,
+        )
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(
+            b"success-like stdout must not be logged",
+            (
+                "x" * 4000
+                + "\nhttps://alice:%s@packages.example/simple token=%s"
+                % (secret, token)
+            ).encode(),
+        ))
+        proc.returncode = 1
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch(
+                 "updater.asyncio.create_subprocess_exec",
+                 AsyncMock(return_value=proc),
+             ):
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        history = (tmp_path / "data" / "updates.json").read_text()
+        evidence = "\n".join((message, history, caplog.text))
+        assert secret not in evidence
+        assert token not in evidence
+        assert "success-like stdout must not be logged" not in caplog.text
+        assert "[REDACTED]" in message
+        assert len(message) < 2200
 
 
 class TestPostUpdateSmokeTest:
@@ -1748,6 +2005,7 @@ class TestPostUpdateSmokeTest:
         (updater.PROJECT_ROOT / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
         proc = AsyncMock()
         proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+        proc.kill = MagicMock()
         with patch("updater.asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
             ok, err = await updater._post_update_smoke_test()
         assert ok is False
@@ -1785,6 +2043,299 @@ class TestApplyUpdateSafetyIntegration:
         # The restore_data_dir spy must have been called with the snapshot
         # path created during this update.
         restore_spy.assert_called_once()
+
+
+class TestTransactionalPinnedUpdate:
+    """RR-06 gates for exact targets, fail-closed snapshots, and rollback."""
+
+    @staticmethod
+    def _successful_proc():
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        return proc
+
+    @pytest.mark.asyncio
+    async def test_divergent_main_installs_requested_tag_commit(self, tmp_path):
+        """A newer/divergent main must not replace the requested tag target."""
+        old_main = "c" * 40
+        git_side_effect = _make_git_side_effect(
+            has_stash=False,
+            pre_pull_sha=old_main,
+        )
+
+        with patch("updater._git", side_effect=git_side_effect) as git_mock, \
+             patch(
+                 "updater.asyncio.create_subprocess_exec",
+                 AsyncMock(return_value=self._successful_proc()),
+             ), \
+             patch(
+                 "updater._post_update_smoke_test",
+                 new=AsyncMock(return_value=(True, "")),
+             ):
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success, message
+        assert not any(call.args and call.args[0] == "pull"
+                       for call in git_mock.call_args_list)
+        assert any(call.args[:3] == ("reset", "--hard", "b" * 40)
+                   for call in git_mock.call_args_list)
+        history = _read_state(tmp_path)["update_history"][-1]
+        assert history["tag"] == "v0.2.0"
+        assert history["commit"] == "b" * 40
+        assert history["version"] == "0.2.0"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_failure_aborts_before_target_checkout(self):
+        (updater.DATA_DIR / "queue.json").write_text('[{"task": "important"}]')
+
+        with patch("updater._git", side_effect=_make_git_side_effect()) as git_mock, \
+             patch("updater._snapshot_data_dir", return_value=None), \
+             patch("updater.asyncio.create_subprocess_exec") as spawn:
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "snapshot failed" in message.lower()
+        assert not any(call.args[:3] == ("reset", "--hard", "b" * 40)
+                       for call in git_mock.call_args_list)
+        spawn.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unreadable_snapshot_aborts_before_target_checkout(self):
+        (updater.DATA_DIR / "queue.json").write_text('[{"task": "important"}]')
+        backups = updater.DATA_DIR / "backups"
+        backups.mkdir()
+        corrupt = backups / "pre-update-corrupt.tar.gz"
+        corrupt.write_bytes(b"not a gzip tar")
+
+        with patch("updater._git", side_effect=_make_git_side_effect()) as git_mock, \
+             patch("updater._snapshot_data_dir", return_value=corrupt):
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "snapshot verification failed" in message.lower()
+        assert not corrupt.exists(), "invalid transaction snapshots must be discarded"
+        assert not any(call.args[:3] == ("reset", "--hard", "b" * 40)
+                       for call in git_mock.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_migration_failure_rolls_back_sha_then_restores_snapshot(self, tmp_path):
+        (updater.DATA_DIR / "queue.json").write_text('[{"task": "important"}]')
+        (updater.PROJECT_ROOT / "releases" / "0.2.0.md").write_text(
+            "---\nversion: 0.2.0\nrequires_migration: true\n---\n"
+            "## Migration\n1. `python migrate.py`\n"
+        )
+        migration = AsyncMock()
+        migration.communicate = AsyncMock(return_value=(b"", b"migration broke"))
+        migration.returncode = 1
+
+        with patch("updater._git", side_effect=_make_git_side_effect()) as git_mock, \
+             patch(
+                 "updater.asyncio.create_subprocess_exec",
+                 AsyncMock(return_value=migration),
+             ), \
+             patch("updater._restore_data_dir", wraps=updater._restore_data_dir) as restore:
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "Migration step failed" in message
+        assert any(call.args[:3] == ("reset", "--hard", "oldsha")
+                   for call in git_mock.call_args_list)
+        restore.assert_called_once()
+        assert updater.get_current_version() == "0.1.0"
+
+    @pytest.mark.asyncio
+    async def test_rollback_failure_does_not_restore_data_or_pop_stash(self):
+        (updater.DATA_DIR / "queue.json").write_text('[{"task": "important"}]')
+        base = _make_git_side_effect()
+
+        def rollback_fails(*args, check=True):
+            if args[:3] == ("reset", "--hard", "oldsha"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 1, "", "disk I/O failure",
+                )
+            return base(*args, check=check)
+
+        with patch("updater._git", side_effect=rollback_fails) as git_mock, \
+             patch(
+                 "updater.asyncio.create_subprocess_exec",
+                 AsyncMock(return_value=self._successful_proc()),
+             ), \
+             patch(
+                 "updater._post_update_smoke_test",
+                 new=AsyncMock(return_value=(False, "broken import")),
+             ), \
+             patch("updater._restore_data_dir") as restore:
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "CRITICAL" in message
+        assert "data snapshot was NOT restored" in message
+        restore.assert_not_called()
+        assert not any(call.args[:2] == ("stash", "pop")
+                       for call in git_mock.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_stash_conflict_preserves_stash_and_rolls_back_exact_sha(self):
+        base = _make_git_side_effect()
+        pop_attempted = False
+
+        def stash_conflict(*args, check=True):
+            nonlocal pop_attempted
+            if args[:2] == ("stash", "pop"):
+                pop_attempted = True
+                return subprocess.CompletedProcess(
+                    ["git", *args], 1, "", "CONFLICT in bot/bot.py",
+                )
+            if args[:2] == ("ls-files", "--unmerged") and pop_attempted:
+                return subprocess.CompletedProcess(
+                    ["git", *args], 0,
+                    "100644 abc 1\tbot/bot.py\n"
+                    "100644 def 2\tbot/bot.py\n"
+                    "100644 fed 3\tbot/bot.py\n",
+                    "",
+                )
+            return base(*args, check=check)
+
+        with patch("updater._git", side_effect=stash_conflict) as git_mock, \
+             patch(
+                 "updater.asyncio.create_subprocess_exec",
+                 AsyncMock(return_value=self._successful_proc()),
+             ), \
+             patch(
+                 "updater._post_update_smoke_test",
+                 new=AsyncMock(return_value=(True, "")),
+             ):
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "Stash-pop conflict" in message
+        assert "Stash preserved" in message
+        assert any(call.args[:3] == ("reset", "--hard", "oldsha")
+                   for call in git_mock.call_args_list)
+        assert sum(call.args[:2] == ("stash", "pop")
+                   for call in git_mock.call_args_list) == 1
+
+    @pytest.mark.asyncio
+    async def test_tag_object_mismatch_is_rejected_before_checkout(self):
+        base = _make_git_side_effect(has_stash=False)
+
+        def mismatched_object(*args, check=True):
+            if (args and args[0] == "rev-parse" and len(args) > 1
+                    and args[1] == "refs/robyx/updates/v0.2.0"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 0, "d" * 40 + "\n", "",
+                )
+            return base(*args, check=check)
+
+        with patch("updater._git", side_effect=mismatched_object) as git_mock:
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "tag object verification failed" in message
+        assert not any(call.args[:3] == ("reset", "--hard", "b" * 40)
+                       for call in git_mock.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_tagged_commit_version_mismatch_is_rejected(self):
+        base = _make_git_side_effect(has_stash=False)
+
+        def mismatched_version(*args, check=True):
+            if args and args[0] == "show" and args[1].endswith(":VERSION"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 0, "0.2.1\n", "",
+                )
+            return base(*args, check=check)
+
+        with patch("updater._git", side_effect=mismatched_version) as git_mock:
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "VERSION mismatch" in message
+        assert not any(call.args[:3] == ("reset", "--hard", "b" * 40)
+                       for call in git_mock.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_real_git_origin_main_ahead_but_exact_tag_is_installed(self, tmp_path):
+        """Real-git integration: never substitute origin/main for the tag."""
+        origin = tmp_path / "origin.git"
+        seed = tmp_path / "seed"
+        install = tmp_path / "install"
+
+        def git(*args, cwd=None):
+            return subprocess.run(
+                ["git", *args], cwd=cwd, check=True,
+                text=True, capture_output=True,
+            ).stdout.strip()
+
+        git("init", "--bare", str(origin))
+        git("clone", str(origin), str(seed))
+        git("config", "user.email", "tests@robyx.local", cwd=seed)
+        git("config", "user.name", "Robyx Tests", cwd=seed)
+        (seed / ".gitignore").write_text(".venv/\ndata/\n")
+        (seed / "bot").mkdir()
+        (seed / "bot" / "requirements.txt").write_text("")
+        seed_lock = dependency_lock_path(seed, require_exists=False)
+        seed_lock.parent.mkdir(parents=True)
+        seed_lock.write_text("")
+        (seed / "releases").mkdir()
+        (seed / "VERSION").write_text("0.1.0\n")
+        git("add", ".", cwd=seed)
+        git("commit", "-m", "v0.1.0", cwd=seed)
+        git("branch", "-M", "main", cwd=seed)
+        old_sha = git("rev-parse", "HEAD", cwd=seed)
+
+        (seed / "VERSION").write_text("0.2.0\n")
+        (seed / "releases" / "0.2.0.md").write_text(
+            "---\nversion: 0.2.0\nmin_compatible: 0.1.0\n---\n\nPinned.\n"
+        )
+        git("add", ".", cwd=seed)
+        git("commit", "-m", "v0.2.0", cwd=seed)
+        target_sha = git("rev-parse", "HEAD", cwd=seed)
+        git("tag", "v0.2.0", cwd=seed)
+
+        # main moves past the requested tag. A pull-based updater would install
+        # this commit and falsely record 0.2.0.
+        (seed / "VERSION").write_text("0.3.0-dev\n")
+        git("add", "VERSION", cwd=seed)
+        git("commit", "-m", "unreleased main", cwd=seed)
+        divergent_main = git("rev-parse", "HEAD", cwd=seed)
+        git("push", "origin", "main", "v0.2.0", cwd=seed)
+
+        git("clone", "--branch", "main", str(origin), str(install))
+        git("reset", "--hard", old_sha, cwd=install)
+        (install / "data").mkdir()
+        (install / ".venv" / "bin").mkdir(parents=True)
+        (install / ".venv" / "bin" / "pip").write_text("placeholder")
+
+        original_spawn = asyncio.create_subprocess_exec
+        pip_proc = self._successful_proc()
+
+        async def spawn_real_git_only(*args, **kwargs):
+            if args and args[0] == "git":
+                return await original_spawn(*args, **kwargs)
+            return pip_proc
+
+        with patch.object(updater, "PROJECT_ROOT", install), \
+             patch.object(updater, "DATA_DIR", install / "data"), \
+             patch.object(updater, "VERSION_FILE", install / "VERSION"), \
+             patch.object(
+                 updater, "UPDATES_STATE_FILE", install / "data" / "updates.json",
+             ), \
+             patch(
+                 "updater.asyncio.create_subprocess_exec",
+                 side_effect=spawn_real_git_only,
+             ), \
+             patch(
+                 "updater._post_update_smoke_test",
+                 new=AsyncMock(return_value=(True, "")),
+             ):
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success, message
+        assert git("rev-parse", "HEAD", cwd=install) == target_sha
+        assert git("rev-parse", "origin/main", cwd=install) == divergent_main
+        assert (install / "VERSION").read_text().strip() == "0.2.0"
 
 
 # ── v0.28.2 hotfix — post-stash-pop syntax check ─────────────────────
@@ -1828,3 +2379,396 @@ class TestCheckPythonSyntaxInRepo:
         ok, err = updater._check_python_syntax_in_repo()
         assert ok
         assert err == ""
+
+
+class TestMaintenanceTransaction:
+    @pytest.mark.asyncio
+    async def test_concurrent_update_is_rejected_by_single_writer_gate(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def transaction(*_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return True, "0.2.0"
+
+        with patch("updater._apply_update_transaction", side_effect=transaction):
+            first = asyncio.create_task(updater.apply_update("0.2.0"))
+            await entered.wait()
+            second = await updater.apply_update("0.2.0")
+            assert second[0] is False
+            assert "another update" in second[1]
+            release.set()
+            assert await first == (True, "0.2.0")
+
+    @pytest.mark.asyncio
+    async def test_force_drains_supervised_children_before_transaction(self):
+        supervisor = MagicMock()
+        supervisor.process_count = 1
+        supervisor.drain_processes = AsyncMock(return_value=True)
+
+        with patch("updater.get_runtime_supervisor", return_value=supervisor), \
+             patch(
+                 "updater._apply_update_transaction",
+                 new=AsyncMock(return_value=(True, "0.2.0")),
+             ) as transaction:
+            result = await updater.apply_update("0.2.0", force=True)
+
+        assert result == (True, "0.2.0")
+        supervisor.drain_processes.assert_awaited_once_with(grace_seconds=5.0)
+        transaction.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_after_checkout_rolls_back_before_propagating(self):
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+        async def restore_previous_version(_commit):
+            updater.VERSION_FILE.write_text("0.1.0\n")
+            return True, ""
+
+        rollback = AsyncMock(side_effect=restore_previous_version)
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch("updater.asyncio.create_subprocess_exec", return_value=proc), \
+             patch(
+                 "updater._post_update_smoke_test",
+                 new=AsyncMock(side_effect=asyncio.CancelledError()),
+             ), \
+             patch("updater._rollback_code_to", rollback):
+            with pytest.raises(asyncio.CancelledError):
+                await updater.apply_update("0.2.0")
+
+        rollback.assert_awaited_once()
+        assert not updater._update_transaction_marker_path().exists()
+
+    @pytest.mark.asyncio
+    async def test_failed_rollback_keeps_durable_crash_recovery_marker(self):
+        rollback = AsyncMock(return_value=(False, "injected disk failure"))
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch(
+                 "updater._checkout_exact_target",
+                 new=AsyncMock(side_effect=RuntimeError("simulated process death")),
+             ), \
+             patch("updater._rollback_code_to", rollback):
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "CRITICAL" in message
+        marker = updater._update_transaction_marker_path()
+        payload = json.loads(marker.read_text())
+        assert payload["phase"] == "checkout"
+        assert payload["pre_update_version"] == "0.1.0"
+        assert payload["target_version"] == "0.2.0"
+        with pytest.raises(MaintenanceActiveError, match="recovery is incomplete"):
+            async with updater.get_maintenance_gate().shared():
+                pass
+
+    @pytest.mark.asyncio
+    async def test_rollback_reloads_live_manager_before_future_save(self):
+        state_file = updater.DATA_DIR / "state.json"
+        state_file.write_text('{"generation": "pre-update"}')
+        (updater.PROJECT_ROOT / "releases" / "0.2.0.md").write_text(
+            "---\nversion: 0.2.0\nrequires_migration: true\n---\n"
+            "## Migration\n1. `python migrate.py`\n"
+        )
+
+        class LiveManager:
+            def __init__(self):
+                self.generation = "pre-update"
+                self.reloads = 0
+
+            async def reload_state_after_maintenance_restore(self):
+                self.reloads += 1
+                self.generation = json.loads(state_file.read_text())["generation"]
+
+            def save_state(self):
+                state_file.write_text(json.dumps({"generation": self.generation}))
+
+        manager = LiveManager()
+        migration = AsyncMock()
+
+        async def mutate_then_fail():
+            manager.generation = "target-migration"
+            state_file.write_text('{"generation": "target-migration"}')
+            return b"", b"injected failure"
+
+        migration.communicate = mutate_then_fail
+        migration.returncode = 1
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch(
+                 "updater.asyncio.create_subprocess_exec",
+                 AsyncMock(return_value=migration),
+             ):
+            success, _ = await updater.apply_update("0.2.0", manager=manager)
+
+        assert success is False
+        assert manager.reloads == 1
+        assert manager.generation == "pre-update"
+        manager.save_state()
+        assert json.loads(state_file.read_text()) == {"generation": "pre-update"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("branch", "detached", "expected_checkout"),
+        [
+            ("feature/recovery", False, ("checkout", "feature/recovery")),
+            ("", True, ("checkout", "--detach", "f" * 40)),
+        ],
+    )
+    async def test_post_checkout_failure_restores_exact_original_head(
+        self,
+        branch,
+        detached,
+        expected_checkout,
+    ):
+        feature_sha = "f" * 40
+        main_sha = "m" * 40
+        target_sha = "b" * 40
+        state = {"head": feature_sha, "branch": branch}
+        base = _make_git_side_effect(
+            has_stash=False,
+            pre_pull_sha=feature_sha,
+            head_detached=detached,
+            current_branch=branch or "main",
+        )
+
+        def git(*args, check=True):
+            if args[:2] == ("rev-parse", "HEAD"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 0, state["head"] + "\n", "",
+                )
+            if args[:2] == ("checkout", "main"):
+                state.update(head=main_sha, branch="main")
+                return subprocess.CompletedProcess(["git", *args], 0, "", "")
+            if args[:2] == ("checkout", "feature/recovery"):
+                state.update(head=feature_sha, branch="feature/recovery")
+                updater.VERSION_FILE.write_text("0.1.0\n")
+                return subprocess.CompletedProcess(["git", *args], 0, "", "")
+            if args[:2] == ("checkout", "--detach"):
+                state.update(head=args[2], branch="")
+                updater.VERSION_FILE.write_text("0.1.0\n")
+                return subprocess.CompletedProcess(["git", *args], 0, "", "")
+            if args[:2] == ("reset", "--hard"):
+                state["head"] = args[2]
+                updater.VERSION_FILE.write_text(
+                    "0.2.0\n" if args[2] == target_sha else "0.1.0\n"
+                )
+                return subprocess.CompletedProcess(["git", *args], 0, "", "")
+            return base(*args, check=check)
+
+        with patch("updater._git", side_effect=git) as git_mock, \
+             patch(
+                 "updater._checkout_exact_target",
+                 new=AsyncMock(return_value=(False, "injected checkout failure")),
+             ):
+            success, _ = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert state["head"] == feature_sha
+        assert state["branch"] == branch
+        calls = [call.args for call in git_mock.call_args_list]
+        assert ("reset", "--hard", main_sha) in calls
+        assert expected_checkout in calls
+
+    @pytest.mark.asyncio
+    async def test_power_loss_during_first_stash_has_pre_mutation_marker(self):
+        class SimulatedPowerLoss(BaseException):
+            pass
+
+        base = _make_git_side_effect()
+
+        def lose_power(*args, check=True):
+            if args[:2] == ("stash", "--include-untracked"):
+                raise SimulatedPowerLoss()
+            return base(*args, check=check)
+
+        with patch("updater._git", side_effect=lose_power):
+            with pytest.raises(SimulatedPowerLoss):
+                await updater.apply_update("0.2.0")
+
+        payload = json.loads(updater._update_transaction_marker_path().read_text())
+        assert payload["phase"] == "stash"
+        assert payload["pre_update_version"] == "0.1.0"
+        assert payload["pre_update_commit"]
+
+    @pytest.mark.asyncio
+    async def test_nonzero_stash_preserves_marker_for_partial_mutation_recovery(self):
+        base = _make_git_side_effect()
+
+        def failed_stash(*args, check=True):
+            if args[:2] == ("stash", "--include-untracked"):
+                return subprocess.CompletedProcess(
+                    ["git", *args], 1, "", "injected partial stash failure",
+                )
+            return base(*args, check=check)
+
+        with patch("updater._git", side_effect=failed_stash):
+            success, message = await updater.apply_update("0.2.0")
+
+        assert success is False
+        assert "may have partially mutated" in message
+        payload = json.loads(updater._update_transaction_marker_path().read_text())
+        assert payload["phase"] == "stash"
+        with pytest.raises(MaintenanceActiveError):
+            async with updater.get_maintenance_gate().shared():
+                pass
+
+    @pytest.mark.asyncio
+    async def test_baseexception_during_precheckout_data_migration_restores_snapshot(
+        self,
+    ):
+        queue = updater.DATA_DIR / "queue.json"
+        queue.write_text('{"generation": "pre-update"}')
+
+        class InjectedTermination(BaseException):
+            pass
+
+        def partial_data_migration():
+            queue.write_text('{"generation": "partial-target"}')
+            raise InjectedTermination()
+
+        with patch("updater._git", side_effect=_make_git_side_effect()), \
+             patch(
+                 "updater.migrate_personal_data_to_data_dir",
+                 side_effect=partial_data_migration,
+             ):
+            with pytest.raises(InjectedTermination):
+                await updater.apply_update("0.2.0")
+
+        assert json.loads(queue.read_text()) == {"generation": "pre-update"}
+        assert not updater._update_transaction_marker_path().exists()
+
+    def test_sqlite_wal_is_checkpointed_before_snapshot(self):
+        import sqlite3
+
+        database = updater.DATA_DIR / "memory.db"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("CREATE TABLE evidence(value TEXT)")
+            connection.execute("INSERT INTO evidence VALUES ('committed')")
+            connection.commit()
+
+            ok, error = updater._checkpoint_sqlite_databases()
+            assert ok, error
+            assert connection.execute(
+                "SELECT value FROM evidence",
+            ).fetchone() == ("committed",)
+        finally:
+            connection.close()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_child_is_terminated_and_reaped_via_supervisor(self):
+        started = asyncio.Event()
+
+        async def never_finishes():
+            started.set()
+            await asyncio.Event().wait()
+
+        proc = MagicMock()
+        proc.pid = 424242
+        proc.communicate = never_finishes
+        supervisor = MagicMock()
+        supervisor.terminate_process = AsyncMock(return_value=True)
+
+        with patch("updater.get_runtime_supervisor", return_value=supervisor):
+            task = asyncio.create_task(
+                updater._communicate_update_child(
+                    proc,
+                    timeout=60,
+                    owner="fault-injection",
+                ),
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        supervisor.track_process.assert_called_once()
+        supervisor.terminate_process.assert_awaited_once_with(
+            proc,
+            grace_seconds=2.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_leader_exit_with_lingering_descendant_rejects_phase(self):
+        proc = MagicMock()
+        proc.pid = 424242
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"leader done", b""))
+        supervisor = MagicMock()
+        supervisor.untrack_process.return_value = False
+        supervisor.terminate_process = AsyncMock(return_value=True)
+
+        with patch("updater.get_runtime_supervisor", return_value=supervisor):
+            with pytest.raises(RuntimeError, match="lingering descendant"):
+                await updater._communicate_update_child(
+                    proc,
+                    timeout=1,
+                    owner="pip",
+                    already_tracked=True,
+                )
+
+        supervisor.untrack_process.assert_called_once_with(proc)
+        supervisor.terminate_process.assert_awaited_once_with(
+            proc,
+            grace_seconds=2.0,
+        )
+
+    @pytest.mark.asyncio
+    async def test_supervisor_shutdown_waits_for_update_rollback_before_closing(self):
+        import maintenance
+        from runtime_supervisor import RuntimeSupervisor
+
+        supervisor = RuntimeSupervisor()
+        gate = updater.get_maintenance_gate()
+        queue = updater.DATA_DIR / "queue.json"
+        queue.write_text('{"generation": "pre-update"}')
+        smoke_entered = asyncio.Event()
+        rollback_saw_open_supervisor = []
+        base_git = _make_git_side_effect()
+
+        def git(*args, check=True):
+            if args[:3] == ("reset", "--hard", "oldsha"):
+                rollback_saw_open_supervisor.append(not supervisor.closing)
+            return base_git(*args, check=check)
+
+        async def interrupted_smoke():
+            queue.write_text('{"generation": "target-update"}')
+            smoke_entered.set()
+            await asyncio.Event().wait()
+
+        proc = AsyncMock()
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+        proc.returncode = 0
+
+        with patch("updater.get_runtime_supervisor", return_value=supervisor), \
+             patch("updater._git", side_effect=git), \
+             patch(
+                 "updater.asyncio.create_subprocess_exec",
+                 AsyncMock(return_value=proc),
+             ), \
+             patch(
+                 "updater._post_update_smoke_test",
+                 new=AsyncMock(side_effect=interrupted_smoke),
+             ), \
+             patch("maintenance.get_maintenance_gate", return_value=gate):
+            update = supervisor.spawn(
+                updater.apply_update("0.2.0"),
+                name="background-update",
+            )
+            await smoke_entered.wait()
+            await supervisor.shutdown(
+                process_grace_seconds=0.01,
+                task_grace_seconds=0.01,
+                maintenance_writer_grace_seconds=2.0,
+            )
+
+        assert update.cancelled()
+        assert rollback_saw_open_supervisor == [True]
+        assert json.loads(queue.read_text()) == {"generation": "pre-update"}
+        assert not updater._update_transaction_marker_path().exists()
+        assert supervisor.process_count == 0
+        assert supervisor.task_count == 0

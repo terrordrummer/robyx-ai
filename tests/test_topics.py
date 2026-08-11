@@ -1,12 +1,14 @@
 """Tests for bot.topics — channel/topic management via Platform abstraction."""
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import topics
+from task_scope import TaskScope
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +78,50 @@ class TestSanitizeTaskName:
 
 class TestCreateWorkspace:
     @pytest.mark.asyncio
+    async def test_scheduled_workspace_requires_scope_before_side_effects(
+        self, tmp_path, agent_manager, mock_platform,
+    ):
+        with pytest.raises(ValueError, match="workspace scope"):
+            await topics.create_workspace(
+                name="Unscoped",
+                task_type="scheduled",
+                frequency="daily",
+                model="balanced",
+                scheduled_at="none",
+                instructions="x",
+                manager=agent_manager,
+                work_dir=str(tmp_path),
+                platform=mock_platform,
+            )
+
+        mock_platform.create_channel.assert_not_awaited()
+        assert not (tmp_path / "data" / "agents" / "unscoped.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_scheduled_workspace_persists_child_canonical_scope(
+        self, tmp_path, agent_manager, mock_platform,
+    ):
+        mock_platform.create_channel = AsyncMock(return_value=500)
+
+        await topics.create_workspace(
+            name="Scoped Workspace",
+            task_type="scheduled",
+            frequency="daily",
+            model="balanced",
+            scheduled_at="08:00",
+            instructions="Do the thing.",
+            manager=agent_manager,
+            work_dir=str(tmp_path / "workspace"),
+            platform=mock_platform,
+            workspace_scope=TaskScope("telegram", "-1001", None),
+        )
+
+        entries = json.loads((tmp_path / "data" / "queue.json").read_text())
+        assert entries[0]["workspace_scope"] == TaskScope(
+            "telegram", "-1001", 500,
+        ).to_dict()
+
+    @pytest.mark.asyncio
     async def test_success_full_flow(self, tmp_path, agent_manager, mock_platform):
         """Channel created -> agent file written -> queue.json updated -> agent registered -> welcome sent."""
         mock_platform.create_channel = AsyncMock(return_value=500)
@@ -90,6 +136,7 @@ class TestCreateWorkspace:
             manager=agent_manager,
             work_dir=str(tmp_path / "workspace"),
             platform=mock_platform,
+            workspace_scope=TaskScope("telegram", "-1001", None),
         )
 
         assert result is not None
@@ -139,6 +186,7 @@ class TestCreateWorkspace:
             manager=agent_manager,
             work_dir=str(tmp_path),
             platform=mock_platform,
+            workspace_scope=TaskScope("telegram", "-1001", None),
         )
         assert result is None
 
@@ -157,6 +205,7 @@ class TestCreateWorkspace:
             manager=agent_manager,
             work_dir=str(tmp_path),
             platform=mock_platform,
+            workspace_scope=TaskScope("telegram", "-1001", None),
         )
 
         queue_file = tmp_path / "data" / "queue.json"
@@ -255,6 +304,7 @@ class TestCreateWorkspace:
             manager=agent_manager,
             work_dir=str(tmp_path),
             platform=mock_platform,
+            workspace_scope=TaskScope("telegram", "-1001", None),
         )
 
         queued_task = mock_add_task.call_args.args[0]
@@ -428,6 +478,7 @@ class TestCloseWorkspace:
             manager=agent_manager,
             work_dir=str(tmp_path),
             platform=mock_platform,
+            workspace_scope=TaskScope("telegram", "-1001", None),
         )
 
         # Now close it
@@ -438,6 +489,7 @@ class TestCloseWorkspace:
         mock_cancel.assert_called_once_with(
             "agents/toclose.md",
             reason="workspace closed",
+            transaction_id=ANY,
         )
 
         # Agent removed from manager
@@ -484,6 +536,7 @@ class TestCloseWorkspace:
         mock_cancel.assert_called_once_with(
             "agents/queued-workspace.md",
             reason="workspace closed",
+            transaction_id=ANY,
         )
 
     @pytest.mark.asyncio
@@ -540,6 +593,254 @@ class TestCloseWorkspace:
         assert queued["one-shot"]["canceled_reason"] == "workspace closed"
         assert queued["periodic"]["status"] == "canceled"
         assert queued["other"]["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_close_workspace_drains_and_stops_continuous_children(
+        self, tmp_path, agent_manager, mock_platform, monkeypatch,
+    ):
+        import continuous as cont
+        import scheduler as sched_mod
+
+        continuous_dir = tmp_path / "continuous"
+        queue_file = tmp_path / "queue.json"
+        monkeypatch.setattr(cont, "CONTINUOUS_DIR", continuous_dir)
+        monkeypatch.setattr(sched_mod, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(sched_mod, "QUEUE_FILE", queue_file)
+        monkeypatch.setattr(
+            topics,
+            "_cancel_tasks_for_agent_file",
+            sched_mod.cancel_tasks_for_agent_file,
+        )
+        agent_manager.add_agent(
+            name="parent",
+            work_dir=str(tmp_path),
+            description="parent",
+            agent_type="workspace",
+            thread_id=901,
+        )
+        cont.create_continuous_task(
+            name="child",
+            parent_workspace="parent",
+            program={"objective": "x"},
+            thread_id=901,
+            branch="continuous/child",
+            work_dir=str(tmp_path),
+        )
+        queue_file.write_text(json.dumps([{
+            "id": "child",
+            "name": "child",
+            "type": "continuous",
+            "status": "pending",
+            "thread_id": "902",
+            "agent_file": "agents/child.md",
+            "state_file": str(cont.state_file_path("child")),
+        }]))
+
+        assert await topics.close_workspace(
+            "parent",
+            agent_manager,
+            platform=mock_platform,
+        ) is True
+
+        fresh = cont.load_state(cont.state_file_path("child"))
+        assert fresh["status"] == "stopped"
+        queued = sched_mod.load_queue()[0]
+        assert queued["status"] == "canceled"
+        assert queued["canceled_reason"] == "workspace closed"
+        mock_platform.close_channel.assert_awaited_once_with(901)
+
+    @pytest.mark.asyncio
+    async def test_close_failure_restores_only_parent_queue_claim(
+        self, tmp_path, agent_manager, mock_platform, monkeypatch,
+    ):
+        import continuous
+        import scheduler
+
+        queue_file = tmp_path / "data" / "queue.json"
+        monkeypatch.setattr(scheduler, "QUEUE_FILE", queue_file)
+        monkeypatch.setattr(
+            topics,
+            "_cancel_tasks_for_agent_file",
+            scheduler.cancel_tasks_for_agent_file,
+        )
+        continuous_root = tmp_path / "data" / "continuous"
+        monkeypatch.setattr(continuous, "CONTINUOUS_DIR", continuous_root)
+        state_path = continuous_root / "broken-child" / "state.json"
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text("{}")
+        queue_file.write_text(json.dumps([
+            {
+                "id": "parent-periodic",
+                "name": "parent-periodic",
+                "agent_file": "agents/parent.md",
+                "type": "periodic",
+                "status": "pending",
+            },
+            {
+                "id": "other",
+                "name": "other",
+                "agent_file": "agents/other.md",
+                "type": "periodic",
+                "status": "pending",
+            },
+        ]))
+        agent_manager.add_agent(
+            name="parent", work_dir=str(tmp_path), description="parent",
+            agent_type="workspace", thread_id=44,
+        )
+        monkeypatch.setattr(
+            continuous,
+            "load_state",
+            MagicMock(side_effect=RuntimeError("state unavailable")),
+        )
+
+        with pytest.raises(RuntimeError, match="state.*unavailable"):
+            await topics.close_workspace("parent", agent_manager, mock_platform)
+
+        entries = scheduler.load_queue()
+        assert [entry["status"] for entry in entries] == ["pending", "pending"]
+        assert all("cancel_transaction_id" not in entry for entry in entries)
+        assert agent_manager.get("parent") is not None
+
+    @pytest.mark.asyncio
+    async def test_platform_close_refusal_preserves_agent_and_restores_queue(
+        self, tmp_path, agent_manager, mock_platform, monkeypatch,
+    ):
+        import scheduler
+
+        queue_file = tmp_path / "data" / "queue.json"
+        monkeypatch.setattr(scheduler, "QUEUE_FILE", queue_file)
+        monkeypatch.setattr(
+            topics,
+            "_cancel_tasks_for_agent_file",
+            scheduler.cancel_tasks_for_agent_file,
+        )
+        queue_file.write_text(json.dumps([{
+            "id": "parent-job",
+            "name": "parent-job",
+            "agent_file": "agents/parent.md",
+            "type": "one-shot",
+            "status": "pending",
+            "scheduled_at": "2099-01-01T00:00:00+00:00",
+        }]))
+        agent_manager.add_agent(
+            name="parent", work_dir=str(tmp_path), description="parent",
+            agent_type="workspace", thread_id=45,
+        )
+        mock_platform.close_channel.return_value = False
+
+        with pytest.raises(RuntimeError, match="refused to close"):
+            await topics.close_workspace("parent", agent_manager, mock_platform)
+
+        assert scheduler.load_queue()[0]["status"] == "pending"
+        assert agent_manager.get("parent") is not None
+
+    @pytest.mark.asyncio
+    async def test_close_releases_lifecycle_lock_while_watcher_reconciles(
+        self, tmp_path, agent_manager, mock_platform, monkeypatch,
+    ):
+        import continuous
+        import scheduler
+        from topic_recovery import mark_topic_reachable
+
+        continuous_root = tmp_path / "data" / "continuous"
+        monkeypatch.setattr(continuous, "CONTINUOUS_DIR", continuous_root)
+        state = continuous.create_continuous_task(
+            name="child", parent_workspace="parent",
+            program={"objective": "x"}, thread_id=45,
+            branch="continuous/child", work_dir=str(tmp_path),
+        )
+        state["status"] = "running"
+        state["topic_unreachable_since_ts"] = "2026-08-11T00:00:00+00:00"
+        continuous.save_state(continuous.state_file_path("child"), state)
+        agent_manager.add_agent(
+            name="parent", work_dir=str(tmp_path), description="parent",
+            agent_type="workspace", thread_id=45,
+        )
+
+        async def drain_with_delivery_reconciliation(*_args, **_kwargs):
+            await mark_topic_reachable("child")
+            return {"process_found": True, "tree_stopped": True}
+
+        monkeypatch.setattr(
+            scheduler,
+            "drain_and_cancel_continuous_task",
+            drain_with_delivery_reconciliation,
+        )
+
+        assert await asyncio.wait_for(
+            topics.close_workspace("parent", agent_manager, mock_platform),
+            timeout=0.5,
+        )
+        fresh = continuous.load_state(continuous.state_file_path("child"))
+        assert fresh["status"] == "stopped"
+        assert fresh["topic_unreachable_since_ts"] is None
+
+    @pytest.mark.asyncio
+    async def test_partial_close_keeps_attempted_children_canceled_and_recoverable(
+        self, tmp_path, agent_manager, mock_platform, monkeypatch,
+    ):
+        import continuous
+        import scheduler
+
+        continuous_root = tmp_path / "continuous"
+        queue_file = tmp_path / "queue.json"
+        monkeypatch.setattr(continuous, "CONTINUOUS_DIR", continuous_root)
+        monkeypatch.setattr(scheduler, "QUEUE_FILE", queue_file)
+        monkeypatch.setattr(
+            topics,
+            "_cancel_tasks_for_agent_file",
+            scheduler.cancel_tasks_for_agent_file,
+        )
+        for child in ("child-a", "child-b"):
+            state = continuous.create_continuous_task(
+                name=child, parent_workspace="parent",
+                program={"objective": "x"}, thread_id=45,
+                branch="continuous/%s" % child, work_dir=str(tmp_path),
+            )
+            state["status"] = "running"
+            continuous.save_state(continuous.state_file_path(child), state)
+        queue_file.write_text(json.dumps([
+            {
+                "id": child,
+                "name": child,
+                "agent_file": "agents/parent.md",
+                "type": "continuous",
+                "status": "pending",
+            }
+            for child in ("child-a", "child-b")
+        ]))
+        agent_manager.add_agent(
+            name="parent", work_dir=str(tmp_path), description="parent",
+            agent_type="workspace", thread_id=45,
+        )
+        first_started = asyncio.Event()
+
+        async def drain(name, **_kwargs):
+            if name == "child-a":
+                first_started.set()
+                return {"process_found": True, "tree_stopped": True}
+            await first_started.wait()
+            await asyncio.sleep(0.01)
+            raise RuntimeError("second child drain failed")
+
+        monkeypatch.setattr(scheduler, "drain_and_cancel_continuous_task", drain)
+
+        with pytest.raises(RuntimeError, match="second child drain failed"):
+            await topics.close_workspace("parent", agent_manager, mock_platform)
+
+        states = {
+            child: continuous.load_state(continuous.state_file_path(child))
+            for child in ("child-a", "child-b")
+        }
+        queued = {entry["name"]: entry for entry in scheduler.load_queue()}
+        assert states["child-a"]["status"] == "stopped"
+        assert states["child-b"]["status"] == "running"
+        assert states["child-b"]["workspace_close_partial"] is True
+        assert queued["child-a"]["status"] == "canceled"
+        assert queued["child-b"]["status"] == "canceled"
+        assert all("cancel_transaction_id" not in item for item in queued.values())
+        assert agent_manager.get("parent") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +1020,7 @@ class TestPerAgentBackendOverride:
             work_dir=str(tmp_path),
             platform=mock_platform,
             backend="codex",
+            workspace_scope=TaskScope("telegram", "-1001", None),
         )
 
         agent = agent_manager.get("codex-app")
@@ -764,6 +1066,7 @@ class TestPerAgentBackendOverride:
             work_dir=str(tmp_path),
             platform=mock_platform,
             backend="codex",
+            workspace_scope=TaskScope("telegram", "-1001", None),
         )
 
         queue_path = tmp_path / "data" / "queue.json"
@@ -790,6 +1093,7 @@ class TestPerAgentBackendOverride:
             manager=agent_manager,
             work_dir=str(tmp_path),
             platform=mock_platform,
+            workspace_scope=TaskScope("telegram", "-1001", None),
         )
 
         queue_path = tmp_path / "data" / "queue.json"
@@ -915,6 +1219,7 @@ class TestHealDetachedWorkspaces:
             model="balanced", scheduled_at="08:00", instructions="x",
             manager=agent_manager, work_dir=str(tmp_path),
             platform=mock_platform,
+            workspace_scope=TaskScope("telegram", "-1001", None),
         )
         agent = agent_manager.get("detached")
         agent.thread_id = None
@@ -1027,6 +1332,31 @@ class TestCreateContinuousWorkspaceSpec005:
         }
 
     @pytest.mark.asyncio
+    async def test_missing_scope_fails_before_topic_or_git(
+        self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "continuous.CONTINUOUS_DIR", tmp_path / "data" / "continuous",
+        )
+        work_dir = tmp_path / "project"
+        work_dir.mkdir()
+
+        with pytest.raises(ValueError, match="workspace scope"):
+            await topics.create_continuous_workspace(
+                name="Unscoped Loop",
+                program=program,
+                work_dir=str(work_dir),
+                parent_workspace="ops",
+                model="powerful",
+                manager=agent_manager,
+                platform=mock_platform,
+                parent_thread_id=42,
+            )
+
+        mock_platform.create_channel.assert_not_awaited()
+        assert not (work_dir / ".git").exists()
+
+    @pytest.mark.asyncio
     async def test_creates_dedicated_topic(
         self, tmp_path, agent_manager, mock_platform, program, monkeypatch,
     ):
@@ -1047,6 +1377,7 @@ class TestCreateContinuousWorkspaceSpec005:
             manager=agent_manager,
             platform=mock_platform,
             parent_thread_id=42,
+            workspace_scope=TaskScope("telegram", "-1001", 42),
         )
 
         assert result is not None
@@ -1076,6 +1407,7 @@ class TestCreateContinuousWorkspaceSpec005:
             manager=agent_manager,
             platform=mock_platform,
             parent_thread_id=42,
+            workspace_scope=TaskScope("telegram", "-1001", 42),
         )
 
         assert result is not None
@@ -1104,6 +1436,7 @@ class TestCreateContinuousWorkspaceSpec005:
             manager=agent_manager,
             platform=mock_platform,
             parent_thread_id=42,
+            workspace_scope=TaskScope("telegram", "-1001", 42),
         )
 
         state_file = tmp_path / "data" / "continuous" / "docs-hunt" / "state.json"
@@ -1131,6 +1464,7 @@ class TestCreateContinuousWorkspaceSpec005:
             manager=agent_manager,
             platform=mock_platform,
             parent_thread_id=42,
+            workspace_scope=TaskScope("telegram", "-1001", 42),
         )
 
         queue_file = tmp_path / "data" / "queue.json"
@@ -1162,6 +1496,7 @@ class TestCreateContinuousWorkspaceSpec005:
             manager=agent_manager,
             platform=mock_platform,
             parent_thread_id=42,
+            workspace_scope=TaskScope("telegram", "-1001", 42),
         )
 
         agent = agent_manager.get("docs-hunt")

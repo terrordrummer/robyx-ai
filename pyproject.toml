@@ -1,0 +1,31 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# Start with the pyflakes/pycodestyle rules that catch broken names, invalid
+# syntax, and import-time failures.  The broader baseline is recorded in
+# docs/quality.md and will be ratcheted by responsibility, not hidden behind a
+# repository-wide ignore list.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.10"
+files = [
+    "bot/execution_policy.py",
+    "bot/persistence_recovery.py",
+    "bot/runtime_supervisor.py",
+    "bot/local_security.py",
+    "bot/dependency_locks.py",
+    "bot/config_command_service.py",
+    "bot/maintenance.py",
+    "bot/task_scope.py",
+]
+follow_imports = "skip"
+check_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+strict_equality = true
+warn_return_any = true
+warn_unused_ignores = true
+show_error_codes = true

@@ -116,15 +116,18 @@ until an objective is reached or the user intervenes. Each continuous task gets:
 
 - A **git branch** (`continuous/<name>`)
 - A **state file** (`data/continuous/<name>/state.json`)
-- A **plan file** (`data/continuous/<name>/plan.md`) — the authoritative
-  intent document, readable by the primary agent on demand
+- A revisioned **program record** (`data/continuous/<name>/program.json`) —
+  authoritative for accepted objective, constraints, checkpoint policy,
+  context, and exact plan body
+- A human-readable **plan projection** (`data/continuous/<name>/plan.md`) —
+  repaired from the program record after a partial write
 - An entry in `data/queue.json` (type: `continuous`)
 
-Step reports flow back into the **parent workspace chat** with a
-`🔄 [<task-name>]` prefix applied by the delivery layer — there is no
-dedicated sub-topic. The user interacts with the primary workspace
-agent to list / inspect / stop / pause / resume / read the plan of
-any task (see *Lifecycle Commands* below).
+Step reports, pinned questions, incidents, and final notices flow into the
+task's **dedicated topic**. The immutable parent workspace scope remains the
+authorization boundary. The user interacts with the primary workspace agent
+to list / inspect / stop / pause / resume / read or revise any owned task (see
+*Lifecycle Commands* below).
 
 ### Creating a Continuous Task
 
@@ -298,61 +301,21 @@ Validation:
 - Reserved names (`robyx`, `orchestrator`) are not valid targets — Robyx
   coordinates, it does not execute scheduled work.
 
-Multiple `[REMIND ...]` patterns per response are allowed (e.g. one nudge the day before plus one on the day, or a text reminder *and* a delegated action). Validation failures surface as inline notices in the user-visible reply — never as silent drops. **Never write to `data/queue.json` directly.** Use `[REMIND ...]` for reminders. For future autonomous work that must actually run, use the validated timed-queue helper below instead of appending raw JSON to `data/queue.json` yourself.
-
-For the rare case where you need to be re-invoked at a future time to *do work* (not just deliver a message), use the Timed Task Queue described below — it spawns a fresh agent run, which is much heavier and only worth it when actual work is required.
+Multiple `[REMIND ...]` patterns per response are allowed. Validation failures
+surface as inline notices — never as silent drops. **Never write to
+`data/queue.json` directly and never call `scheduler.add_task(...)` from an
+agent turn:** those paths do not carry the authenticated workspace scope. Use
+`[REMIND ... agent="..."]` for future one-shot work. Recurring work must be
+created through the normal `[CREATE_WORKSPACE ... type="scheduled" ...]` flow.
 
 ---
 
 ## Timed Task Queue
 
-Any agent can programmatically schedule a one-shot or periodic task with `scheduler.add_task(...)`.
-The helper validates task names and `agent_file` references, writes atomically to `data/queue.json`, and the timed scheduler dispatches due tasks every 60 seconds.
-
-### When to use the timed queue directly (inside an agent)
-
-Use this when you need to **re-invoke an agent at a precise future time to perform actual work** — not for plain reminders, which should use `[REMIND ...]`. Specifically:
-- Schedule a recurring autonomous run (a periodic R&D iteration, a daily cleanup, etc.) from within an existing agent.
-- Schedule a one-shot agent invocation that must execute code or call tools at the trigger time, not just post a message.
-- Chain multiple follow-up agent runs at different future times.
-
-### How to add a task (Python snippet for agents)
-
-```python
-import uuid
-from datetime import datetime, timezone
-from scheduler import add_task
-
-add_task({
-    "id": str(uuid.uuid4()),
-    "name": "remind-meeting",            # unique slug
-    "agent_file": "agents/my-workspace.md",
-    "prompt": "Tell the owner: reminder — product meeting at 15:00!",
-    "type": "one-shot",                  # or "periodic"
-    "scheduled_at": "2026-04-10T15:00:00+00:00",
-    "status": "pending",
-    "model": "claude-haiku-4-5-20251001",
-    "thread_id": "<thread_id>",          # optional: Telegram/Discord channel
-    "created_at": datetime.now(timezone.utc).isoformat(),
-})
-```
-
-For `periodic` tasks, also include:
-- `"interval_seconds": 86400`  (seconds between runs)
-- Use `"scheduled_at"` for the first run; after each dispatch `next_run` is set automatically.
-
-### Task statuses
-
-| Status | Meaning |
-|--------|---------|
-| `pending` | Waiting to be dispatched |
-| `dispatched` | One-shot task was sent (will not run again) |
-| `error` | Dispatch failed; check bot.log |
-
-### Jitter / offline recovery
-
-Tasks whose `scheduled_at` or `next_run` is in the past are dispatched immediately on the next cycle.
-No event is lost due to restarts or brief outages.
+The Python queue API is an internal runtime boundary. Chat-facing agents use
+the validated reminder and workspace macros above so Robyx attaches canonical
+platform/chat/thread ownership. Do not manufacture queue records in model
+output or shell commands.
 
 ---
 
@@ -385,7 +348,10 @@ Migration steps:
 3. Send a farewell message on the current platform
 4. Emit `[RESTART]` — the bot restarts on the new platform
 
-All workspaces, agents, memory, and scheduled tasks are preserved. Only the messaging transport changes.
+Agent briefs and memory remain on disk. Workspace channel IDs and scheduled
+task ownership scopes are platform-specific, so the user must recreate or
+explicitly rebind them on the target platform before resuming work. Never
+describe a platform switch as transport-only.
 
 ---
 

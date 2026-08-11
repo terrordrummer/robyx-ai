@@ -35,10 +35,13 @@ _SCRUBBED_ENV_KEYS = frozenset({
 })
 
 
-def _scrubbed_child_env() -> dict[str, str]:
+def _scrubbed_child_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
     """Return a copy of ``os.environ`` with Robyx-specific bot secrets
-    removed. Used as the ``env=`` argument when spawning the AI CLI."""
-    return {k: v for k, v in os.environ.items() if k not in _SCRUBBED_ENV_KEYS}
+    removed. Child-specific overrides never mutate process-global state."""
+    env = {k: v for k, v in os.environ.items() if k not in _SCRUBBED_ENV_KEYS}
+    if overrides:
+        env.update(overrides)
+    return env
 
 from agents import Agent, AgentManager
 from ai_backend import AIBackend, get_or_create_backend
@@ -53,6 +56,13 @@ from config import (
     MAX_MESSAGE_LEN,
     SPECIALISTS_DIR,
     WORKSPACE_AGENT_SYSTEM_PROMPT,
+    COLLAB_PARTICIPANT_POLICY,
+)
+from execution_policy import (
+    EXECUTIVE_INVOCATION,
+    ExecutionProfile,
+    InvocationSecurityContext,
+    UnsupportedExecutionProfile,
 )
 
 
@@ -68,9 +78,104 @@ class AIIdleTimeout(Exception):
         self.elapsed = elapsed
 from i18n import STRINGS
 from memory import build_memory_context, get_memory_instructions
+from maintenance import (
+    MAINTENANCE_MESSAGE,
+    MaintenanceActiveError,
+    get_maintenance_gate,
+)
 from model_preferences import resolve_model_preference
+from runtime_supervisor import get_runtime_supervisor
 
 log = logging.getLogger("robyx.invoke")
+
+
+_PARTICIPANT_PROBE_CACHE: dict[tuple[type, str], str | None] = {}
+
+
+async def _ensure_participant_backend_supported(
+    backend: AIBackend,
+    *,
+    env_overrides: dict[str, str],
+) -> None:
+    """Verify required CLI flags offline and cache the fail-closed result."""
+    key = (type(backend), backend.cli_path)
+    if key in _PARTICIPANT_PROBE_CACHE:
+        error = _PARTICIPANT_PROBE_CACHE[key]
+        if error:
+            raise UnsupportedExecutionProfile(error)
+        return
+
+    try:
+        commands = backend.participant_probe_commands()
+    except UnsupportedExecutionProfile as exc:
+        _PARTICIPANT_PROBE_CACHE[key] = str(exc)
+        raise
+
+    outputs: list[str] = []
+    for command in commands:
+        proc = None
+        supervisor = get_runtime_supervisor()
+        try:
+            supervisor.reject_if_closing()
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_scrubbed_child_env(env_overrides),
+                start_new_session=sys.platform != "win32",
+            )
+            try:
+                supervisor.track_process(
+                    proc,
+                    owner="participant-probe:%s" % backend.name,
+                    process_group=sys.platform != "win32",
+                )
+            except RuntimeError:
+                await supervisor.terminate_process(proc, grace_seconds=1.0)
+                raise
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+            if supervisor.process_tree_alive(proc):
+                stopped = await supervisor.terminate_process(
+                    proc,
+                    grace_seconds=1.0,
+                )
+                if not stopped:
+                    raise UnsupportedExecutionProfile(
+                        "participant capability probe left a live process tree"
+                    )
+        except asyncio.CancelledError:
+            if proc is not None and supervisor.process_tree_alive(proc):
+                # Cancellation is a control-flow event, not a failed safety
+                # probe. Terminate/reap the isolated CLI group without
+                # poisoning the capability cache, then propagate it.
+                await supervisor.terminate_process(proc, grace_seconds=1.0)
+            raise
+        except (OSError, asyncio.TimeoutError) as exc:
+            if proc is not None and supervisor.process_tree_alive(proc):
+                await supervisor.terminate_process(proc, grace_seconds=0.0)
+            error = "participant capability probe failed: %s" % exc
+            _PARTICIPANT_PROBE_CACHE[key] = error
+            raise UnsupportedExecutionProfile(error) from exc
+        finally:
+            if proc is not None and not supervisor.process_tree_alive(proc):
+                supervisor.untrack_process(proc)
+        combined = (stdout + b"\n" + stderr).decode(errors="replace")
+        if proc.returncode != 0:
+            error = "participant capability probe exited %d" % proc.returncode
+            _PARTICIPANT_PROBE_CACHE[key] = error
+            raise UnsupportedExecutionProfile(error)
+        outputs.append(combined)
+
+    error = backend.validate_participant_probe(outputs)
+    _PARTICIPANT_PROBE_CACHE[key] = error
+    if error:
+        raise UnsupportedExecutionProfile(error)
+
+
+def reset_participant_probe_cache() -> None:
+    """Clear cached CLI capability results (primarily for tests/upgrades)."""
+    _PARTICIPANT_PROBE_CACHE.clear()
 
 # ── Response patterns ──
 DELEGATION_PATTERN = re.compile(r'\[DELEGATE\s+@(\w+):\s*(.+?)\]', re.DOTALL)
@@ -367,6 +472,22 @@ def _normalize_backend_response(parsed_response):
     return parsed_response or "", None
 
 
+def _prepare_session_retry(
+    agent: Agent,
+    manager: AgentManager,
+    security_context: InvocationSecurityContext,
+) -> str:
+    """Reset only a privileged persistent lane; participants stay stateless."""
+    if security_context.is_participant:
+        return "stateless participant lane"
+    new_sid = str(uuid.uuid4())
+    agent.session_id = new_sid
+    agent.session_started = False
+    agent.message_count = 0
+    manager.save_state()
+    return new_sid
+
+
 # (mtime, size)-keyed cache: invalidates automatically when the on-disk
 # brief changes (edits from chat commands, manual edits, `/reset`,
 # migration, etc.) without needing a separate pub-sub hook. Keyed by
@@ -432,6 +553,37 @@ def _load_agent_instructions(agent: Agent) -> str:
     if not path.exists():
         _instructions_cache.pop(str(path), None)
         return ""
+
+    # Continuous-task briefs created before a prompt update contain a copied
+    # snapshot of CONTINUOUS_SETUP.md. Overlay the current template at runtime
+    # so updater-driven session invalidation actually delivers corrected
+    # lifecycle/topic instructions to existing tasks instead of resuming with
+    # a permanently stale copy. Preserve only the per-task heading from the
+    # generated brief; the behavioural body comes from the versioned template.
+    if agent.agent_type == "workspace":
+        try:
+            from config import CONTINUOUS_DIR, TEMPLATES_DIR
+
+            state_path = CONTINUOUS_DIR / agent.name / "state.json"
+            setup_path = TEMPLATES_DIR / "CONTINUOUS_SETUP.md"
+            if state_path.exists() and setup_path.exists():
+                brief = path.read_text(encoding="utf-8").strip()
+                heading = next(
+                    (
+                        line.strip()
+                        for line in brief.splitlines()
+                        if line.strip().startswith("# ")
+                    ),
+                    "# %s (Continuous Task)" % agent.name,
+                )
+                setup = setup_path.read_text(encoding="utf-8").strip()
+                return "\n\n## Agent Instructions\n" + heading + "\n\n" + setup
+        except (OSError, UnicodeDecodeError) as exc:
+            log.warning(
+                "Failed to overlay current continuous instructions for %s: %s",
+                agent.name,
+                exc,
+            )
 
     try:
         stat = path.stat()
@@ -673,6 +825,42 @@ async def invoke_ai(
     model: str | None = None,
     _retry: int = 0,
     thread_id: int | None = None,
+    *,
+    security_context: InvocationSecurityContext,
+) -> str:
+    """Invoke under a shared lease so updates cannot race state writes."""
+    try:
+        async with get_maintenance_gate().shared():
+            return await _invoke_ai_with_maintenance_lease(
+                agent,
+                message,
+                chat_id,
+                platform,
+                manager,
+                backend,
+                is_orchestrator_call,
+                model,
+                _retry,
+                thread_id,
+                security_context=security_context,
+            )
+    except MaintenanceActiveError:
+        return MAINTENANCE_MESSAGE
+
+
+async def _invoke_ai_with_maintenance_lease(
+    agent: Agent,
+    message: str,
+    chat_id: int,
+    platform,
+    manager: AgentManager,
+    backend: AIBackend,
+    is_orchestrator_call: bool = False,
+    model: str | None = None,
+    _retry: int = 0,
+    thread_id: int | None = None,
+    *,
+    security_context: InvocationSecurityContext,
 ) -> str:
     """Invoke the AI CLI with session persistence, keep-alive, and per-agent locking.
 
@@ -684,9 +872,23 @@ async def invoke_ai(
     process is interrupted (SIGTERM → SIGKILL) so the user's message is
     processed immediately instead of queuing behind the lock.
     """
-    # Interrupt running subprocess if the agent is busy — the user's new
-    # message takes priority over the in-flight task.
+    if security_context.is_participant and COLLAB_PARTICIPANT_POLICY == "disabled":
+        return STRINGS["collab_participant_disabled"]
+
+    # A participant may replace another participant turn, but must never be
+    # able to interrupt an executive/system process.  Executive/system turns
+    # retain the existing priority behaviour and may interrupt either lane.
     if agent.busy and agent.running_proc is not None:
+        running_profile = getattr(agent, "running_profile", None)
+        if (
+            security_context.is_participant
+            and running_profile != ExecutionProfile.PARTICIPANT_READ_ONLY.value
+        ):
+            log.warning(
+                "Participant turn refused while privileged agent [%s] is busy",
+                agent.name,
+            )
+            return STRINGS["collab_participant_agent_busy"]
         log.info(
             "Interrupting agent [%s] (PID %d) for user message",
             agent.name, agent.running_proc.pid,
@@ -696,13 +898,14 @@ async def invoke_ai(
     async with agent.lock:
         return await _invoke_ai_locked(
             agent, message, chat_id, platform, manager, backend,
-            is_orchestrator_call, model, _retry, thread_id,
+            is_orchestrator_call, model, _retry, thread_id, security_context,
         )
 
 
 async def _invoke_ai_locked(
     agent, message, chat_id, platform, manager, backend,
     is_orchestrator_call, model, _retry, thread_id,
+    security_context=EXECUTIVE_INVOCATION,
 ):
     # Per-agent backend override. The caller passes the global default; if
     # this agent pinned itself to a different backend at creation time
@@ -745,10 +948,14 @@ async def _invoke_ai_locked(
             agent.thread_id,
         )
 
-    # Inject memory context and management instructions
+    # Inject memory context and management instructions. Participant turns are
+    # read-only, so do not tell them to mutate persistent memory.
     if system_prompt:
         memory_ctx = build_memory_context(agent.name, agent.agent_type, agent.work_dir)
-        memory_instr = get_memory_instructions(agent.name, agent.agent_type, agent.work_dir)
+        memory_instr = (
+            "" if security_context.is_participant
+            else get_memory_instructions(agent.name, agent.agent_type, agent.work_dir)
+        )
         system_prompt = system_prompt + memory_ctx + "\n\n" + memory_instr
 
         # Guard against runaway system prompts. Warn at 30 000 words
@@ -783,25 +990,46 @@ async def _invoke_ai_locked(
     # bookkeeping, but some backends (e.g. OpenCode) require their own id
     # format and would reject ours.
     session_id = None
-    if backend.supports_sessions() and backend.can_resume_session(agent.session_id):
+    if (
+        not security_context.is_participant
+        and backend.supports_sessions()
+        and backend.can_resume_session(agent.session_id)
+    ):
         session_id = agent.session_id
     is_resume = bool(session_id and (agent.session_started or agent.message_count > 0))
 
-    cmd = backend.build_command(
-        message=message,
-        session_id=session_id,
-        system_prompt=system_prompt,
-        model=effective_model,
-        work_dir=agent.work_dir,
-        is_resume=is_resume,
-    )
+    try:
+        invocation = backend.build_invocation(
+            message=message,
+            session_id=session_id,
+            system_prompt=system_prompt,
+            model=effective_model,
+            work_dir=agent.work_dir,
+            is_resume=is_resume,
+            security_context=security_context,
+        )
+        if security_context.is_participant:
+            await _ensure_participant_backend_supported(
+                backend,
+                env_overrides=invocation.env_overrides,
+            )
+    except UnsupportedExecutionProfile as exc:
+        log.error(
+            "Participant execution refused for agent [%s] on %s: %s",
+            agent.name, backend.name, exc,
+        )
+        return STRINGS["collab_participant_backend_unsupported"]
+
+    cmd = invocation.argv
     stdin_payload = backend.command_stdin_payload(message)
 
     log.info(
-        "Invoking %s for [%s] with model %s (chars=%d)",
-        backend.name, agent.name, effective_model, len(message or ""),
+        "Invoking %s for [%s] with model %s profile=%s (chars=%d)",
+        backend.name, agent.name, effective_model, security_context.profile.value,
+        len(message or ""),
     )
     agent.busy = True
+    agent.running_profile = security_context.profile.value
 
     effective_thread_id = thread_id
 
@@ -813,6 +1041,9 @@ async def _invoke_ai_locked(
     # guessing whether the try reached the create_task call.
     heartbeat_task: asyncio.Task | None = None
     try:
+        from runtime_supervisor import get_runtime_supervisor
+        supervisor = get_runtime_supervisor()
+        supervisor.reject_if_closing()
         # start_new_session=True places the CLI in its own process group so
         # interrupt() can signal the whole tree via os.killpg — otherwise
         # grandchildren (a node worker spawned by the CLI, etc.) are left
@@ -825,11 +1056,21 @@ async def _invoke_ai_locked(
             cwd=agent.work_dir,
             limit=1024 * 1024,
             start_new_session=sys.platform != "win32",
-            env=_scrubbed_child_env(),
+            env=_scrubbed_child_env(invocation.env_overrides),
         )
         agent.running_proc = proc
-        import orphan_tracker
-        orphan_tracker.register(proc.pid, owner=agent.name)
+        try:
+            supervisor.track_process(
+                proc,
+                owner="interactive:%s" % agent.name,
+                process_group=sys.platform != "win32",
+            )
+        except RuntimeError:
+            # Shutdown may begin while create_subprocess_exec is yielding.
+            # track_process has already signalled the isolated child group;
+            # reap the immediate child before refusing the invocation.
+            await supervisor.terminate_process(proc, grace_seconds=2.0)
+            raise
 
         # Heartbeat watchdog: periodic log line while the subprocess runs,
         # so operators scrolling bot.log can see "agent X still working at
@@ -849,12 +1090,18 @@ async def _invoke_ai_locked(
             except asyncio.CancelledError:
                 pass
 
-        heartbeat_task = asyncio.create_task(_heartbeat())
+        heartbeat_task = supervisor.spawn(
+            _heartbeat(),
+            name="agent_heartbeat:%s:%s" % (agent.name, proc.pid),
+        )
 
         backend_session_id: str | None = None
         if backend.supports_streaming():
             await _write_stdin_payload(proc, stdin_payload)
-            text = await _read_stream(proc, platform, chat_id, effective_thread_id, backend)
+            text = await _read_stream(
+                proc, platform, chat_id, effective_thread_id, backend,
+                relay_status=not security_context.is_participant,
+            )
         else:
             if stdin_payload is not None:
                 stdout, stderr = await asyncio.wait_for(
@@ -866,6 +1113,10 @@ async def _invoke_ai_locked(
             out = stdout.decode().strip()
             err = stderr.decode().strip()
             combined = (out + " " + err).lower()
+            # On failures stderr is authoritative. Stdout can contain a
+            # perfectly valid assistant response discussing these phrases;
+            # scanning it when stderr exists causes silent duplicate turns.
+            diagnostic = err.lower() if err else out.lower()
 
             if proc.returncode != 0:
                 if agent.interrupted:
@@ -875,24 +1126,31 @@ async def _invoke_ai_locked(
                     "%s error for [%s] (rc=%d, stderr_len=%d, stdout_len=%d)",
                     backend.name, agent.name, proc.returncode, len(err), len(out),
                 )
-                session_collision = "already in use" in combined
-                stream_retryable = _is_stream_retryable(combined)
+                session_collision = "already in use" in diagnostic
+                stream_retryable = _is_stream_retryable(diagnostic)
                 if (session_collision or stream_retryable) and _retry < MAX_AI_RETRIES:
-                    new_sid = str(uuid.uuid4())
+                    new_sid = _prepare_session_retry(agent, manager, security_context)
                     reason = "session collision" if session_collision else "transient stream error"
                     log.warning(
                         "Retryable backend error for [%s] (%s): id=%s → regenerating as %s, retry %d/%d",
                         agent.name, reason, agent.session_id, new_sid, _retry + 1, MAX_AI_RETRIES,
                     )
-                    agent.session_id = new_sid
-                    agent.session_started = False
-                    agent.message_count = 0
-                    manager.save_state()
+                    if supervisor.process_tree_alive(proc):
+                        retired = await supervisor.terminate_process(
+                            proc,
+                            grace_seconds=2.0,
+                        )
+                    else:
+                        retired = supervisor.untrack_process(proc)
+                    if not retired:
+                        return STRINGS["ai_error"] % "previous process tree did not stop"
+                    agent.running_proc = None
                     agent.busy = False
                     await asyncio.sleep(min(2 ** _retry, 16))
                     return await _invoke_ai_locked(
                         agent, message, chat_id, platform, manager, backend,
                         is_orchestrator_call, model, _retry + 1, thread_id,
+                        security_context,
                     )
                 return _classify_error(combined, err, out)
 
@@ -918,64 +1176,53 @@ async def _invoke_ai_locked(
                 session_collision = "already in use" in combined
                 stream_retryable = _is_stream_retryable(combined)
                 if (session_collision or stream_retryable) and _retry < MAX_AI_RETRIES:
-                    new_sid = str(uuid.uuid4())
+                    new_sid = _prepare_session_retry(agent, manager, security_context)
                     reason = "session collision" if session_collision else "transient stream error"
                     log.warning(
                         "Retryable streaming error for [%s] (%s): id=%s → regenerating as %s, retry %d/%d",
                         agent.name, reason, agent.session_id, new_sid, _retry + 1, MAX_AI_RETRIES,
                     )
-                    agent.session_id = new_sid
-                    agent.session_started = False
-                    agent.message_count = 0
-                    manager.save_state()
+                    if supervisor.process_tree_alive(proc):
+                        retired = await supervisor.terminate_process(
+                            proc,
+                            grace_seconds=2.0,
+                        )
+                    else:
+                        retired = supervisor.untrack_process(proc)
+                    if not retired:
+                        return STRINGS["ai_error"] % "previous process tree did not stop"
+                    agent.running_proc = None
                     agent.busy = False
                     await asyncio.sleep(min(2 ** _retry, 16))
                     return await _invoke_ai_locked(
                         agent, message, chat_id, platform, manager, backend,
                         is_orchestrator_call, model, _retry + 1, thread_id,
+                        security_context,
                     )
                 return _classify_error(combined, err, "")
             return STRINGS["ai_no_response"]
 
         if not text:
             return STRINGS["ai_empty"]
-        text_lower = text.lower()
-        # Claude Code sometimes delivers a transient stream error *as* the
-        # result payload (e.g. "API Error: Stream idle timeout - partial
-        # response received") instead of non-zero exit + stderr. Treat that
-        # identically to a stderr failure and retry with a fresh session
-        # instead of surfacing the raw error to chat.
-        if _is_stream_retryable(text_lower) and _retry < MAX_AI_RETRIES:
-            new_sid = str(uuid.uuid4())
-            log.warning(
-                "Transient stream error in result for [%s]: %s → regenerating as %s, retry %d/%d",
-                agent.name, text[:120], new_sid, _retry + 1, MAX_AI_RETRIES,
-            )
-            agent.session_id = new_sid
-            agent.session_started = False
-            agent.message_count = 0
-            manager.save_state()
-            agent.busy = False
-            await asyncio.sleep(min(2 ** _retry, 16))
-            return await _invoke_ai_locked(
-                agent, message, chat_id, platform, manager, backend,
-                is_orchestrator_call, model, _retry + 1, thread_id,
-            )
-        # Do not infer rate limits from assistant content. Substring
-        # matches against free-form AI output produce frequent false
-        # positives; failure-path diagnostics are classified separately
-        # in _classify_error.
+        # Never infer transport failures or rate limits from successful
+        # assistant content. Failure-path diagnostics are classified from
+        # stderr (or failure stdout when stderr is empty) above.
 
         # If the backend handed us a native session id (e.g. OpenCode's
         # ``ses_…``), persist it so the next turn can resume the
         # conversation server-side.
-        if backend_session_id and backend_session_id != agent.session_id:
+        if (
+            invocation.persist_session
+            and backend_session_id
+            and backend_session_id != agent.session_id
+        ):
             agent.session_id = backend_session_id
 
-        agent.last_used = time.time()
-        agent.message_count += 1
-        agent.session_started = True
-        manager.save_state()
+        if invocation.persist_session:
+            agent.last_used = time.time()
+            agent.message_count += 1
+            agent.session_started = True
+            manager.save_state()
 
         # Spec 007.1 — conversation archive. Log this turn so /clear can
         # produce a markdown transcript before resetting the session.
@@ -1002,19 +1249,11 @@ async def _invoke_ai_locked(
             "AI %s timeout for [%s] after %ds",
             exc.kind, agent.name, exc.elapsed,
         )
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
         if exc.kind == "idle":
             return STRINGS["ai_idle_timeout"] % exc.elapsed
         return STRINGS["ai_timeout"] % exc.elapsed
     except asyncio.TimeoutError:
         log.error("AI timeout for [%s]", agent.name)
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
         return STRINGS["ai_timeout"] % AI_TIMEOUT
     except (OSError, RuntimeError) as e:
         log.error("AI exception for [%s]: %s", agent.name, e, exc_info=True)
@@ -1022,19 +1261,39 @@ async def _invoke_ai_locked(
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
-        agent.busy = False
-        agent.interrupted = False
+        tree_stopped = agent.running_proc is None
         try:
             if agent.running_proc is not None:
-                import orphan_tracker
-                orphan_tracker.unregister(agent.running_proc.pid)
+                from runtime_supervisor import get_runtime_supervisor
+                supervisor = get_runtime_supervisor()
+                if supervisor.process_tree_alive(agent.running_proc):
+                    # Handler cancellation, transport shutdown, and unusual
+                    # backend failures must not detach an active CLI tree. The
+                    # group can remain alive after its direct leader exits.
+                    tree_stopped = await supervisor.terminate_process(
+                        agent.running_proc, grace_seconds=2.0,
+                    )
+                else:
+                    tree_stopped = supervisor.untrack_process(agent.running_proc)
         except Exception:
             log.debug("orphan_tracker cleanup failed", exc_info=True)
-        finally:
+            tree_stopped = False
+        if tree_stopped:
+            agent.busy = False
+            agent.interrupted = False
             agent.running_proc = None
+            agent.running_profile = None
+        else:
+            agent.busy = True
+            log.error(
+                "Agent [%s] process tree could not be reaped; preserving busy evidence",
+                agent.name,
+            )
 
 
-async def _read_stream(proc, platform, chat_id, effective_thread_id, backend):
+async def _read_stream(
+    proc, platform, chat_id, effective_thread_id, backend, *, relay_status=True,
+):
     """Read stream-json stdout line by line, relay [STATUS ...] in real time.
 
     Returns the final result text (with STATUS patterns stripped),
@@ -1077,14 +1336,12 @@ async def _read_stream(proc, platform, chat_id, effective_thread_id, backend):
     while True:
         now = asyncio.get_event_loop().time()
         if now >= deadline:
-            proc.kill()
             raise AIIdleTimeout("hard_cap", elapsed=AI_TIMEOUT)
 
         idle_budget = min(AI_IDLE_TIMEOUT, deadline - now)
         try:
             line = await asyncio.wait_for(proc.stdout.readline(), timeout=idle_budget)
         except asyncio.TimeoutError:
-            proc.kill()
             raise AIIdleTimeout("idle", elapsed=AI_IDLE_TIMEOUT)
 
         if not line:
@@ -1102,7 +1359,7 @@ async def _read_stream(proc, platform, chat_id, effective_thread_id, backend):
         event_type = event.get("type", "")
 
         # Relay STATUS patterns from assistant text blocks in real time
-        if event_type == "assistant":
+        if event_type == "assistant" and relay_status:
             msg = event.get("message", {})
             content_blocks = msg.get("content", []) if isinstance(msg, dict) else []
             for block in content_blocks:
@@ -1158,6 +1415,7 @@ async def handle_delegations(response, chat_id, platform, manager, backend, thre
 
         delegate_response = await invoke_ai(
             target, task, chat_id, platform, manager, backend, thread_id=thread_id,
+            security_context=EXECUTIVE_INVOCATION,
         )
         manager.save_state()
         if delegate_response is not None:
@@ -1250,7 +1508,7 @@ async def handle_specialist_requests(response, chat_id, platform, manager, backe
         contextualized_task = "Request from workspace '%s': %s" % (requesting_agent.name, task)
         specialist_response = await invoke_ai(
             specialist, contextualized_task, chat_id, platform, manager, backend,
-            thread_id=thread_id,
+            thread_id=thread_id, security_context=EXECUTIVE_INVOCATION,
         )
         manager.save_state()
         if specialist_response is not None:

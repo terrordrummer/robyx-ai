@@ -24,6 +24,7 @@ from lifecycle_macros import (
     scope_to_workspace,
     substitute_macros,
 )
+from task_scope import TaskScope
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -172,6 +173,54 @@ class TestScopeToWorkspace:
         assert scope_to_workspace(entries, chat_id=1, thread_id=None) == [
             e for e in entries
         ]
+
+    def test_canonical_scope_separates_same_thread_across_chats(self):
+        mine = _entry("mine", "periodic", thread_id=42)
+        mine["workspace_scope"] = TaskScope(
+            "telegram", "-1001", 42,
+        ).to_dict()
+        theirs = _entry("theirs", "periodic", thread_id=42)
+        theirs["workspace_scope"] = TaskScope(
+            "telegram", "-1002", 42,
+        ).to_dict()
+
+        scoped = scope_to_workspace(
+            [mine, theirs],
+            chat_id=-1001,
+            thread_id=42,
+            task_scope=TaskScope("telegram", "-1001", 42),
+        )
+
+        assert scoped == [mine]
+
+    def test_canonical_scope_separates_none_thread_across_chats(self):
+        mine = _entry("mine", "reminder", thread_id=None)
+        mine["workspace_scope"] = TaskScope(
+            "telegram", "-1001", None,
+        ).to_dict()
+        theirs = _entry("theirs", "reminder", thread_id=None)
+        theirs["workspace_scope"] = TaskScope(
+            "telegram", "-1002", None,
+        ).to_dict()
+
+        scoped = scope_to_workspace(
+            [mine, theirs],
+            chat_id=-1001,
+            thread_id=None,
+            task_scope=TaskScope("telegram", "-1001", None),
+        )
+
+        assert scoped == [mine]
+
+    def test_legacy_none_thread_is_hidden_with_modern_context(self):
+        legacy = _entry("ambiguous", "reminder", thread_id=None)
+
+        assert scope_to_workspace(
+            [legacy],
+            chat_id=-1001,
+            thread_id=None,
+            task_scope=TaskScope("telegram", "-1001", None),
+        ) == []
 
 
 # ─────────────────────────────────────────────────────────────────────────

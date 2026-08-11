@@ -1,12 +1,13 @@
 """Tests for bot/_bootstrap.py — startup dep check."""
 
-import hashlib
 import importlib
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from dependency_locks import dependency_fingerprint, dependency_lock_path
 
 
 @pytest.fixture
@@ -30,6 +31,9 @@ def fresh_bootstrap(tmp_path, monkeypatch):
     bot_dir.mkdir()
     req = bot_dir / "requirements.txt"
     req.write_text("dummy==1.0\n")
+    lock = dependency_lock_path(tmp_path, require_exists=False)
+    lock.parent.mkdir(parents=True)
+    lock.write_text("dummy==1.0 --hash=sha256:test\n")
 
     # Remove the active PYTEST marker so the guard doesn't skip the code.
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
@@ -42,19 +46,28 @@ def fresh_bootstrap(tmp_path, monkeypatch):
     monkeypatch.setattr(bs, "_PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(bs, "_REQUIREMENTS", req)
     monkeypatch.setattr(bs, "_VENV_DIR", venv)
+    monkeypatch.setattr(bs, "_running_from_managed_venv", lambda: True)
     return bs, tmp_path, req, venv
 
 
 class TestEnsureDependencies:
     def test_first_run_installs_and_writes_marker(self, fresh_bootstrap):
         bs, root, req, venv = fresh_bootstrap
-        expected_hash = hashlib.sha1(req.read_bytes()).hexdigest()
+        lock = dependency_lock_path(root)
+        expected_hash = dependency_fingerprint(req, lock)
 
-        with patch("_bootstrap.subprocess.run") as mock_run:
+        with patch("_bootstrap._run_pip_install") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
             bs.ensure_dependencies()
 
         mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == [
+            str(bs._venv_pip()),
+            "install",
+            "--require-hashes",
+            "-r",
+            str(lock),
+        ]
         marker = venv / ".robyx_deps_hash"
         assert marker.exists()
         assert marker.read_text().strip() == expected_hash
@@ -62,9 +75,9 @@ class TestEnsureDependencies:
     def test_second_run_same_requirements_is_noop(self, fresh_bootstrap):
         bs, root, req, venv = fresh_bootstrap
         marker = venv / ".robyx_deps_hash"
-        marker.write_text(hashlib.sha1(req.read_bytes()).hexdigest())
+        marker.write_text(dependency_fingerprint(req, dependency_lock_path(root)))
 
-        with patch("_bootstrap.subprocess.run") as mock_run:
+        with patch("_bootstrap._run_pip_install") as mock_run:
             bs.ensure_dependencies()
         mock_run.assert_not_called()
 
@@ -73,21 +86,46 @@ class TestEnsureDependencies:
         marker = venv / ".robyx_deps_hash"
         marker.write_text("stale-hash-value")
 
-        with patch("_bootstrap.subprocess.run") as mock_run:
+        with patch("_bootstrap._run_pip_install") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             bs.ensure_dependencies()
         mock_run.assert_called_once()
-        assert marker.read_text().strip() == hashlib.sha1(req.read_bytes()).hexdigest()
+        assert marker.read_text().strip() == dependency_fingerprint(
+            req,
+            dependency_lock_path(root),
+        )
 
     def test_pip_failure_does_not_update_marker(self, fresh_bootstrap):
         bs, root, req, venv = fresh_bootstrap
 
-        with patch("_bootstrap.subprocess.run") as mock_run:
+        with patch("_bootstrap._run_pip_install") as mock_run:
             mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="err")
-            bs.ensure_dependencies()
+            with pytest.raises(bs.DependencyLockError, match="exit status 1"):
+                bs.ensure_dependencies()
 
         marker = venv / ".robyx_deps_hash"
         assert not marker.exists()
+
+    def test_pip_failure_never_logs_child_credentials(
+        self,
+        fresh_bootstrap,
+        capsys,
+    ):
+        bs, _root, _req, _venv = fresh_bootstrap
+        secret = "authenticated-index-password"
+        with patch("_bootstrap._run_pip_install") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=1,
+                stdout="download https://alice:%s@packages.example/simple" % secret,
+                stderr="token=%s" % secret,
+            )
+            with pytest.raises(bs.DependencyLockError):
+                bs.ensure_dependencies()
+
+        captured = capsys.readouterr()
+        evidence = captured.out + captured.err
+        assert secret not in evidence
+        assert "alice:" not in evidence
 
     def test_pip_subprocess_gets_scrubbed_env(self, fresh_bootstrap, monkeypatch):
         """P2-86: pip must run with a scrubbed environment — platform
@@ -108,7 +146,7 @@ class TestEnsureDependencies:
         monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
         monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
 
-        with patch("_bootstrap.subprocess.run") as mock_run:
+        with patch("_bootstrap._run_pip_install") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
             bs.ensure_dependencies()
 
@@ -150,26 +188,57 @@ class TestEnsureDependencies:
             "ANTHROPIC_API_KEY",
         })
 
-    def test_timeout_does_not_crash(self, fresh_bootstrap):
+    def test_timeout_fails_closed(self, fresh_bootstrap):
         import subprocess as _sp
         bs, root, req, venv = fresh_bootstrap
 
         with patch(
-            "_bootstrap.subprocess.run",
+            "_bootstrap._run_pip_install",
             side_effect=_sp.TimeoutExpired(cmd="pip", timeout=600),
         ):
-            bs.ensure_dependencies()  # must not raise
+            with pytest.raises(bs.DependencyLockError, match="timed out"):
+                bs.ensure_dependencies()
 
         marker = venv / ".robyx_deps_hash"
         assert not marker.exists()
+
+    def test_pip_launch_error_fails_closed(self, fresh_bootstrap):
+        bs, _root, _req, venv = fresh_bootstrap
+
+        with patch(
+            "_bootstrap._run_pip_install",
+            side_effect=OSError("executable became unavailable"),
+        ):
+            with pytest.raises(bs.DependencyLockError, match="could not be launched"):
+                bs.ensure_dependencies()
+
+        assert not (venv / ".robyx_deps_hash").exists()
+
+    def test_missing_pip_fails_closed(self, fresh_bootstrap):
+        bs, _root, _req, _venv = fresh_bootstrap
+        bs._venv_pip().unlink()
+
+        with pytest.raises(bs.DependencyLockError, match="venv pip not found"):
+            bs.ensure_dependencies()
 
     def test_missing_requirements_is_noop(self, fresh_bootstrap):
         bs, root, req, venv = fresh_bootstrap
         req.unlink()
 
-        with patch("_bootstrap.subprocess.run") as mock_run:
+        with patch("_bootstrap._run_pip_install") as mock_run:
             bs.ensure_dependencies()
         mock_run.assert_not_called()
+
+    def test_missing_runtime_lock_refuses_unlocked_boot(self, fresh_bootstrap, capsys):
+        bs, root, _req, _venv = fresh_bootstrap
+        dependency_lock_path(root).unlink()
+
+        with patch("_bootstrap._run_pip_install") as mock_run:
+            with pytest.raises(bs.DependencyLockError, match="refusing unlocked boot"):
+                bs.ensure_dependencies()
+
+        mock_run.assert_not_called()
+        assert "refusing unlocked boot" in capsys.readouterr().err
 
     def test_missing_venv_is_noop(self, tmp_path, monkeypatch):
         monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
@@ -188,6 +257,21 @@ class TestEnsureDependencies:
         with patch("_bootstrap.subprocess.run") as mock_run:
             bs.ensure_dependencies()
         mock_run.assert_not_called()
+
+    def test_existing_unrelated_checkout_venv_is_not_mutated(
+        self,
+        fresh_bootstrap,
+        monkeypatch,
+    ):
+        bs, _root, _req, venv = fresh_bootstrap
+        assert venv.exists()
+        monkeypatch.setattr(bs, "_running_from_managed_venv", lambda: False)
+
+        with patch("_bootstrap._run_pip_install") as install:
+            bs.ensure_dependencies()
+
+        install.assert_not_called()
+        assert not (venv / ".robyx_deps_hash").exists()
 
 
 class TestMigratePersonalDataIfNeeded:
@@ -252,3 +336,125 @@ class TestMigratePersonalDataIfNeeded:
         moved = bs.migrate_personal_data_if_needed()
         assert "agents/zeus-engine.md" in moved
         assert (data_dir / "agents" / "zeus-engine.md").read_text() == "Z\n"
+
+
+class TestInterruptedUpdateRecovery:
+    def test_boot_fails_closed_on_durable_interrupted_update_marker(
+        self,
+        fresh_bootstrap,
+        monkeypatch,
+    ):
+        bs, root, _req, _venv = fresh_bootstrap
+        data_dir = root / "data"
+        marker = data_dir / "backups" / "active-update.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text(
+            '{"schema": 1, "phase": "migration", '
+            '"pre_update_commit": "%s", '
+            '"pre_update_version": "0.1.0"}' % ("a" * 40),
+        )
+        monkeypatch.setattr(bs, "_DATA_DIR", data_dir)
+
+        with patch("_bootstrap._run_pip_install") as install:
+            with pytest.raises(bs.DependencyLockError, match="interrupted update"):
+                bs.ensure_dependencies()
+
+        install.assert_not_called()
+        assert marker.exists(), "manual recovery evidence must be retained"
+
+    def test_corrupt_interrupted_update_marker_also_fails_closed(
+        self,
+        fresh_bootstrap,
+        monkeypatch,
+    ):
+        bs, root, _req, _venv = fresh_bootstrap
+        data_dir = root / "data"
+        marker = data_dir / "backups" / "active-update.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text("not-json")
+        monkeypatch.setattr(bs, "_DATA_DIR", data_dir)
+
+        with pytest.raises(bs.DependencyLockError, match="unverified"):
+            bs.ensure_dependencies()
+
+    def test_bootstrap_timeout_terminates_entire_process_group(
+        self,
+        fresh_bootstrap,
+    ):
+        import signal
+        import subprocess as _sp
+
+        bs, _root, _req, _venv = fresh_bootstrap
+        proc = MagicMock()
+        proc.pid = 424242
+        proc.poll.return_value = None
+        proc.communicate.side_effect = _sp.TimeoutExpired("pip", 1)
+        proc.wait.side_effect = [_sp.TimeoutExpired("pip", 1), 0]
+
+        with patch("_bootstrap.subprocess.Popen", return_value=proc), \
+             patch("_bootstrap.os.killpg") as killpg:
+            with pytest.raises(_sp.TimeoutExpired):
+                bs._run_pip_install(["pip"], timeout=1, env={})
+
+        assert [item.args for item in killpg.call_args_list] == [
+            (proc.pid, signal.SIGTERM),
+            (proc.pid, signal.SIGKILL),
+        ]
+        assert proc.wait.call_count == 2
+
+    def test_bootstrap_sigterm_handler_cleans_child_and_restores_handlers(
+        self,
+        fresh_bootstrap,
+    ):
+        import signal
+
+        bs, _root, _req, _venv = fresh_bootstrap
+        proc = MagicMock()
+        proc.pid = 424242
+        proc.poll.return_value = None
+        proc.wait.return_value = 0
+        installed = {}
+        originals = {
+            signal.SIGTERM: object(),
+            signal.SIGINT: object(),
+        }
+
+        def fake_signal(signum, handler):
+            installed[signum] = handler
+
+        def interrupted_communicate(*_args, **_kwargs):
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+
+        proc.communicate.side_effect = interrupted_communicate
+        with patch("_bootstrap.signal.getsignal", side_effect=originals.get), \
+             patch("_bootstrap.signal.signal", side_effect=fake_signal), \
+             patch("_bootstrap.subprocess.Popen", return_value=proc), \
+             patch("_bootstrap.os.killpg") as killpg:
+            with pytest.raises(SystemExit) as caught:
+                bs._run_pip_install(["pip"], timeout=60, env={})
+
+        assert caught.value.code == 128 + signal.SIGTERM
+        killpg.assert_called_once_with(proc.pid, signal.SIGTERM)
+        assert installed == originals
+        proc.wait.assert_called_once_with(timeout=2.0)
+
+    def test_windows_bootstrap_cleanup_uses_taskkill_tree(self, fresh_bootstrap):
+        bs, _root, _req, _venv = fresh_bootstrap
+        proc = MagicMock()
+        proc.pid = 424242
+        proc.poll.return_value = None
+        proc.wait.return_value = 0
+
+        with patch.object(bs.sys, "platform", "win32"), \
+             patch("_bootstrap.subprocess.run") as run:
+            bs._terminate_pip_process(proc)
+
+        run.assert_called_once_with(
+            ["taskkill", "/PID", "424242", "/T", "/F"],
+            check=False,
+            stdout=bs.subprocess.DEVNULL,
+            stderr=bs.subprocess.DEVNULL,
+            timeout=3.0,
+        )
+        proc.terminate.assert_not_called()
+        proc.wait.assert_called_once_with(timeout=2.0)

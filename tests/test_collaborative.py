@@ -4,6 +4,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "bot"))
 
 from collaborative import CollabStore, CollabWorkspace, Role, validate_collab_name
@@ -180,9 +182,10 @@ class TestCollabStore:
         path = tmp_path / "collab.json"
         path.write_text("{not valid json!!")
 
-        store = CollabStore(path)
-        # Store loaded nothing because the file was corrupt.
-        assert store.list_all() == []
+        from persistence_recovery import PersistenceUnavailableError
+
+        with pytest.raises(PersistenceUnavailableError):
+            CollabStore(path)
         # Original file is gone (renamed), replaced by a .corrupt-* sibling.
         assert not path.exists(), (
             "corrupt file should be quarantined, not present — otherwise "
@@ -260,15 +263,46 @@ class TestCollabStore:
         siblings[0].unlink(missing_ok=True)
         snap.unlink(missing_ok=True)
 
+    def test_semantically_partial_registry_is_not_partially_loaded(self, tmp_path):
+        from persistence_recovery import PersistenceUnavailableError
+
+        path = tmp_path / "collab.json"
+        path.write_text(json.dumps({
+            "collab-incomplete": {
+                "id": "collab-incomplete",
+                "name": "incomplete",
+                # agent_name is required; valid JSON must not be enough.
+            },
+        }))
+
+        with pytest.raises(PersistenceUnavailableError):
+            CollabStore(path)
+        assert list(tmp_path.glob("collab.json.corrupt-*"))
+
     def test_unreadable_file_degrades_gracefully(self, tmp_path):
-        """If the file is present but we can't decode it (e.g. written in
-        a non-UTF-8 encoding from a botched edit), the store starts empty
-        and logs the failure without crashing."""
+        """An unreadable existing registry blocks startup."""
+        from persistence_recovery import PersistenceUnavailableError
+
         path = tmp_path / "collab.json"
         path.write_bytes(b"\xff\xfe\x00garbage-not-utf-8")
 
+        with pytest.raises(PersistenceUnavailableError):
+            CollabStore(path)
+
+    def test_corruption_before_write_rolls_back_in_memory(self, tmp_path):
+        from persistence_recovery import PersistenceUnavailableError
+
+        path = tmp_path / "collab.json"
         store = CollabStore(path)
-        assert store.list_all() == []
+        ws = _make_ws()
+        store.add(ws)
+        path.write_text("{broken")
+
+        with pytest.raises(PersistenceUnavailableError):
+            store.update_roles(ws.id, 222, Role.OPERATOR)
+
+        assert store.get(ws.id).get_role(222) is None
+        assert list(tmp_path.glob("collab.json.corrupt-*"))
 
     def test_update_roles(self, tmp_path):
         store = CollabStore(tmp_path / "collab.json")

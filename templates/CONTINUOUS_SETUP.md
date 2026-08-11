@@ -70,10 +70,11 @@ continuous task:
 ```
 
 The system will create a git branch (`continuous/<slug>` in `work_dir`),
-register the task in the queue, and start the first step automatically.
-No dedicated sub-topic is created: step reports flow back into **this same
-workspace chat** with a `🔄 [<slug>]` prefix. Never tell the user to "go to
-the 🔄 topic" — there is none.
+persist a revisioned `program.json` plus a readable `plan.md` projection,
+register the canonical platform/chat scope in the queue, create a dedicated
+task topic, and start the first step automatically. Step reports, questions,
+incidents, and terminal notices are delivered to that task topic; lifecycle
+control remains in the parent workspace.
 
 Use ASCII straight quotes (`"`) around attribute values. Curly/typographic
 quotes are tolerated but plain ASCII is preferred.

@@ -8,6 +8,7 @@ import pytest
 
 import config as cfg
 import continuous as cont_mod
+from persistence_recovery import PersistenceUnavailableError
 from continuous import (
     build_step_context,
     check_rate_limit_recovery,
@@ -19,12 +20,14 @@ from continuous import (
     mark_step_failed,
     mark_step_started,
     pause_task,
+    program_file_path,
     resume_task,
     save_state,
     set_awaiting_input,
     set_next_step,
     set_rate_limited,
     state_file_path,
+    update_program,
 )
 
 
@@ -65,13 +68,155 @@ class TestStateIO:
 
     def test_atomic_write(self, tmp_path):
         path = tmp_path / "state.json"
-        save_state(path, {"x": 1})
+        save_state(path, {"name": "atomic", "status": "pending"})
         assert not path.with_suffix(".tmp").exists()
+
+    def test_semantically_invalid_state_fails_closed(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text('{"x": 1}')
+
+        with pytest.raises(PersistenceUnavailableError):
+            load_state(path)
+        with pytest.raises(ValueError, match="malformed continuous state"):
+            save_state(path, {"x": 1})
 
     def test_corrupt_json(self, tmp_path):
         path = tmp_path / "state.json"
         path.write_text("NOT JSON")
-        assert load_state(path) is None
+        with pytest.raises(PersistenceUnavailableError):
+            load_state(path)
+        assert not path.exists()
+        assert list(tmp_path.glob("state.json.corrupt-*"))
+
+    def test_authoritative_program_survives_stale_external_state_write(self):
+        state = create_continuous_task(
+            name="race",
+            parent_workspace="ops",
+            program={"objective": "S0"},
+            thread_id=42,
+            branch="continuous/race",
+            work_dir="/tmp",
+        )
+        path = state_file_path("race")
+        stale = json.loads(path.read_text())
+
+        update_program(
+            path, state, {"objective": "S1"}, plan_text="# Plan S1\n",
+        )
+        assert program_file_path("race").exists()
+
+        # The step child follows the historical template and atomically
+        # replaces the whole state from its old S0 snapshot.
+        stale["status"] = "pending"
+        child_tmp = path.with_suffix(".child.tmp")
+        child_tmp.write_text(json.dumps(stale))
+        child_tmp.replace(path)
+
+        reconciled = load_state(path)
+        assert reconciled["program"] == {"objective": "S1"}
+        assert reconciled["program_revision"] == 1
+
+    def test_normal_stale_save_cannot_replace_newer_program_revision(self):
+        state = create_continuous_task(
+            name="stale-save",
+            parent_workspace="ops",
+            program={"objective": "S0"},
+            thread_id=42,
+            branch="continuous/stale-save",
+            work_dir="/tmp",
+        )
+        stale = dict(state)
+        stale["program"] = {"objective": "S0"}
+        update_program(
+            state_file_path("stale-save"),
+            state,
+            {"objective": "S1"},
+            plan_text="# Plan S1\n",
+        )
+
+        save_state(state_file_path("stale-save"), stale)
+
+        assert load_state(state_file_path("stale-save"))["program"] == {
+            "objective": "S1",
+        }
+
+    def test_missing_revisioned_program_sidecar_fails_closed(self):
+        state = create_continuous_task(
+            name="missing-authority",
+            parent_workspace="ops",
+            program={"objective": "S0"},
+            thread_id=42,
+            branch="continuous/missing-authority",
+            work_dir="/tmp",
+        )
+        update_program(
+            state_file_path("missing-authority"),
+            state,
+            {"objective": "S1"},
+            plan_text="# Plan S1\n",
+        )
+        program_file_path("missing-authority").unlink()
+
+        with pytest.raises(PersistenceUnavailableError):
+            load_state(state_file_path("missing-authority"))
+
+    def test_corrupt_program_sidecar_fails_closed(self):
+        create_continuous_task(
+            name="corrupt-authority",
+            parent_workspace="ops",
+            program={"objective": "S0"},
+            thread_id=42,
+            branch="continuous/corrupt-authority",
+            work_dir="/tmp",
+        )
+        program_file_path("corrupt-authority").write_text("not-json")
+
+        with pytest.raises(PersistenceUnavailableError):
+            load_state(state_file_path("corrupt-authority"))
+
+    def test_load_repairs_plan_after_crash_between_sidecar_and_state(
+        self, monkeypatch,
+    ):
+        state = create_continuous_task(
+            name="plan-crash",
+            parent_workspace="ops",
+            program={"objective": "S0"},
+            thread_id=42,
+            branch="continuous/plan-crash",
+            work_dir="/tmp",
+            plan_text="# Old plan\n",
+        )
+        path = state_file_path("plan-crash")
+        original_repair = cont_mod._repair_authoritative_plan
+
+        def simulated_crash(_state_path, _record):
+            raise RuntimeError("simulated crash after sidecar commit")
+
+        monkeypatch.setattr(
+            cont_mod, "_repair_authoritative_plan", simulated_crash,
+        )
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            update_program(
+                path,
+                state,
+                {"objective": "S1"},
+                plan_text="# Accepted custom plan\n",
+            )
+
+        # state.json and plan.md are still old, but program.json already
+        # durably identifies the accepted revision and its exact plan body.
+        assert json.loads(path.read_text())["program"]["objective"] == "S0"
+        assert (path.parent / "plan.md").read_text() == "# Old plan\n"
+
+        monkeypatch.setattr(
+            cont_mod, "_repair_authoritative_plan", original_repair,
+        )
+        recovered = load_state(path)
+        assert recovered["program"]["objective"] == "S1"
+        assert recovered["program_revision"] == 1
+        assert (path.parent / "plan.md").read_text() == (
+            "# Accepted custom plan\n"
+        )
 
 
 # ── State creation ───────────────────────────────────────────────────────────

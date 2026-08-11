@@ -1,6 +1,7 @@
 #!/bin/bash
 # Robyx — macOS installer (launchd)
 set -e
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -10,7 +11,7 @@ PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME.plist"
 echo "=== Robyx macOS Installer ==="
 echo ""
 
-# Pick the newest available Python >= 3.10 from python/python3
+# Pick the newest lock-supported Python (3.10 through 3.14).
 get_python_version() {
     local cmd="$1"
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -26,6 +27,15 @@ version_ge_3_10() {
 $version
 EOF
     [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 10 ]; }
+}
+
+version_le_3_14() {
+    local version="$1"
+    local major minor
+    IFS='.' read -r major minor _ << EOF
+$version
+EOF
+    [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -le 14 ]; }
 }
 
 version_gt() {
@@ -54,14 +64,14 @@ PYTHON_VERSION=""
 FOUND_PYTHON="not found"
 FOUND_PYTHON3="not found"
 
-for candidate in python python3 python3.13 python3.12 python3.11 python3.10; do
+for candidate in python python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
     version=$(get_python_version "$candidate") || continue
     if [ "$candidate" = "python" ]; then
         FOUND_PYTHON="$version"
     elif [ "$candidate" = "python3" ]; then
         FOUND_PYTHON3="$version"
     fi
-    if ! version_ge_3_10 "$version"; then
+    if ! version_ge_3_10 "$version" || ! version_le_3_14 "$version"; then
         continue
     fi
     if [ -z "$PYTHON_BIN" ] || version_gt "$version" "$PYTHON_VERSION"; then
@@ -71,11 +81,31 @@ for candidate in python python3 python3.13 python3.12 python3.11 python3.10; do
 done
 
 if [ -z "$PYTHON_BIN" ]; then
-    echo "Error: Neither 'python' nor 'python3' provides Python 3.10+. Found python=$FOUND_PYTHON, python3=$FOUND_PYTHON3."
+    echo "Error: Neither 'python' nor 'python3' provides a lock-supported Python (3.10-3.14). Found python=$FOUND_PYTHON, python3=$FOUND_PYTHON3."
     exit 1
 fi
 
 echo "Python: $PYTHON_BIN ($PYTHON_VERSION)"
+
+# Stop the live service before clearing its interpreter. Mutating an in-use
+# venv can leave a half-updated process importing a mixed dependency set.
+if launchctl list "$PLIST_NAME" >/dev/null 2>&1; then
+    echo "Stopping existing service before dependency update..."
+    if ! launchctl unload "$PLIST_PATH"; then
+        echo "Error: Could not stop the existing Robyx service; the venv was not modified. Run: launchctl unload '$PLIST_PATH'"
+        exit 1
+    fi
+    for _wait_attempt in $(seq 1 30); do
+        if ! launchctl list "$PLIST_NAME" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    if launchctl list "$PLIST_NAME" >/dev/null 2>&1; then
+        echo "Error: $PLIST_NAME did not stop within 30 seconds; the existing venv was not modified. Stop it manually with: launchctl unload '$PLIST_PATH'"
+        exit 1
+    fi
+fi
 
 # Create venv
 echo "Creating virtual environment..."
@@ -84,7 +114,11 @@ source "$PROJECT_ROOT/.venv/bin/activate"
 
 # Install deps
 echo "Installing dependencies..."
-pip install -q -r "$PROJECT_ROOT/bot/requirements.txt"
+RUNTIME_LOCK="$("$PROJECT_ROOT/.venv/bin/python" \
+    "$PROJECT_ROOT/bot/dependency_locks.py" \
+    --project-root "$PROJECT_ROOT" --kind runtime)"
+"$PROJECT_ROOT/.venv/bin/python" -m pip install -q --require-hashes \
+    -r "$RUNTIME_LOCK"
 
 # Run setup if no .env
 if [ ! -f "$PROJECT_ROOT/.env" ]; then
@@ -99,14 +133,11 @@ if git -C "$PROJECT_ROOT" remote get-url origin >/dev/null 2>&1; then
     echo "Remote push disabled (repo is read-only for this install)."
 fi
 
-# Create data dirs
-mkdir -p "$PROJECT_ROOT/data"
-
-# Unload existing service if present
-if launchctl list | grep -q "$PLIST_NAME" 2>/dev/null; then
-    echo "Stopping existing service..."
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-fi
+# Create and repair private runtime paths. This is intentionally run on every
+# install/upgrade, including installations whose migration tracker is current.
+install -d -m 700 "$PROJECT_ROOT/data"
+"$PROJECT_ROOT/.venv/bin/python" "$PROJECT_ROOT/bot/local_security.py" \
+    --project-root "$PROJECT_ROOT"
 
 # Generate plist
 echo "Creating launchd service..."
@@ -124,6 +155,8 @@ cat > "$PLIST_PATH" << EOF
     </array>
     <key>WorkingDirectory</key>
     <string>$PROJECT_ROOT</string>
+    <key>Umask</key>
+    <integer>63</integer>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
