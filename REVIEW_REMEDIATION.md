@@ -680,5 +680,10 @@ P1 tickets should normally be completed before broad architectural work.
 - Packaged the completed program as the non-breaking `0.29.0` release with a
   continuous no-op data migration, verified release metadata, and annotated
   tag `v0.29.0` on the release commit.
+- Followed immediately with `0.29.1` after Linux CI showed that its process-name
+  smoke expected the launcher spelling `python`; the portable assertion accepts
+  the real `pytest` console launcher while preserving the non-empty-name
+  contract. Runtime behaviour is unchanged and the published `v0.29.0` tag was
+  not moved.
 - RR-00 through RR-11 are complete. Start any future P2 cleanup as a new bounded
   program rather than silently reopening this historical closure record.

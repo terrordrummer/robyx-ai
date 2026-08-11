@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.29.1
+
+### Fixed
+
+- Made the Unix process-name smoke tests launcher-agnostic. GitHub Actions runs
+  the locked `pytest` console script directly, so Linux correctly reports
+  `pytest` rather than `python`; the test now verifies the actual contract (a
+  live PID resolves to a non-empty name) across all supported Python versions.
+
 ## 0.29.0
 
 **Repository-wide security, resilience, and release-engineering hardening.**

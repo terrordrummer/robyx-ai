@@ -58,7 +58,11 @@ class TestGetProcessNameSync:
 
         name = get_process_name_sync(os.getpid())
         assert isinstance(name, str)
-        assert "python" in name or name == ""
+        # Console-script launchers legitimately expose ``pytest`` as the
+        # process name on Linux, while ``python`` is typical on macOS and for
+        # ``python -m pytest``. The contract is that the live Unix PID resolves
+        # to a non-empty name, not that its launcher spelling is fixed.
+        assert name
 
     def test_returns_empty_on_timeout(self):
         from process import get_process_name_sync
@@ -104,7 +108,7 @@ class TestGetProcessName:
 
         name = await get_process_name(os.getpid())
         assert isinstance(name, str)
-        assert "python" in name or name == ""
+        assert name
 
     @pytest.mark.asyncio
     async def test_returns_empty_on_timeout(self):
