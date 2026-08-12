@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.29.2
+
+### Fixed
+
+- Restored the universal auto-update bridge by declaring
+  `min_compatible: 0.0.0`. Every earlier Robyx release with a functioning
+  updater can now select the latest tag directly instead of being blocked by
+  the intermediate `0.29.1` compatibility floor.
+
 ## 0.29.1
 
 ### Fixed

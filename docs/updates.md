@@ -32,6 +32,14 @@ Robyx checks for new versions every hour:
 
 The updater never substitutes the tip of `main` for the requested version. This matters when `main` contains unreleased work beyond the latest tag: the installed and recorded commit is always the commit peeled from `v<VERSION>`.
 
+The checker evaluates only the highest semantic-version tag; it does not plan a
+sequence through intermediate release metadata. Therefore `min_compatible`
+describes the oldest version allowed to jump **directly to that latest tag**,
+not merely the previous release. A non-breaking bridge intended for the whole
+installed fleet uses `min_compatible: 0.0.0`. Release `0.29.2` locks this
+contract with a regression test that exercises both automatic discovery and
+manual pending-update selection from an arbitrarily old semantic version.
+
 After an update restarts Robyx, the stdlib-only local-security bootstrap runs
 before `.env` is loaded. It idempotently restores owner-only modes for `.env`,
 `bot.log*`, and the complete `data/` tree, including installations already at

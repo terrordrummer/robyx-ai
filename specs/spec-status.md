@@ -6,7 +6,7 @@ history, and task checklists on 2026-08-12._
 - **Project**: robyx-ai
 - **Branch**: `main`
 - **Constitution**: defined (v1.0.0, ratified 2026-04-16)
-- **Release version**: `0.29.1`
+- **Release version**: `0.29.2`
 - **Remediation register**: [`REVIEW_REMEDIATION.md`](../REVIEW_REMEDIATION.md)
 
 ## Features
@@ -29,14 +29,15 @@ an explicitly manual validation boundary.
 
 - Release `0.29.0` captures the completed August remediation program;
   `v0.29.1` adds the launcher-portable Linux CI assertion without changing
-  runtime behaviour.
+  runtime behaviour, and `v0.29.2` restores a `0.0.0` compatibility floor so
+  every updater-capable historical Robyx release can select it directly.
 - Full locked suites: **2,505 passed, 1 skipped** independently on Python 3.10,
   3.11, 3.12, 3.13, and 3.14.
 - Python 3.12 coverage: **82.09%** overall; every committed risk-path ratchet
   passes, including all new security/resilience boundaries at 85% or higher.
 - Critical Ruff, gradual mypy, dependency-lock drift, compileall, POSIX installer
   syntax, and `git diff --check` gates pass.
-- Release history and tags are present through `v0.29.1`.
+- Release history and tags are present through `v0.29.2`.
 
 ## Open validation and P2 work
 

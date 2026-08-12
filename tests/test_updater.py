@@ -3,6 +3,7 @@
 import asyncio
 import json
 import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -445,6 +446,52 @@ class TestGetPendingUpdate:
             new=AsyncMock(side_effect=subprocess.CalledProcessError(1, "git")),
         ):
             assert await updater.get_pending_update() is None
+
+
+class TestUniversalReleaseBridge:
+    """The latest recovery release must be selectable from any old version."""
+
+    @staticmethod
+    def _release_notes() -> dict:
+        repo_root = Path(__file__).resolve().parents[1]
+        return updater._parse_release_notes(
+            (repo_root / "releases" / "0.29.2.md").read_text(encoding="utf-8")
+        )
+
+    def test_release_metadata_has_no_compatibility_floor(self):
+        notes = self._release_notes()
+        assert notes["version"] == "0.29.2"
+        assert notes["min_compatible"] == "0.0.0"
+        assert notes["breaking"] is False
+        assert notes["requires_migration"] is False
+
+    @pytest.mark.asyncio
+    async def test_arbitrarily_old_version_can_select_latest(self):
+        notes = self._release_notes()
+        updater.VERSION_FILE.write_text("0.0.0\n")
+        tags = ["v0.19.0", "v0.29.0", "v0.29.1", "v0.29.2"]
+
+        with patch(
+            "updater.fetch_remote_tags", new=AsyncMock(return_value=tags)
+        ), patch(
+            "updater._get_release_notes_for", new=AsyncMock(return_value=notes)
+        ), patch(
+            "updater._load_state",
+            return_value={
+                "notified_versions": ["0.29.1"],
+                "last_check": None,
+                "last_update": None,
+                "update_history": [],
+            },
+        ), patch("updater._save_state"):
+            available = await updater.check_for_updates()
+            pending = await updater.get_pending_update()
+
+        assert available is not None
+        assert available["version"] == "0.29.2"
+        assert available["status"] == "available"
+        assert pending is not None
+        assert pending["version"] == "0.29.2"
 
 
 # ── apply_update ──

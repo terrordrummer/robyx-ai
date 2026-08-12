@@ -685,5 +685,10 @@ P1 tickets should normally be completed before broad architectural work.
   the real `pytest` console launcher while preserving the non-empty-name
   contract. Runtime behaviour is unchanged and the published `v0.29.0` tag was
   not moved.
+- Released `0.29.2` with `min_compatible: 0.0.0` after detecting that `0.29.1`'s
+  `0.29.0` floor prevented older installations from traversing the release
+  bridge. A repository contract test proves both automatic and manual pending
+  selection from an arbitrarily old semantic version; existing tags remain
+  immutable.
 - RR-00 through RR-11 are complete. Start any future P2 cleanup as a new bounded
   program rather than silently reopening this historical closure record.
