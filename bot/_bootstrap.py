@@ -260,11 +260,64 @@ def _write_marker_atomically(marker: Path, value: str) -> None:
             pass
 
 
-def _assert_no_interrupted_update() -> None:
-    """Fail boot closed when a prior updater died after changing code/data."""
+def _active_update_smoke_matches_target(payload: dict) -> bool:
+    """Return whether a controlled smoke child matches its durable target.
+
+    The updater intentionally keeps ``active-update.json`` in place while it
+    imports the freshly installed runtime. That child is safe to admit only
+    for the ``smoke-test`` phase and only when both Git HEAD and ``VERSION``
+    match the exact target recorded before checkout. Ordinary service boots
+    never use this exception.
+    """
+    target_commit = payload.get("target_commit")
+    target_version = payload.get("target_version")
+    if not (
+        payload.get("phase") == "smoke-test"
+        and isinstance(target_commit, str)
+        and bool(re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", target_commit))
+        and isinstance(target_version, str)
+        and bool(target_version.strip())
+    ):
+        return False
+
+    try:
+        installed_version = (_PROJECT_ROOT / "VERSION").read_text(
+            encoding="utf-8",
+        ).strip()
+        git_env = _scrubbed_child_env()
+        for key in tuple(git_env):
+            if key.startswith("GIT_"):
+                git_env.pop(key, None)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(_PROJECT_ROOT),
+            env=git_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=5.0,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        return False
+    return (
+        head.returncode == 0
+        and head.stdout.strip().lower() == target_commit.lower()
+        and installed_version == target_version.strip()
+    )
+
+
+def _assert_no_interrupted_update(*, allow_target_smoke: bool = False) -> bool:
+    """Fail boot closed when a prior updater died after changing code/data.
+
+    Returns ``True`` only for the updater-owned, exact-target smoke-test lane.
+    The caller uses that signal to prohibit an opportunistic dependency
+    install: dependencies must already have the fingerprint committed by the
+    parent update transaction.
+    """
     marker = _DATA_DIR / "backups" / "active-update.json"
     if not marker.exists():
-        return
+        return False
     valid = False
     phase = "unknown"
     pre_commit = ""
@@ -289,6 +342,9 @@ def _assert_no_interrupted_update() -> None:
         )
     except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
         valid = False
+
+    if allow_target_smoke and valid and _active_update_smoke_matches_target(payload):
+        return True
 
     detail = "phase=%s pre-update=%s" % (
         phase,
@@ -364,9 +420,11 @@ def migrate_personal_data_if_needed() -> list[str]:
     return moved
 
 
-def ensure_dependencies() -> None:
+def ensure_dependencies(*, allow_interrupted_update_smoke: bool = False) -> None:
     """Install the selected runtime lock iff its fingerprint changed."""
-    _assert_no_interrupted_update()
+    active_update_smoke = _assert_no_interrupted_update(
+        allow_target_smoke=allow_interrupted_update_smoke,
+    )
     if not _REQUIREMENTS.exists():
         return
     if not _VENV_DIR.exists() or not _running_from_managed_venv():
@@ -388,6 +446,12 @@ def ensure_dependencies() -> None:
                 return
         except OSError:
             pass  # unreadable marker — re-install to be safe
+
+    if active_update_smoke:
+        raise DependencyLockError(
+            "active-update smoke test found an unverified dependency "
+            "fingerprint; refusing to install outside the parent transaction"
+        )
 
     pip = _venv_pip()
     if pip is None:

@@ -30,6 +30,13 @@ Robyx checks for new versions every hour:
 14. release maintenance and restart_service()
 ```
 
+The smoke-test subprocess runs while `active-update.json` is intentionally
+present. Bootstrap admits that child only when the marker is in `smoke-test`
+phase and its target commit/version exactly match Git HEAD and `VERSION`; its
+dependency fingerprint must already be current. The smoke lane does not run
+runtime-data migrations or install dependencies. Every ordinary service boot
+continues to treat the marker as an interrupted transaction and fails closed.
+
 The updater never substitutes the tip of `main` for the requested version. This matters when `main` contains unreleased work beyond the latest tag: the installed and recorded commit is always the commit peeled from `v<VERSION>`.
 
 The checker evaluates only the highest semantic-version tag; it does not plan a

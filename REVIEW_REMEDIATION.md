@@ -694,5 +694,10 @@ P1 tickets should normally be completed before broad architectural work.
   already-migrated queues. The fail-closed, idempotent migration removes only
   matching recurring telemetry; installers and current documentation no
   longer seed or recommend it, while on-demand diagnostics remain available.
+- The first production `0.29.3` attempt exposed a self-denial in the hardened
+  transaction: its own smoke child saw `active-update.json` and failed closed.
+  Rollback restored the local `0.29.2` installation and removed the marker.
+  Released `0.29.4` with an exact phase/commit/version/fingerprint smoke lane;
+  every ordinary or mismatched boot remains fail-closed.
 - RR-00 through RR-11 are complete. Start any future P2 cleanup as a new bounded
   program rather than silently reopening this historical closure record.

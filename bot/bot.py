@@ -13,12 +13,19 @@ Architecture:
 # MUST run before any other bot-local import: keeps the venv in sync with
 # the hash-verified runtime lock for this Python minor so a new release with
 # new deps never boots against a stale environment. See bot/_bootstrap.py.
+import sys
+
 import _bootstrap
-_bootstrap.ensure_dependencies()
+
+_SMOKE_TEST = "--smoke-test" in sys.argv
+_bootstrap.ensure_dependencies(
+    allow_interrupted_update_smoke=_SMOKE_TEST,
+)
 # v0.16+: relocate any leftover repo-root runtime files into data/. This
 # is the boot-time safety net that complements the pre-pull migration in
 # bot/updater.py — see migrate_personal_data_if_needed() for rationale.
-_bootstrap.migrate_personal_data_if_needed()
+if not _SMOKE_TEST:
+    _bootstrap.migrate_personal_data_if_needed()
 
 # Enforce owner-only modes before ``config`` reads .env.  Kept behind the
 # executable-entrypoint check so importing this module does not alter a test
@@ -47,7 +54,6 @@ import atexit
 import logging
 import os
 import signal
-import sys
 from logging.handlers import RotatingFileHandler
 
 from telegram import Update
@@ -1100,6 +1106,6 @@ if __name__ == "__main__":
     # syntax error from a partial commit, missing migration constant);
     # running the same interpreter + code path as production catches
     # those before we return from apply_update with success.
-    if "--smoke-test" in sys.argv:
+    if _SMOKE_TEST:
         sys.exit(0)
     main()

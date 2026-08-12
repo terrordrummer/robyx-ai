@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.29.4
+
+### Fixed
+
+- Fixed the updater smoke test being rejected by its own durable
+  `active-update.json` safety marker. Only an exact `smoke-test` phase whose
+  recorded target commit and version match the checked-out runtime may pass;
+  ordinary boots and mismatched targets remain fail-closed.
+- Prevented the controlled smoke child from migrating runtime data or starting
+  a fallback dependency installation outside the parent update transaction.
+
 ## 0.29.3
 
 ### Changed

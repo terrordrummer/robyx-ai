@@ -2040,6 +2040,17 @@ class TestPostUpdateSmokeTest:
         assert args[1].endswith("bot/bot.py") or args[1].endswith("bot\\bot.py")
         assert "--smoke-test" in args
 
+    def test_bot_smoke_lane_skips_runtime_data_migration(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        source = (repo_root / "bot" / "bot.py").read_text(
+            encoding="utf-8",
+        )
+        assert "allow_interrupted_update_smoke=_SMOKE_TEST" in source
+        assert (
+            "if not _SMOKE_TEST:\n    _bootstrap.migrate_personal_data_if_needed()"
+            in source
+        )
+
     @pytest.mark.asyncio
     async def test_nonzero_exit_is_failure_with_tail(self, tmp_path):
         (updater.PROJECT_ROOT / ".venv" / "bin" / "python").write_text("#!/bin/sh\nexit 1\n")

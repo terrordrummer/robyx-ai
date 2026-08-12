@@ -6,7 +6,7 @@ history, and task checklists on 2026-08-13._
 - **Project**: robyx-ai
 - **Branch**: `main`
 - **Constitution**: defined (v1.0.0, ratified 2026-04-16)
-- **Release version**: `0.29.3`
+- **Release version**: `0.29.4`
 - **Remediation register**: [`REVIEW_REMEDIATION.md`](../REVIEW_REMEDIATION.md)
 
 ## Features
@@ -33,13 +33,15 @@ an explicitly manual validation boundary.
   every updater-capable historical Robyx release can select it directly.
   `v0.29.3` retires legacy periodic system-monitor notifications while
   preserving on-demand diagnostics and all unrelated queue entries.
-- Release gate: **2,513 passed, 1 skipped** locally on Python 3.12; the locked
+  `v0.29.4` fixes the active-marker/smoke-test protocol exposed by the first
+  `0.29.3` production update attempt.
+- Release gate: **2,519 passed, 1 skipped** locally on Python 3.12; the locked
   Python 3.10–3.14 GitHub matrix also passes on the release commit.
-- Python 3.12 coverage: **82.14%** overall; every committed risk-path ratchet
+- Python 3.12 coverage: **82.17%** overall; every committed risk-path ratchet
   passes, including all new security/resilience boundaries at 85% or higher.
 - Critical Ruff, gradual mypy, dependency-lock drift, compileall, POSIX installer
   syntax, and `git diff --check` gates pass.
-- Release metadata is present through `v0.29.3`; annotated tags remain
+- Release metadata is present through `v0.29.4`; annotated tags remain
   immutable and are created only after the corresponding commit passes CI.
 
 ## Open validation and P2 work

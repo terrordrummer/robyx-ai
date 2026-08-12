@@ -339,6 +339,29 @@ class TestMigratePersonalDataIfNeeded:
 
 
 class TestInterruptedUpdateRecovery:
+    @staticmethod
+    def _write_marker(
+        data_dir: Path,
+        *,
+        phase: str = "smoke-test",
+        target_commit: str | None = None,
+        target_version: str = "0.29.4",
+    ) -> Path:
+        marker = data_dir / "backups" / "active-update.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            '{"schema": 1, "phase": "%s", '
+            '"pre_update_commit": "%s", "pre_update_version": "0.29.3", '
+            '"target_commit": "%s", "target_version": "%s"}'
+            % (
+                phase,
+                "a" * 40,
+                target_commit or "b" * 40,
+                target_version,
+            ),
+        )
+        return marker
+
     def test_boot_fails_closed_on_durable_interrupted_update_marker(
         self,
         fresh_bootstrap,
@@ -376,6 +399,78 @@ class TestInterruptedUpdateRecovery:
 
         with pytest.raises(bs.DependencyLockError, match="unverified"):
             bs.ensure_dependencies()
+
+    def test_exact_target_smoke_is_allowed_without_mutating_dependencies(
+        self,
+        fresh_bootstrap,
+        monkeypatch,
+    ):
+        bs, root, req, venv = fresh_bootstrap
+        data_dir = root / "data"
+        target_commit = "b" * 40
+        self._write_marker(data_dir, target_commit=target_commit)
+        (root / "VERSION").write_text("0.29.4\n")
+        (venv / ".robyx_deps_hash").write_text(
+            dependency_fingerprint(req, dependency_lock_path(root)),
+        )
+        monkeypatch.setattr(bs, "_DATA_DIR", data_dir)
+        monkeypatch.setenv("GIT_DIR", "/tmp/untrusted-git-dir")
+        git_result = MagicMock(returncode=0, stdout=target_commit + "\n")
+
+        with patch("_bootstrap.subprocess.run", return_value=git_result) as git, \
+             patch("_bootstrap._run_pip_install") as install:
+            bs.ensure_dependencies(allow_interrupted_update_smoke=True)
+
+        install.assert_not_called()
+        assert "GIT_DIR" not in git.call_args.kwargs["env"]
+
+    @pytest.mark.parametrize(
+        ("phase", "head", "version"),
+        [
+            ("dependencies", "b" * 40, "0.29.4"),
+            ("smoke-test", "c" * 40, "0.29.4"),
+            ("smoke-test", "b" * 40, "0.29.3"),
+        ],
+    )
+    def test_smoke_bypass_rejects_wrong_phase_commit_or_version(
+        self,
+        fresh_bootstrap,
+        monkeypatch,
+        phase,
+        head,
+        version,
+    ):
+        bs, root, _req, _venv = fresh_bootstrap
+        data_dir = root / "data"
+        self._write_marker(data_dir, phase=phase)
+        (root / "VERSION").write_text(version + "\n")
+        monkeypatch.setattr(bs, "_DATA_DIR", data_dir)
+        git_result = MagicMock(returncode=0, stdout=head + "\n")
+
+        with patch("_bootstrap.subprocess.run", return_value=git_result):
+            with pytest.raises(bs.DependencyLockError, match="interrupted update"):
+                bs.ensure_dependencies(allow_interrupted_update_smoke=True)
+
+    def test_active_smoke_never_installs_when_dependency_hash_is_stale(
+        self,
+        fresh_bootstrap,
+        monkeypatch,
+    ):
+        bs, root, _req, venv = fresh_bootstrap
+        data_dir = root / "data"
+        target_commit = "b" * 40
+        self._write_marker(data_dir, target_commit=target_commit)
+        (root / "VERSION").write_text("0.29.4\n")
+        (venv / ".robyx_deps_hash").write_text("stale")
+        monkeypatch.setattr(bs, "_DATA_DIR", data_dir)
+        git_result = MagicMock(returncode=0, stdout=target_commit + "\n")
+
+        with patch("_bootstrap.subprocess.run", return_value=git_result), \
+             patch("_bootstrap._run_pip_install") as install:
+            with pytest.raises(bs.DependencyLockError, match="unverified dependency"):
+                bs.ensure_dependencies(allow_interrupted_update_smoke=True)
+
+        install.assert_not_called()
 
     def test_bootstrap_timeout_terminates_entire_process_group(
         self,
