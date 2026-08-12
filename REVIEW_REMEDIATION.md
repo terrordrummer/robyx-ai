@@ -690,7 +690,7 @@ P1 tickets should normally be completed before broad architectural work.
   bridge. A repository contract test proves both automatic and manual pending
   selection from an arbitrarily old semantic version; existing tags remain
   immutable.
-- Prepared `0.29.3` to retire the obsolete periodic `system-monitor` entry from
+- Released `0.29.3` to retire the obsolete periodic `system-monitor` entry from
   already-migrated queues. The fail-closed, idempotent migration removes only
   matching recurring telemetry; installers and current documentation no
   longer seed or recommend it, while on-demand diagnostics remain available.

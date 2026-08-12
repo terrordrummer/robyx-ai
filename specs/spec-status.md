@@ -33,14 +33,14 @@ an explicitly manual validation boundary.
   every updater-capable historical Robyx release can select it directly.
   `v0.29.3` retires legacy periodic system-monitor notifications while
   preserving on-demand diagnostics and all unrelated queue entries.
-- Local Python 3.12 release gate: **2,513 passed, 1 skipped**; the locked
-  Python 3.10–3.14 matrix runs again on the release commit and tag.
+- Release gate: **2,513 passed, 1 skipped** locally on Python 3.12; the locked
+  Python 3.10–3.14 GitHub matrix also passes on the release commit.
 - Python 3.12 coverage: **82.14%** overall; every committed risk-path ratchet
   passes, including all new security/resilience boundaries at 85% or higher.
 - Critical Ruff, gradual mypy, dependency-lock drift, compileall, POSIX installer
   syntax, and `git diff --check` gates pass.
-- Release history is prepared through `v0.29.3`; the annotated tag is created
-  only after the release commit and CI gates pass.
+- Release metadata is present through `v0.29.3`; annotated tags remain
+  immutable and are created only after the corresponding commit passes CI.
 
 ## Open validation and P2 work
 
