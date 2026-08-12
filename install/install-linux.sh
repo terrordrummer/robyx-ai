@@ -131,7 +131,6 @@ fi
 
 # Create and repair private runtime paths. This is intentionally run on every
 # install/upgrade, including installations whose migration tracker is current.
-install -d -m 700 "$PROJECT_ROOT/data/system-monitor"
 "$PROJECT_ROOT/.venv/bin/python" "$PROJECT_ROOT/bot/local_security.py" \
     --project-root "$PROJECT_ROOT"
 

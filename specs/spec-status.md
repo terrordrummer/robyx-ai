@@ -1,12 +1,12 @@
 # Spec-Driven Development Status
 
 _Maintained project snapshot. Last reconciled against code, tests, release
-history, and task checklists on 2026-08-12._
+history, and task checklists on 2026-08-13._
 
 - **Project**: robyx-ai
 - **Branch**: `main`
 - **Constitution**: defined (v1.0.0, ratified 2026-04-16)
-- **Release version**: `0.29.2`
+- **Release version**: `0.29.3`
 - **Remediation register**: [`REVIEW_REMEDIATION.md`](../REVIEW_REMEDIATION.md)
 
 ## Features
@@ -31,13 +31,16 @@ an explicitly manual validation boundary.
   `v0.29.1` adds the launcher-portable Linux CI assertion without changing
   runtime behaviour, and `v0.29.2` restores a `0.0.0` compatibility floor so
   every updater-capable historical Robyx release can select it directly.
-- Full locked suites: **2,505 passed, 1 skipped** independently on Python 3.10,
-  3.11, 3.12, 3.13, and 3.14.
-- Python 3.12 coverage: **82.09%** overall; every committed risk-path ratchet
+  `v0.29.3` retires legacy periodic system-monitor notifications while
+  preserving on-demand diagnostics and all unrelated queue entries.
+- Local Python 3.12 release gate: **2,513 passed, 1 skipped**; the locked
+  Python 3.10–3.14 matrix runs again on the release commit and tag.
+- Python 3.12 coverage: **82.14%** overall; every committed risk-path ratchet
   passes, including all new security/resilience boundaries at 85% or higher.
 - Critical Ruff, gradual mypy, dependency-lock drift, compileall, POSIX installer
   syntax, and `git diff --check` gates pass.
-- Release history and tags are present through `v0.29.2`.
+- Release history is prepared through `v0.29.3`; the annotated tag is created
+  only after the release commit and CI gates pass.
 
 ## Open validation and P2 work
 

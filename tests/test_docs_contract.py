@@ -129,3 +129,15 @@ def test_command_and_migration_docs_match_runtime_contracts():
     assert "failed version-chain step" in updates
     assert "retried on the next" in updates
     assert "Migrations are idempotent, never retried on failure" not in updates
+
+
+def test_legacy_system_monitor_is_not_seeded_or_recommended():
+    scheduler_docs = _read("docs/scheduler.md")
+    team_docs = _read("docs/team.md")
+    linux_installer = _read("install/install-linux.sh")
+    windows_installer = _read("install/install-windows.ps1")
+
+    assert "does not create a periodic system monitor" in scheduler_docs
+    assert "system monitor (scheduled" not in team_docs
+    assert "data/system-monitor" not in linux_installer
+    assert "data\\system-monitor" not in windows_installer

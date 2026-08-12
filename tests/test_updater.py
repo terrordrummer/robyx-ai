@@ -452,24 +452,28 @@ class TestUniversalReleaseBridge:
     """The latest recovery release must be selectable from any old version."""
 
     @staticmethod
-    def _release_notes() -> dict:
+    def _current_release() -> tuple[str, dict]:
         repo_root = Path(__file__).resolve().parents[1]
-        return updater._parse_release_notes(
-            (repo_root / "releases" / "0.29.2.md").read_text(encoding="utf-8")
+        version = (repo_root / "VERSION").read_text(encoding="utf-8").strip()
+        notes = updater._parse_release_notes(
+            (repo_root / "releases" / (version + ".md")).read_text(
+                encoding="utf-8"
+            )
         )
+        return version, notes
 
     def test_release_metadata_has_no_compatibility_floor(self):
-        notes = self._release_notes()
-        assert notes["version"] == "0.29.2"
+        version, notes = self._current_release()
+        assert notes["version"] == version
         assert notes["min_compatible"] == "0.0.0"
         assert notes["breaking"] is False
         assert notes["requires_migration"] is False
 
     @pytest.mark.asyncio
     async def test_arbitrarily_old_version_can_select_latest(self):
-        notes = self._release_notes()
+        version, notes = self._current_release()
         updater.VERSION_FILE.write_text("0.0.0\n")
-        tags = ["v0.19.0", "v0.29.0", "v0.29.1", "v0.29.2"]
+        tags = ["v0.19.0", "v0.29.0", "v0.29.1", "v0.29.2", "v" + version]
 
         with patch(
             "updater.fetch_remote_tags", new=AsyncMock(return_value=tags)
@@ -488,10 +492,10 @@ class TestUniversalReleaseBridge:
             pending = await updater.get_pending_update()
 
         assert available is not None
-        assert available["version"] == "0.29.2"
+        assert available["version"] == version
         assert available["status"] == "available"
         assert pending is not None
-        assert pending["version"] == "0.29.2"
+        assert pending["version"] == version
 
 
 # ── apply_update ──

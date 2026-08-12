@@ -18,7 +18,13 @@ validated chat macros rather than calling `scheduler.add_task` without scope.
 
 **One-shot tasks** — an agent subprocess that runs once at a specific date/time. Use this when you need an agent to *do work* at a scheduled moment: "Run a security scan tonight at 2am", "Generate the weekly report next Monday at 8am".
 
-**Periodic tasks** — recurring agent invocations on an interval (hourly, daily, etc.). A system monitor that checks server health every 6 hours, a price tracker that runs every 30 minutes — the scheduler keeps firing them until the workspace is closed or paused.
+**Periodic tasks** — recurring agent invocations on an interval (hourly, daily, etc.). A weekly project digest or a price tracker that runs every 30 minutes keeps firing until the workspace is closed or paused.
+
+Robyx does not create a periodic system monitor or push raw timestamp, disk,
+memory, or process telemetry into chat. Those diagnostics are useful when
+requested or when an actionable fault occurs, not as routine notifications.
+Version 0.29.3 removes the old six-hour monitor from queues that still contain
+it while preserving other scheduled work and on-demand diagnostics.
 
 **Continuous tasks (agentic loop)** — autonomous, iterative work that the scheduler keeps alive step-by-step until the objective is reached or the user intervenes. Each continuous task gets:
 - A **git branch** in the target project's repo

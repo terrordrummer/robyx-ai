@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.29.3
+
+### Changed
+
+- Retired the legacy six-hour `system-monitor` schedule. During boot, the
+  versioned migration removes only matching periodic queue entries while
+  preserving other scheduled work, historical output, and on-demand
+  diagnostics.
+- Stopped Linux and Windows installers from recreating the obsolete
+  `data/system-monitor` directory and aligned scheduler/team documentation
+  with the on-demand-only monitoring policy.
+
+### Fixed
+
+- Kept the latest release universally selectable with
+  `min_compatible: 0.0.0`, so updater-capable installations can jump directly
+  to this cleanup release from any historical Robyx version.
+
 ## 0.29.2
 
 ### Fixed

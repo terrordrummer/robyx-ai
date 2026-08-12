@@ -101,7 +101,7 @@ class QueueUnavailableError(PersistenceUnavailableError):
     """The queue is corrupt and no verified recovery copy is available."""
 
 
-def _valid_queue_payload(value: Any) -> bool:
+def valid_queue_payload(value: Any) -> bool:
     """Validate the complete semantic shape of live and snapshot queues.
 
     Legacy records may omit ``workspace_scope`` so authoritative lifecycle
@@ -196,7 +196,7 @@ def _load_queue_unlocked() -> list[dict]:
         result = load_json_with_recovery(
             QUEUE_FILE,
             data_dir=DATA_DIR,
-            validator=_valid_queue_payload,
+            validator=valid_queue_payload,
             kind="scheduler queue",
             logger=log,
         )
@@ -228,7 +228,7 @@ _queue_size_warned = False
 
 
 def _save_queue_unlocked(entries: list[dict]) -> None:
-    if not _valid_queue_payload(entries):
+    if not valid_queue_payload(entries):
         raise ValueError("refusing to persist a malformed scheduler queue")
     QUEUE_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = QUEUE_FILE.with_suffix(".tmp")
@@ -261,7 +261,7 @@ def save_queue(entries: list[dict]) -> None:
             guard_json_write(
                 QUEUE_FILE,
                 data_dir=DATA_DIR,
-                validator=_valid_queue_payload,
+                validator=valid_queue_payload,
                 kind="scheduler queue",
                 logger=log,
             )

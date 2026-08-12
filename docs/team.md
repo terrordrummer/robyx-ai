@@ -33,7 +33,7 @@ Your team grows organically:
 ```
 Week 1:  Robyx + 2 project workspaces
 Week 2:  + code reviewer specialist
-Week 3:  + system monitor (scheduled, runs every 6h)
+Week 3:  + weekly project summary (scheduled)
 Week 4:  + deployment specialist that knows your Cloudflare setup
 Month 2: + research workspace for ML experiments
          + data pipeline monitor

@@ -110,9 +110,6 @@ if (-not (Test-Path "$ProjectRoot\.env")) {
     & $venvPython "$ProjectRoot\setup.py"
 }
 
-# Create data dirs
-New-Item -ItemType Directory -Force -Path "$ProjectRoot\data\system-monitor" | Out-Null
-
 # Python's stdlib cannot express an equivalent Windows ACL. The shared
 # hardener is therefore a documented no-op on Windows, while atomic writes and
 # the current-user Task Scheduler boundary remain intact.
